@@ -19,7 +19,7 @@ const std = @import("std");
 
 /// `fbflash` pokes /dev/fb0 with raw syscalls and needs no libc, so it links
 /// fully static. The others need libc purely for dlopen.
-const App = struct { name: []const u8, src: []const u8, libc: bool };
+const App = struct { name: []const u8, src: []const u8, libc: bool, shaders: bool = false };
 
 const apps = [_]App{
     .{ .name = "fbflash", .src = "src/fbflash.zig", .libc = false },
@@ -28,6 +28,8 @@ const apps = [_]App{
     .{ .name = "vkinfo", .src = "src/vkinfo.zig", .libc = true },
     .{ .name = "fptest", .src = "src/fptest.zig", .libc = true },
     .{ .name = "inputlog", .src = "src/inputlog.zig", .libc = true },
+    .{ .name = "glinfo", .src = "src/glinfo.zig", .libc = true },
+    .{ .name = "gltri", .src = "src/gltri.zig", .libc = true, .shaders = true },
 };
 
 /// Sourced by every remote step. Defaults keep a fresh clone working.
@@ -66,16 +68,14 @@ pub fn build(b: *std.Build) void {
                 .link_libc = app.libc,
             }),
         });
-        exe.root_module.addAnonymousImport("font", .{ .root_source_file = b.path("assets/font8x16.bin") });
+        addAssets(b, exe, app);
         b.installArtifact(exe);
         exes.put(app.name, exe) catch @panic("OOM");
     }
 
-    var chosen_src: []const u8 = "";
-    var chosen_libc = true;
+    var chosen_app = apps[0];
     for (apps) |a| if (std.mem.eql(u8, a.name, selected)) {
-        chosen_src = a.src;
-        chosen_libc = a.libc;
+        chosen_app = a;
     };
 
     const chosen = exes.get(selected) orelse {
@@ -128,13 +128,13 @@ pub fn build(b: *std.Build) void {
         // build goes through LLVM anyway; pin the host build to it too.
         .use_llvm = true,
         .root_module = b.createModule(.{
-            .root_source_file = b.path(chosen_src),
+            .root_source_file = b.path(chosen_app.src),
             .target = b.resolveTargetQuery(.{}),
             .optimize = optimize,
-            .link_libc = chosen_libc,
+            .link_libc = chosen_app.libc,
         }),
     });
-    host_exe.root_module.addAnonymousImport("font", .{ .root_source_file = b.path("assets/font8x16.bin") });
+    addAssets(b, host_exe, chosen_app);
     const run_host = b.addRunArtifact(host_exe);
     b.step("run-host", "Build -Dapp for this PC and run it locally").dependOn(&run_host.step);
 
@@ -158,6 +158,57 @@ pub fn build(b: *std.Build) void {
     inst.step.dependOn(pkg_step);
     b.step("install-app", "Package, push and install -Dapp on the TV").dependOn(&inst.step);
 }
+
+/// Every app gets the font and the compiled shaders as embeddable modules.
+/// Unused ones cost nothing: an @embedFile nobody references is not emitted.
+fn addAssets(b: *std.Build, exe: *std.Build.Step.Compile, app: App) void {
+    exe.root_module.addAnonymousImport("font", .{ .root_source_file = b.path("assets/font8x16.bin") });
+    if (!app.shaders) return; // don't make every app wait on slangc
+    for (shaders) |sh_| {
+        exe.root_module.addAnonymousImport(sh_.import, .{ .root_source_file = slangc(b, sh_) });
+    }
+}
+
+const Shader = struct {
+    import: []const u8,
+    src: []const u8,
+    entry: []const u8,
+    /// Slang's name for the stage, then glslang's.
+    stage: []const u8,
+    short: []const u8,
+};
+
+const shaders = [_]Shader{
+    .{ .import = "tri_vs", .src = "src/shaders/tri.slang", .entry = "vsMain", .stage = "vertex", .short = "vert" },
+    .{ .import = "tri_fs", .src = "src/shaders/tri.slang", .entry = "fsMain", .stage = "fragment", .short = "frag" },
+    .{ .import = "text_vs", .src = "src/shaders/text.slang", .entry = "vsText", .stage = "vertex", .short = "vert" },
+    .{ .import = "text_fs", .src = "src/shaders/text.slang", .entry = "fsText", .stage = "fragment", .short = "frag" },
+};
+
+/// Compile one Slang entry point to GLSL ES. Slang only emits desktop GLSL
+/// (there is no ESSL profile), so the header is rewritten: `#version 450` and
+/// the two `layout(row_major)` defaults are GLSL 4.x-only, and ES insists on
+/// explicit default precision. The body needs no changes, as long as the
+/// shaders avoid the constructs Slang lowers to Vulkan-only GLSL --
+/// see docs/opengl.md.
+fn slangc(b: *std.Build, s: Shader) std.Build.LazyPath {
+    const run = b.addSystemCommand(&.{ "sh", "-c", slang_script, "--" });
+    run.addFileArg(b.path(s.src));
+    run.addArgs(&.{ s.stage, s.entry, s.short });
+    return run.addOutputFileArg(b.fmt("{s}.glsl", .{s.import}));
+}
+
+const slang_script =
+    \\set -e
+    \\src="$1"; stage="$2"; entry="$3"; short="$4"; out="$5"
+    \\command -v slangc >/dev/null || { echo "slangc not found; see README" >&2; exit 1; }
+    \\tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
+    \\slangc "$src" -target glsl -stage "$stage" -entry "$entry" -o "$tmp"
+    \\sed -e '1s|.*|#version 320 es\nprecision highp float;\nprecision highp int;|' \
+    \\    -e '/^layout(row_major) uniform;$/d' -e '/^layout(row_major) buffer;$/d' \
+    \\    "$tmp" > "$out"
+    \\if command -v glslangValidator >/dev/null; then glslangValidator -S "$short" "$out" >/dev/null; fi
+;
 
 fn sh(b: *std.Build, script: []const u8, args: []const []const u8) *std.Build.Step.Run {
     const run = b.addSystemCommand(&.{ "sh", "-c", script, "--" });

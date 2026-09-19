@@ -10,6 +10,8 @@ library is `dlopen`'d at runtime.
 
 | | |
 |---|---|
+| `gltri` | 1000 instanced rotating triangles via GL ES 3.2, CPU/GPU frame times on screen — **verified on device** |
+| `glinfo` | EGL + OpenGL ES capabilities, limits and extensions |
 | `inputlog` | on-screen log of every input event — maps the remote and the cursor, **verified on device** |
 | `wlbox` | fullscreen red box via Wayland `wl_shm` + `wl_webos_shell` — **verified on device** |
 | `wlinfo` | lists the compositor's Wayland globals |
@@ -17,8 +19,8 @@ library is `dlopen`'d at runtime.
 | `fbflash` | `/dev/fb0` prober — documents why direct framebuffer access is impossible |
 | `fptest` | float throughput benchmark (soft-float ABI vs hardware VFP) |
 
-Full findings are in **[docs/](docs/README.md)** — ABI, display pipeline, Vulkan,
-codecs, input, network, packaging.
+Full findings are in **[docs/](docs/README.md)** — ABI, display pipeline, OpenGL
+ES, Vulkan, codecs, input, network, packaging.
 
 ## Requirements
 
@@ -26,6 +28,10 @@ codecs, input, network, packaging.
   versions may need small edits)
 - `openssh` — `ssh`/`scp` for deploy
 - `tar`, `sed`, `coreutils` — used by the `.ipk` packager
+- **`slangc`** ([Slang](https://shader-slang.org/)) — only for the GL apps, which
+  compile their shaders from `src/shaders/*.slang` at build time
+- `glslangValidator` — optional; if present, every generated shader is validated
+  against GLSL ES 3.20 before it is embedded
 - An LG webOS TV with **root SSH access** (e.g. via
   [Homebrew Channel](https://github.com/webosbrew/webos-homebrew-channel)) and
   your key installed
@@ -92,6 +98,9 @@ build.zig     build, package, deploy, install, launch
   present; use `zwp_linux_dmabuf_v1`.
 - Zig 0.16's self-hosted x86_64 backend miscompiles `@memset` over a large
   global slice, so `run-host` pins `use_llvm`. The ARM build is unaffected.
+- `GL_EXT_disjoint_timer_query` is advertised but returns nothing on this
+  driver, and Slang cannot emit GLSL ES directly — both are worked around and
+  explained in [docs/opengl.md](docs/opengl.md).
 
 Each is explained in [docs/](docs/README.md).
 
@@ -108,6 +117,7 @@ without a compositor at all:
 
 ```sh
 INPUTLOG_DUMP=1 zig build run-host -Dapp=inputlog
+GLTRI_DUMP=1    zig build run-host -Dapp=gltri     # glReadPixels -> ASCII
 ```
 
 `assets/font8x16.bin` is the ASCII range of

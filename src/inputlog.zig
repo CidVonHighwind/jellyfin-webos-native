@@ -12,13 +12,11 @@
 //! BACK or ESC quits.
 const std = @import("std");
 const wl = @import("wl.zig");
+const txt = @import("text.zig");
 
-const font = @embedFile("font"); // ASCII 0x20..0x7e, 8x16, 1bpp
-const GLYPH_W = 8;
-const GLYPH_H = 16;
 const SCALE = 2;
-const CELL_W = GLYPH_W * SCALE;
-const CELL_H = GLYPH_H * SCALE;
+const CELL_W = txt.GLYPH_W * SCALE;
+const CELL_H = txt.GLYPH_H * SCALE;
 
 const BG = 0xFF101018;
 const FG = 0xFFE0E0E0;
@@ -137,25 +135,7 @@ fn onEvent(ev: wl.Event) void {
 // ------------------------------------------------------------------ drawing
 
 fn text(x: u32, y: u32, colour: u32, s: []const u8) void {
-    var cx = x;
-    for (s) |ch| {
-        if (cx + CELL_W > wl.width) return;
-        if (ch >= 0x20 and ch < 0x7f) {
-            const glyph = font[(@as(usize, ch) - 0x20) * GLYPH_H ..][0..GLYPH_H];
-            for (glyph, 0..) |bits, gy| {
-                if (bits == 0) continue;
-                for (0..GLYPH_W) |gx| {
-                    if (bits >> @intCast(7 - gx) & 1 == 0) continue;
-                    for (0..SCALE) |sy| for (0..SCALE) |sx| {
-                        const px = cx + gx * SCALE + sx;
-                        const py = y + gy * SCALE + sy;
-                        if (py < wl.height) wl.pixels[py * wl.width + px] = colour;
-                    };
-                }
-            }
-        }
-        cx += CELL_W;
-    }
+    txt.draw(u32, wl.pixels, wl.width, wl.height, x, y, SCALE, colour, s);
 }
 
 fn hline(y: u32, colour: u32) void {
@@ -229,7 +209,7 @@ pub fn main() !void {
 
     wl.on_event = onEvent;
     const appid = std.c.getenv("APPID") orelse @as([*:0]const u8, "dev.hookedbehemoth.inputlog");
-    try wl.open(appid, "input event log", 1920, 1080);
+    try wl.open(appid, "input event log", 1920, 1080, .shm);
     push("connected: {d}x{d}, {s}", .{ wl.width, wl.height, if (wl.on_webos) "webOS" else "desktop" });
 
     while (wl.running) {

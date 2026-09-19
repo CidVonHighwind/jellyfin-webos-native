@@ -79,6 +79,8 @@ var getVersion: *const fn (?*anyopaque) callconv(.c) u32 = undefined;
 var addListener: *const fn (?*anyopaque, *const anyopaque, ?*anyopaque) callconv(.c) i32 = undefined;
 var dispatchFn: *const fn (?*anyopaque) callconv(.c) i32 = undefined;
 var roundtripFn: *const fn (?*anyopaque) callconv(.c) i32 = undefined;
+var dispatchPendingFn: *const fn (?*anyopaque) callconv(.c) i32 = undefined;
+var flushFn: *const fn (?*anyopaque) callconv(.c) i32 = undefined;
 
 /// A bound protocol object plus the interface it speaks, so requests can be
 /// named instead of numbered.
@@ -205,11 +207,13 @@ pub var running = true;
 /// True on the TV: the surface is fullscreen and managed by LSM.
 pub var on_webos = false;
 
-var display: ?*anyopaque = null;
+/// The wl_display, for EGL (`eglGetDisplay`) and anything else native.
+pub var display: ?*anyopaque = null;
 var registry: Proxy = .{};
 var compositor: Proxy = .{};
 var shm: Proxy = .{};
-var surface: Proxy = .{};
+/// The wl_surface, for wl_egl_window_create.
+pub var surface: Proxy = .{};
 var webos_shell: Proxy = .{};
 var xdg_wm: Proxy = .{};
 var xdg_surf: Proxy = .{};
@@ -219,9 +223,13 @@ var configured = false;
 var seat_count: u8 = 0;
 var seats: [4]Proxy = @splat(.{});
 
+/// How the window's pixels get there: a CPU-written shm buffer, or nothing at
+/// all because something else (EGL) will attach its own buffers.
+pub const Buffers = enum { shm, external };
+
 /// Connect, bind a shell and map a window. `w`/`h` are a hint; on the TV the
 /// surface is fullscreen and the real size wins.
-pub fn open(app_id: [*:0]const u8, title: [*:0]const u8, w: u32, h: u32) !void {
+pub fn open(app_id: [*:0]const u8, title: [*:0]const u8, w: u32, h: u32, buffers: Buffers) !void {
     libs[0] = c.dlopen("libwayland-client.so.0", .{ .NOW = true }) orelse return error.NoWaylandClient;
     libs[1] = c.dlopen("libwayland-webos-client.so.1", .{ .NOW = true }); // TV only
 
@@ -230,6 +238,8 @@ pub fn open(app_id: [*:0]const u8, title: [*:0]const u8, w: u32, h: u32) !void {
     addListener = fnPtr(@TypeOf(addListener), "wl_proxy_add_listener");
     dispatchFn = fnPtr(@TypeOf(dispatchFn), "wl_display_dispatch");
     roundtripFn = fnPtr(@TypeOf(roundtripFn), "wl_display_roundtrip");
+    dispatchPendingFn = fnPtr(@TypeOf(dispatchPendingFn), "wl_display_dispatch_pending");
+    flushFn = fnPtr(@TypeOf(flushFn), "wl_display_flush");
     const connect = fnPtr(*const fn (?[*:0]const u8) callconv(.c) ?*anyopaque, "wl_display_connect");
 
     display = connect(null) orelse return error.NoDisplay;
@@ -264,7 +274,7 @@ pub fn open(app_id: [*:0]const u8, title: [*:0]const u8, w: u32, h: u32) !void {
         while (!configured) _ = dispatchFn(display);
     } else return error.NoShell;
 
-    try allocBuffer();
+    if (buffers == .shm) try allocBuffer();
     return;
 }
 
@@ -303,6 +313,14 @@ pub fn present() void {
 /// Returns false once the window should close.
 pub fn dispatch() bool {
     if (dispatchFn(display) < 0) running = false;
+    return running;
+}
+
+/// Deliver whatever has already arrived without blocking, for apps that drive
+/// their own frame loop (EGL). Returns false once the window should close.
+pub fn poll() bool {
+    if (dispatchPendingFn(display) < 0) running = false;
+    _ = flushFn(display);
     return running;
 }
 
