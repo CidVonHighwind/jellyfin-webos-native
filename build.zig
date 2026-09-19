@@ -21,7 +21,7 @@ const std = @import("std");
 
 /// `fbflash` pokes /dev/fb0 with raw syscalls and needs no libc, so it links
 /// fully static. The others need libc purely for dlopen.
-const App = struct { name: []const u8, src: []const u8, libc: bool, shaders: bool = false };
+const App = struct { name: []const u8, src: []const u8, libc: bool, shaders: bool = false, ui: bool = false };
 
 const apps = [_]App{
     .{ .name = "fbflash", .src = "src/fbflash.zig", .libc = false },
@@ -32,7 +32,8 @@ const apps = [_]App{
     .{ .name = "inputlog", .src = "src/inputlog.zig", .libc = true },
     .{ .name = "glinfo", .src = "src/glinfo.zig", .libc = true },
     .{ .name = "gltri", .src = "src/gltri.zig", .libc = true, .shaders = true },
-    .{ .name = "uidemo", .src = "src/uidemo.zig", .libc = true, .shaders = true },
+    .{ .name = "uidemo", .src = "src/uidemo.zig", .libc = true, .shaders = true, .ui = true },
+    .{ .name = "jellyfin", .src = "src/jellyfin.zig", .libc = true, .shaders = true, .ui = true },
     .{ .name = "ndlplay", .src = "src/ndlplay.zig", .libc = true },
 };
 
@@ -75,7 +76,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         addAssets(b, exe, app);
-        if (std.mem.eql(u8, app.name, "uidemo")) addUiDeps(b, exe.root_module, target, optimize);
+        if (app.ui) addUiDeps(b, exe.root_module, target, optimize);
         b.installArtifact(exe);
         exes.put(app.name, exe) catch @panic("OOM");
     }
@@ -142,7 +143,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     addAssets(b, host_exe, chosen_app);
-    if (std.mem.eql(u8, chosen_app.name, "uidemo")) addUiDeps(b, host_exe.root_module, b.resolveTargetQuery(.{}), optimize);
+    if (chosen_app.ui) addUiDeps(b, host_exe.root_module, b.resolveTargetQuery(.{}), optimize);
     const run_host = b.addRunArtifact(host_exe);
     b.step("run-host", "Build -Dapp for this PC and run it locally").dependOn(&run_host.step);
 
@@ -393,6 +394,14 @@ const ipk_script =
     \\for extra in icon.png largeIcon.png splash.png; do
     \\  [ -f "assets/$extra" ] && cp "assets/$extra" "$work/data/usr/palm/applications/$id/" || true
     \\done
+    \\# An installed app runs as a jail uid, not as the uid that owns the
+    \\# installed files, so it can only write to its own directory if that
+    \\# directory is world-writable. Every native app on the device ships it
+    \\# that way (com.limelight.webos and org.mariotaku.ihsplay are both 777);
+    \\# without this the app cannot store a token or cache artwork at all.
+    \\mkdir -p "$work/data/usr/palm/applications/$id/conf" "$work/data/usr/palm/applications/$id/cache"
+    \\chmod 777 "$work/data/usr/palm/applications/$id" \
+    \\  "$work/data/usr/palm/applications/$id/conf" "$work/data/usr/palm/applications/$id/cache"
     \\size=$(du -ks "$work/data" | cut -f1)
     \\cat > "$work/control/control" <<CTL
     \\Package: $id

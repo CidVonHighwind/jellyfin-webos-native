@@ -3,8 +3,9 @@
 //! This keeps the useful boundary from `gallery-glfw/src/loom`: layout emits
 //! backend-neutral draw commands and the renderer knows nothing about widgets.
 //! The TV does not need custom 3D commands, clipboard, drag and drop,
-//! right-click state, or retained desktop-window machinery. Images are a small
-//! atlas-region command so media art stays in the same instanced batch.
+//! right-click state, or retained desktop-window machinery. An image is a
+//! texture plus a UV rectangle, so art from one shared atlas stays in the same
+//! instanced batch and art loaded at runtime costs only a binding change.
 
 const std = @import("std");
 
@@ -54,6 +55,10 @@ pub const Image = struct {
     uv: [4]f32,
     tint: Color = .{ 255, 255, 255, 255 },
     radius: f32 = 0,
+    /// Which texture to sample. 0 means the renderer's default media texture;
+    /// anything else is a texture the application made, and each distinct one
+    /// costs a draw call, because this GPU has no bindless textures.
+    texture: u32 = 0,
 };
 
 pub const Command = struct {
@@ -101,6 +106,11 @@ pub const Context = struct {
 
     pub fn image(self: *Context, rect: Rect, clip: ?Rect, uv: [4]f32, tint: Color, radius: f32) void {
         self.append(rect, clip, .{ .image = .{ .uv = uv, .tint = tint, .radius = radius } });
+    }
+
+    /// Same, from a texture the application owns rather than the default one.
+    pub fn textured(self: *Context, rect: Rect, clip: ?Rect, texture: u32, uv: [4]f32, tint: Color, radius: f32) void {
+        self.append(rect, clip, .{ .image = .{ .uv = uv, .tint = tint, .radius = radius, .texture = texture } });
     }
 
     fn append(self: *Context, rect: Rect, clip: ?Rect, data: @FieldType(Command, "data")) void {

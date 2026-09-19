@@ -75,6 +75,28 @@ webOS-Package-Format-Version: 2
 webOS-Packager-Version: x.y.x
 ```
 
+## An app that writes files needs world-writable directories
+
+An installed app runs as a **jail uid** (6350 on this TV) which owns none of
+its own files -- they are installed owned by uid 1000. So an app can only write
+inside its own directory if the package ships that directory world-writable.
+
+Both native reference apps do:
+
+```
+777 com.limelight.webos/          (conf/, cache/ -- settings, keys, box art)
+777 org.mariotaku.ihsplay/
+755 <a package built with a plain mkdir>   <- every write fails, silently
+```
+
+`ipk_script` ships `conf/` and `cache/` at `777` for this reason. The
+give-away that this is the real mechanism is the ownership of files the app
+writes afterwards: `6350:5000`, not the installing uid.
+
+Note that the *top-level* app directory comes back `755` from the install
+service regardless; only the subdirectories keep the mode the package set, so
+put writable state in a subdirectory rather than the app root.
+
 ## appinfo.json for a native app
 
 Minimum that works, cross-checked against installed native apps

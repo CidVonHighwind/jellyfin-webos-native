@@ -11,6 +11,7 @@ marked as unverified.
 | [opengl.md](opengl.md) | OpenGL ES 3.2 capabilities, GPU timing, and the Slang -> GLSL ES pipeline |
 | [fonts.md](fonts.md) | Installed TV fonts and the native UI font selection order |
 | [vulkan.md](vulkan.md) | The Mali ICD, the missing loader, the missing WSI, and how to initialise anyway |
+| [jellyfin.md](jellyfin.md) | **The Jellyfin client**: storage and artwork caching, the libpng-not-libjpeg decision, audio formats for later |
 | [ndl.md](ndl.md) | **NDL: hardware video decode on the video plane** — interface, the four traps, punch-through |
 | [multimedia.md](multimedia.md) | Hardware video decode: NDL_directmedia, GStreamer, device nodes |
 | [codecs.md](codecs.md) | Full codec support: hardware limits, containers, which API to use |
@@ -54,6 +55,7 @@ Working and verified on-device:
 - `gltri.zig` — **1000 instanced rotating triangles at 60 fps** with CPU/GPU frame times
 - `ndlplay.zig` — **hardware video via NDL**: 4K30 and 1080p120 from storage, and a live TCP stream
 - `uidemo.zig` — **one-batch MSDF UI**, remote focus and a 10,000-row virtual list
+- `jellyfin.zig` — **a real Jellyfin client**: discovery, sign-in, home rows, a virtual library grid with server artwork, shows down to episodes
 
 Build and deploy with `build.zig`; SSH target comes from `.env`:
 
@@ -67,4 +69,7 @@ zig build info                # show resolved .env
 Not yet built:
 
 - **the Vulkan triangle** — design in [vulkan.md](vulkan.md#getting-a-triangle-on-screen)
+- **playback in the Jellyfin client** — it resolves a stream URL but decodes
+  nothing; the container demuxer and the audio union are in
+  [jellyfin.md](jellyfin.md#audio-for-later)
 (The PC-cursor-as-remote idea was dropped — see [input.md](input.md).)

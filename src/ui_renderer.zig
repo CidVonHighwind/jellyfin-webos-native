@@ -29,9 +29,15 @@ const fragment_sources = [_][]const u8{
     @embedFile("ui_glyph"),
     @embedFile("ui_image"),
 };
-const media_pixels = @embedFile("media_atlas");
-const media_width = 768;
-const media_height = 432;
+/// A default texture for `Context.image`, for an application whose artwork is
+/// known up front -- `uidemo`'s baked atlas. An application that loads images
+/// at runtime passes null and makes its own textures with `createTexture`.
+pub const Media = struct {
+    width: u32,
+    height: u32,
+    /// RGB8, `width * height * 3` bytes.
+    pixels: []const u8,
+};
 
 const GL_VERTEX_SHADER = 0x8B31;
 const GL_FRAGMENT_SHADER = 0x8B30;
@@ -130,6 +136,7 @@ var glActiveTexture: *const fn (u32) callconv(.c) void = undefined;
 var glTexStorage2D: *const fn (u32, i32, u32, i32, i32) callconv(.c) void = undefined;
 var glTexSubImage2D: *const fn (u32, i32, i32, i32, i32, i32, u32, u32, *const anyopaque) callconv(.c) void = undefined;
 var glTexParameteri: *const fn (u32, u32, i32) callconv(.c) void = undefined;
+var glDeleteTextures: *const fn (i32, [*]const u32) callconv(.c) void = undefined;
 
 fn loadGl() void {
     inline for (.{
@@ -140,7 +147,7 @@ fn loadGl() void {
         .{ "glBindBuffer", &glBindBuffer },                   .{ "glBufferData", &glBufferData },                   .{ "glBufferSubData", &glBufferSubData },             .{ "glBindBufferBase", &glBindBufferBase },
         .{ "glGenVertexArrays", &glGenVertexArrays },         .{ "glBindVertexArray", &glBindVertexArray },         .{ "glVertexAttribPointer", &glVertexAttribPointer }, .{ "glEnableVertexAttribArray", &glEnableVertexAttribArray },
         .{ "glVertexAttribDivisor", &glVertexAttribDivisor }, .{ "glDrawArraysInstanced", &glDrawArraysInstanced }, .{ "glGenTextures", &glGenTextures },                 .{ "glBindTexture", &glBindTexture },
-        .{ "glActiveTexture", &glActiveTexture },             .{ "glTexStorage2D", &glTexStorage2D },               .{ "glTexSubImage2D", &glTexSubImage2D },             .{ "glTexParameteri", &glTexParameteri },
+        .{ "glActiveTexture", &glActiveTexture },             .{ "glTexStorage2D", &glTexStorage2D },               .{ "glTexSubImage2D", &glTexSubImage2D },             .{ "glTexParameteri", &glTexParameteri },        .{ "glDeleteTextures", &glDeleteTextures },
     }) |entry| entry[1].* = gl.proc(@TypeOf(entry[1].*), entry[0]);
 }
 
@@ -203,7 +210,7 @@ pub const Renderer = struct {
         return total;
     }
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io) !Renderer {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, media: ?Media) !Renderer {
         loadGl();
         var atlas = try glyphs.Atlas.init(allocator, io);
         errdefer atlas.deinit();
@@ -245,17 +252,8 @@ pub const Renderer = struct {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-        var media_texture: u32 = 0;
-        glGenTextures(1, @ptrCast(&media_texture));
-        // Same unit as the glyph atlas: only one of them is bound at a time.
-        glActiveTexture(ATLAS_UNIT);
-        glBindTexture(GL_TEXTURE_2D, media_texture);
-        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGB8, media_width, media_height);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, media_width, media_height, GL_RGB, GL_UNSIGNED_BYTE, media_pixels.ptr);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        // Same unit as the glyph atlas: only one texture is bound at a time.
+        const media_texture = if (media) |m| makeTexture(m.width, m.height, m.pixels) else texture;
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
@@ -279,6 +277,28 @@ pub const Renderer = struct {
     pub fn deinit(self: *Renderer) void {
         self.instances.deinit(self.allocator);
         self.atlas.deinit();
+    }
+
+    /// A texture of its own for one image, for `Context.textured`.
+    ///
+    /// Deliberately not an atlas: artwork arrives at whatever size the server
+    /// felt like returning, an atlas would have to crop every image to a fixed
+    /// tile, and recycling tiles in a scrolling grid means uploading over a
+    /// tile something else may still be drawing from. The cost is one draw
+    /// call per distinct texture on screen, which is what the batcher already
+    /// does for a binding change.
+    pub fn createTexture(self: *Renderer, width: u32, height: u32, rgb: []const u8) u32 {
+        std.debug.assert(rgb.len >= @as(usize, width) * height * 3);
+        const id = makeTexture(width, height, rgb);
+        // The batcher tracks what it bound last; this bypassed it.
+        self.state = null;
+        return id;
+    }
+
+    pub fn destroyTexture(self: *Renderer, id: u32) void {
+        if (id == 0) return;
+        glDeleteTextures(1, @ptrCast(&id));
+        self.state = null;
     }
 
     pub fn measure(self: *const Renderer, text: []const u8, size: f32) f32 {
@@ -314,7 +334,7 @@ pub const Renderer = struct {
                 self.appendText(command.rect, command.clip, t);
             },
             .image => |i| {
-                self.want(.image, self.media_texture, uniforms, true);
+                self.want(.image, if (i.texture != 0) i.texture else self.media_texture, uniforms, true);
                 self.push(command.rect, command.clip, i.uv, i.tint, i.radius, 0);
             },
         };
@@ -386,6 +406,23 @@ pub const Renderer = struct {
         }) catch {};
     }
 };
+
+/// RGB8 into a fresh immutable-storage texture, clamped and linear -- the
+/// settings every texture here wants.
+fn makeTexture(width: u32, height: u32, rgb: []const u8) u32 {
+    var id: u32 = 0;
+    glGenTextures(1, @ptrCast(&id));
+    glActiveTexture(ATLAS_UNIT);
+    glBindTexture(GL_TEXTURE_2D, id);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGB8, @intCast(width), @intCast(height));
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, @intCast(width), @intCast(height), GL_RGB, GL_UNSIGNED_BYTE, rgb.ptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    return id;
+}
 
 fn norm(color: loom.Color) [4]f32 {
     return .{

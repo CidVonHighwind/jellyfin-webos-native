@@ -679,7 +679,7 @@ pub fn main(init: std.process.Init) !void {
     glViewport(0, 0, @intCast(gl.width), @intCast(gl.height));
     glClearColor(9.0 / 255.0, 13.0 / 255.0, 22.0 / 255.0, 1);
     const renderer_start = nowNs();
-    var renderer = try UiRenderer.init(init.gpa, init.io);
+    var renderer = try UiRenderer.init(init.gpa, init.io, .{ .width = 768, .height = 432, .pixels = @embedFile("media_atlas") });
     defer renderer.deinit();
     std.debug.print("UI renderer init: {d:.2} ms\n", .{@as(f64, @floatFromInt(nowNs() - renderer_start)) / std.time.ns_per_ms});
     var ctx = loom.Context.init(init.gpa);

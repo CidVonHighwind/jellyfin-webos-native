@@ -13,6 +13,7 @@ library is `dlopen`'d at runtime.
 | `ndlplay` | hardware video via NDL DirectMedia — 1080p120 and 4K H.265 from storage or a live TCP stream, **verified on device** |
 | `gltri` | 1000 instanced rotating triangles via GL ES 3.2, CPU/GPU frame times on screen — **verified on device** |
 | `uidemo` | one-batch instanced UI, MSDF text, remote navigation and a 10,000-row virtual list — **verified on device** |
+| `jellyfin` | a Jellyfin client: discovery, sign-in, Quick Connect, home rows, a virtual library grid with server artwork, shows down to episodes — **verified on device** |
 | `glinfo` | EGL + OpenGL ES capabilities, limits and extensions |
 | `inputlog` | on-screen log of every input event — maps the remote and the cursor, **verified on device** |
 | `wlbox` | fullscreen red box via Wayland `wl_shm` + `wl_webos_shell` — **verified on device** |
@@ -31,6 +32,9 @@ ES, Vulkan, codecs, input, network, packaging.
 - `openssh` — `ssh`/`scp` for deploy
 - `tar`, `sed`, `coreutils` — used by the `.ipk` packager
 - `ffmpeg` — only for `zig build videos` / `zig build stream` (the NDL demo)
+- nothing for the `jellyfin` app: it `dlopen`s the TV's own `libpng16.so.16`
+  for artwork, like every other device library here — see
+  [docs/jellyfin.md](docs/jellyfin.md#artwork-why-libpng-and-why-not-the-jpeg)
 - **`slangc`** ([Slang](https://shader-slang.org/)) — only for the GL apps, which
   compile their shaders from `src/shaders/*.slang` at build time
 - `glslangValidator` — optional; if present, every generated shader is validated
@@ -153,6 +157,18 @@ INPUTLOG_DUMP=1 zig build run-host -Dapp=inputlog
 GLTRI_DUMP=1    zig build run-host -Dapp=gltri     # glReadPixels -> ASCII
 UI_SCREEN=library UI_CAPTURE=uidemo.ppm zig build run-host -Dapp=uidemo # glReadPixels -> PPM
 ```
+
+`jellyfin` takes the same environment plus a replayed remote, since there is no
+way to click through it headlessly:
+
+```sh
+set -a; . ./.env; set +a          # server address and credentials
+UI_SCRIPT=oddo UI_CAPTURE=jellyfin.ppm zig build run-host -Dapp=jellyfin
+```
+
+`u`/`d`/`l`/`r` are the arrows, `o` is OK, `b` is Back; each press waits for the
+fetcher to go idle, so a script cannot race a request. See
+[docs/jellyfin.md](docs/jellyfin.md).
 
 `uidemo` can also capture its current screen with F12. Both paths read this
 application's OpenGL backbuffer directly; they do not use a desktop screenshot
