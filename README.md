@@ -101,6 +101,9 @@ build.zig     build, package, deploy, install, launch
 - `GL_EXT_disjoint_timer_query` is advertised but returns nothing on this
   driver, and Slang cannot emit GLSL ES directly — both are worked around and
   explained in [docs/opengl.md](docs/opengl.md).
+- The panel is 120 Hz FreeSync but **the graphics plane is a fixed 1080p60**
+  (DRM CRTC mode, `wl_output`, and no 120 Hz mode on the connector). Apps here
+  take their size and rate from `wl_output` and never assume one.
 
 Each is explained in [docs/](docs/README.md).
 

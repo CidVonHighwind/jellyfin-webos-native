@@ -90,6 +90,46 @@ frame's first GL call, so a wall-clock "CPU time" just reports the refresh
 interval back at you — the first version of this did exactly that and read
 16.5 ms.
 
+## Refresh rate: the graphics plane is 60 Hz, whatever the panel does
+
+The TV panel is 120 Hz with FreeSync. **The LSM graphics plane is not.** Nothing
+in the app assumes a rate, but the rate that comes back is 60:
+
+- `wl_output.mode` reports `1920x1080` at **60000 mHz**.
+- The DRM CRTC agrees — `/sys/kernel/debug/dri/0/state`:
+  `mode: "1920x1080": 60 148500 1920 2008 2052 2200 1080 1084 1089 1125` — a
+  stock 148.5 MHz 1080p60 timing, with no `mode_changed` pending.
+- `/sys/class/drm/card0-TV-1/modes` lists only `1920x1080`, `3840x2160`,
+  `1280x720` — one entry each, so no 120 Hz variant is exposed to DRM at all.
+- There is no Wayland protocol on this device to ask for one:
+  `wl_starfish_output` sounds promising but its only requests are
+  `set_stereoscope` / `stereoscope_hint`, and no `wp_tearing_control_manager_v1`
+  or presentation-timing global is advertised.
+
+So 120 Hz and VRR belong to the TV's video/HDMI path, not to the plane a native
+Wayland client draws into. Nothing here is hardcoded to 60, and if that plane
+ever changes the app follows it automatically:
+
+- the window size comes from `wl_output` (`wl.open(..., 0, 0, ...)`), never from
+  a literal;
+- the refresh rate comes from `wl_output.mode` and is re-read whenever the
+  compositor sends a new one;
+- animation is driven by elapsed seconds, so it looks identical at any rate;
+- the overlay shows **measured Hz / reported Hz** side by side, so a mismatch or
+  a mode change is visible on screen.
+
+`SWAP_INTERVAL` in the environment sets the EGL swap interval (default 1).
+`SWAP_INTERVAL=0` presents unthrottled, which is what a variable-refresh output
+wants and also shows the headroom:
+
+```
+SWAP_INTERVAL=1   frame 16.66 ms    60 Hz    (compositor-throttled)
+SWAP_INTERVAL=0   frame  2.68 ms   373 Hz    (same scene, no throttle)
+```
+
+1000 triangles cost 0.4 ms of CPU and ~0.9 ms of GPU, so the 60 Hz cap is the
+compositor's, not the app's — a 120 Hz plane would need no code change.
+
 ## Shaders: Slang to GLSL ES
 
 Shaders are written in [Slang](https://shader-slang.org/) (`src/shaders/*.slang`)

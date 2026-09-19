@@ -19,7 +19,7 @@ fn sleepMs(ms: u32) void {
 
 pub fn main() !void {
     const appid = std.c.getenv("APPID") orelse @as([*:0]const u8, "dev.hookedbehemoth.wlbox");
-    try wl.open(appid, "red box", 1920, 1080, .shm);
+    try wl.open(appid, "red box", 0, 0, .shm);
     std.debug.print("appId={s} {d}x{d}\n", .{ std.mem.sliceTo(appid, 0), wl.width, wl.height });
 
     for (0..10) |i| {

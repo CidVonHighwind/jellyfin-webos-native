@@ -119,12 +119,25 @@ pub fn init(app_id: [*:0]const u8, title: [*:0]const u8, w: u32, h: u32) !void {
     const ctx_attrs = [_]i32{ EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
     egl_context = eglCreateContext(egl_display, config, null, &ctx_attrs) orelse return error.NoEglContext;
     if (eglMakeCurrent(egl_display, egl_surface, egl_surface, egl_context) == 0) return error.EglMakeCurrentFailed;
-    _ = eglSwapInterval(egl_display, 1);
+    // 1 = throttle to the compositor. SWAP_INTERVAL=0 in the environment lets
+    // frames go out as fast as they are drawn, which is what a variable-refresh
+    // output wants and also shows what the GPU could actually sustain.
+    setSwapInterval(if (c.getenv("SWAP_INTERVAL")) |v| parseInterval(v) else 1);
 
     std.debug.print("EGL {d}.{d} vendor={s}\n  apis={s}\n", .{
         major,                                                         minor,
         std.mem.sliceTo(eglQueryString(egl_display, EGL_VENDOR).?, 0), std.mem.sliceTo(eglQueryString(egl_display, EGL_CLIENT_APIS).?, 0),
     });
+}
+
+pub var swap_interval: i32 = 1;
+
+pub fn setSwapInterval(n: i32) void {
+    if (eglSwapInterval(egl_display, n) != 0) swap_interval = n;
+}
+
+fn parseInterval(v: [*:0]const u8) i32 {
+    return std.fmt.parseInt(i32, std.mem.sliceTo(v, 0), 10) catch 1;
 }
 
 pub fn swap() void {

@@ -188,7 +188,7 @@ fn program(vs_src: []const u8, fs_src: []const u8) u32 {
 // ------------------------------------------------------------------- overlay
 
 const OVERLAY_COLS = 22;
-const OVERLAY_ROWS = 4;
+const OVERLAY_ROWS = 5;
 const OVERLAY_W = OVERLAY_COLS * txt.GLYPH_W;
 const OVERLAY_H = OVERLAY_ROWS * txt.GLYPH_H;
 const OVERLAY_ZOOM = 2; // on-screen magnification of the 1x rasterisation
@@ -274,7 +274,7 @@ fn dumpFrame() void {
 
 pub fn main() !void {
     const appid = std.c.getenv("APPID") orelse @as([*:0]const u8, "dev.hookedbehemoth.gltri");
-    try gl.init(appid, "1000 triangles", 1920, 1080);
+    try gl.init(appid, "1000 triangles", 0, 0);
     loadGl();
 
     const w: i32 = @intCast(gl.width);
@@ -384,7 +384,10 @@ pub fn main() !void {
     // has finished that frame, so the previous frame's query is the one to read.
     var queries: [2]u32 = @splat(0);
     if (gpu_mode == .query) glGenQueriesEXT.?(2, &queries);
-    std.debug.print("{d} instances, GPU timing: {s}\n", .{ INSTANCES, @tagName(gpu_mode) });
+    std.debug.print("{d} instances at {d}x{d}, output {d}.{d:0>3} Hz, swap interval {d}, GPU timing: {s}\n", .{
+        INSTANCES,             gl.width,         gl.height,          wl.refresh_mhz / 1000,
+        wl.refresh_mhz % 1000, gl.swap_interval, @tagName(gpu_mode),
+    });
 
     // A couple of frames first, so the timer query has a result to show.
     var dump_after: u32 = if (std.c.getenv("GLTRI_DUMP") != null) 3 else 0;
@@ -444,11 +447,20 @@ pub fn main() !void {
             if (gpu_mode == .finish) "*" else " ", gpu_ms,
         }) catch "gpu ?");
         overlayLine(2, std.fmt.bufPrint(&line, "frame{d: >6.2} ms", .{frame_ms}) catch "frame ?");
-        overlayLine(3, std.fmt.bufPrint(&line, "{d} tris", .{INSTANCES}) catch "?");
+        overlayLine(4, std.fmt.bufPrint(&line, "{d} tris", .{INSTANCES}) catch "?");
+        // Both numbers on purpose: what the output says it runs at, and what
+        // we are actually presenting. On a variable-refresh output they differ.
+        overlayLine(3, std.fmt.bufPrint(&line, "{d: >5.1}/{d: >5.1} Hz", .{
+            if (frame_ms > 0) 1000.0 / frame_ms else 0.0,
+            @as(f64, @floatFromInt(wl.refresh_mhz)) / 1000.0,
+        }) catch "hz ?");
         // Same numbers as the overlay, once a second, so `zig build run` over
         // ssh shows them without a camera pointed at the TV.
         if (dump_after > 0 or frames % 60 == 0)
-            std.debug.print("cpu {d:.2} ms  gpu {d:.2} ms  frame {d:.2} ms\n", .{ cpu_ms, gpu_ms, frame_ms });
+            std.debug.print("cpu {d:.2} ms  gpu{s}{d:.2} ms  frame {d:.2} ms  {d:.1} Hz\n", .{
+                cpu_ms,   if (gpu_mode == .finish) "* " else " ",       gpu_ms,
+                frame_ms, if (frame_ms > 0) 1000.0 / frame_ms else 0.0,
+            });
         glUseProgram(text_prog);
         glActiveTexture(GL_TEXTURE0 + TEXT_ATLAS_UNIT);
         glBindTexture(GL_TEXTURE_2D, overlay_tex);

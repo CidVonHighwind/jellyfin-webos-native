@@ -209,7 +209,7 @@ pub fn main() !void {
 
     wl.on_event = onEvent;
     const appid = std.c.getenv("APPID") orelse @as([*:0]const u8, "dev.hookedbehemoth.inputlog");
-    try wl.open(appid, "input event log", 1920, 1080, .shm);
+    try wl.open(appid, "input event log", 0, 0, .shm);
     push("connected: {d}x{d}, {s}", .{ wl.width, wl.height, if (wl.on_webos) "webOS" else "desktop" });
 
     while (wl.running) {

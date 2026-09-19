@@ -207,6 +207,13 @@ pub var running = true;
 /// True on the TV: the surface is fullscreen and managed by LSM.
 pub var on_webos = false;
 
+/// The current mode of the first wl_output, from the compositor. `refresh_mhz`
+/// is millihertz, as the protocol reports it (60000 = 60 Hz); 0 means the
+/// compositor never sent a mode.
+pub var output_width: u32 = 0;
+pub var output_height: u32 = 0;
+pub var refresh_mhz: u32 = 0;
+
 /// The wl_display, for EGL (`eglGetDisplay`) and anything else native.
 pub var display: ?*anyopaque = null;
 var registry: Proxy = .{};
@@ -219,6 +226,7 @@ var xdg_wm: Proxy = .{};
 var xdg_surf: Proxy = .{};
 var xdg_top: Proxy = .{};
 var buffer: Proxy = .{};
+var output: Proxy = .{};
 var configured = false;
 var seat_count: u8 = 0;
 var seats: [4]Proxy = @splat(.{});
@@ -227,8 +235,8 @@ var seats: [4]Proxy = @splat(.{});
 /// all because something else (EGL) will attach its own buffers.
 pub const Buffers = enum { shm, external };
 
-/// Connect, bind a shell and map a window. `w`/`h` are a hint; on the TV the
-/// surface is fullscreen and the real size wins.
+/// Connect, bind a shell and map a window. Pass 0 for `w`/`h` to take the
+/// output's own mode, which is what fullscreen on the TV gets anyway.
 pub fn open(app_id: [*:0]const u8, title: [*:0]const u8, w: u32, h: u32, buffers: Buffers) !void {
     libs[0] = c.dlopen("libwayland-client.so.0", .{ .NOW = true }) orelse return error.NoWaylandClient;
     libs[1] = c.dlopen("libwayland-webos-client.so.1", .{ .NOW = true }); // TV only
@@ -252,8 +260,9 @@ pub fn open(app_id: [*:0]const u8, title: [*:0]const u8, w: u32, h: u32, buffers
     if (!compositor.ok() or !shm.ok()) return error.MissingGlobals;
 
     surface = compositor.new("create_surface", iface("wl_surface_interface"), .{});
-    width = w;
-    height = h;
+    width = if (w != 0) w else output_width;
+    height = if (h != 0) h else output_height;
+    if (width == 0 or height == 0) return error.NoOutputMode;
 
     if (webos_shell.ok()) {
         on_webos = true;
@@ -352,6 +361,9 @@ fn onGlobal(_: ?*anyopaque, _: ?*anyopaque, name: u32, i: [*:0]const u8, _: u32)
             webos_shell = bindGlobal(name, iface("wl_webos_shell_interface"), 1);
     } else if (std.mem.eql(u8, s, "xdg_wm_base")) {
         xdg_wm = bindGlobal(name, &xdg_wm_base_i, 1);
+    } else if (std.mem.eql(u8, s, "wl_output") and !output.ok()) {
+        output = bindGlobal(name, iface("wl_output_interface"), 1);
+        output.listen(&output_listener, null);
     } else if (std.mem.eql(u8, s, "wl_seat") and seat_count < seats.len) {
         // The TV advertises three seats -- remote, panel buttons and a virtual
         // one -- and does not say which is which. Listen to all of them and let
@@ -396,6 +408,22 @@ const xdg_toplevel_listener = extern struct {
     configure: @TypeOf(&onToplevelConfigure),
     close: @TypeOf(&onToplevelClose),
 }{ .configure = onToplevelConfigure, .close = onToplevelClose };
+
+fn onMode(_: ?*anyopaque, _: ?*anyopaque, flags: u32, w: i32, h: i32, refresh: i32) callconv(.c) void {
+    if (flags & 1 == 0) return; // WL_OUTPUT_MODE_CURRENT
+    output_width = @intCast(w);
+    output_height = @intCast(h);
+    refresh_mhz = @intCast(@max(refresh, 0));
+}
+const output_listener = extern struct {
+    geometry: Nop,
+    mode: @TypeOf(&onMode),
+    rest: [4]Nop,
+}{
+    .geometry = nop,
+    .mode = onMode,
+    .rest = @splat(nop),
+};
 
 // -------------------------------------------------------------------- input
 //

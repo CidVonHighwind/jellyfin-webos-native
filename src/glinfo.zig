@@ -55,7 +55,7 @@ const limits = [_]struct { u32, []const u8 }{
 };
 
 pub fn main() !void {
-    try gl.init("dev.hookedbehemoth.glinfo", "gl info", 1920, 1080);
+    try gl.init("dev.hookedbehemoth.glinfo", "gl info", 0, 0);
     glGetString = gl.proc(@TypeOf(glGetString), "glGetString");
     glGetIntegerv = gl.proc(@TypeOf(glGetIntegerv), "glGetIntegerv");
     glGetStringi = gl.proc(@TypeOf(glGetStringi), "glGetStringi");
