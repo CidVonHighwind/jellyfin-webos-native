@@ -11,6 +11,7 @@ library is `dlopen`'d at runtime.
 | | |
 |---|---|
 | `gltri` | 1000 instanced rotating triangles via GL ES 3.2, CPU/GPU frame times on screen — **verified on device** |
+| `uidemo` | one-batch instanced UI, MSDF text, remote navigation and a 10,000-row virtual list — **verified on device** |
 | `glinfo` | EGL + OpenGL ES capabilities, limits and extensions |
 | `inputlog` | on-screen log of every input event — maps the remote and the cursor, **verified on device** |
 | `wlbox` | fullscreen red box via Wayland `wl_shm` + `wl_webos_shell` — **verified on device** |
@@ -32,6 +33,8 @@ ES, Vulkan, codecs, input, network, packaging.
   compile their shaders from `src/shaders/*.slang` at build time
 - `glslangValidator` — optional; if present, every generated shader is validated
   against GLSL ES 3.20 before it is embedded
+- the sibling `../gallery-glfw` checkout, which supplies Loom's vendored
+  pure-Zig TrueType/MSDF generator and `SkylineBinPack` for `uidemo`
 - An LG webOS TV with **root SSH access** (e.g. via
   [Homebrew Channel](https://github.com/webosbrew/webos-homebrew-channel)) and
   your key installed
@@ -90,6 +93,7 @@ src/wl.zig  Wayland shim: one window, one shm buffer, all input.
             Picks wl_webos_shell on the TV and xdg_wm_base on a PC, so the
             same binary source runs in both places.
 src/        application sources
+src/loom/   TV-focused Loom subset: stacks, draw commands and virtual lists
 src/shaders/ Slang shaders, compiled to GLSL ES at build time
 assets/     icon.png, font8x16.bin and other packaged files
 tools/      dev-machine helpers (VNC screenshot)
@@ -138,3 +142,8 @@ GLTRI_DUMP=1    zig build run-host -Dapp=gltri     # glReadPixels -> ASCII
 `assets/font8x16.bin` is the ASCII range of
 [Terminus](https://terminus-font.sourceforge.net/) (OFL-1.1), extracted from
 `Lat2-Terminus16.psfu` as 95 glyphs of 16 bytes.
+
+`uidemo` instead uses the MSDF generator and `SkylineBinPack` from the sibling
+`../gallery-glfw` checkout. On the TV it opens the installed
+`LG_Smart_UI-Regular.ttf`; see [docs/fonts.md](docs/fonts.md) for the measured
+font inventory and fallbacks.

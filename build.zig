@@ -31,6 +31,7 @@ const apps = [_]App{
     .{ .name = "inputlog", .src = "src/inputlog.zig", .libc = true },
     .{ .name = "glinfo", .src = "src/glinfo.zig", .libc = true },
     .{ .name = "gltri", .src = "src/gltri.zig", .libc = true, .shaders = true },
+    .{ .name = "uidemo", .src = "src/uidemo.zig", .libc = true, .shaders = true },
     .{ .name = "ndlplay", .src = "src/ndlplay.zig", .libc = true },
 };
 
@@ -73,6 +74,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         addAssets(b, exe, app);
+        if (std.mem.eql(u8, app.name, "uidemo")) addUiDeps(b, exe.root_module, target, optimize);
         b.installArtifact(exe);
         exes.put(app.name, exe) catch @panic("OOM");
     }
@@ -139,6 +141,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     addAssets(b, host_exe, chosen_app);
+    if (std.mem.eql(u8, chosen_app.name, "uidemo")) addUiDeps(b, host_exe.root_module, b.resolveTargetQuery(.{}), optimize);
     const run_host = b.addRunArtifact(host_exe);
     b.step("run-host", "Build -Dapp for this PC and run it locally").dependOn(&run_host.step);
 
@@ -204,6 +207,57 @@ pub fn build(b: *std.Build) void {
     b.step("stream", "Publish a live stream from this PC and play it on the TV").dependOn(&stream.step);
 }
 
+/// The UI uses the same pure-Zig MSDF generator and SkylineBinPack as the
+/// sibling gallery project. They stay modules instead of becoming a C/system
+/// dependency, which keeps the TV cross-build sysroot-free.
+fn addUiDeps(
+    b: *std.Build,
+    root: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    const tt = b.createModule(.{
+        .root_source_file = b.path("../gallery-glfw/vendor/TrueType/TrueType.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const tt_options = b.addOptions();
+    tt_options.addOption(bool, "debug_todo", false);
+    tt.addOptions("build_options", tt_options);
+
+    // Overlay the upstream sources in the cache. Only edge_color differs: two
+    // random indices need an explicit usize narrowing on the TV's 32-bit ABI.
+    const msdf_files = [_][]const u8{
+        "Contour.zig",   "EdgeSegment.zig", "ErrorCorrection.zig", "Generator.zig",
+        "Scanline.zig",  "Shape.zig",       "SignedDistance.zig",  "coloring.zig",
+        "equations.zig", "math.zig",
+    };
+    const msdf_sources = b.addWriteFiles();
+    var msdf_root: std.Build.LazyPath = undefined;
+    for (msdf_files) |name| {
+        const copied = msdf_sources.addCopyFile(
+            b.path(b.fmt("../gallery-glfw/vendor/msdf-zig/src/{s}", .{name})),
+            name,
+        );
+        if (std.mem.eql(u8, name, "Generator.zig")) msdf_root = copied;
+    }
+    _ = msdf_sources.addCopyFile(b.path("src/msdf_edge_color.zig"), "edge_color.zig");
+
+    const msdf = b.createModule(.{
+        .root_source_file = msdf_root,
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{.{ .name = "TrueType", .module = tt }},
+    });
+    const skyline = b.createModule(.{
+        .root_source_file = b.path("../gallery-glfw/src/render/SkylineBinPack.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    root.addImport("msdf", msdf);
+    root.addImport("skyline", skyline);
+}
+
 /// Every app gets the font and the compiled shaders as embeddable modules.
 /// Unused ones cost nothing: an @embedFile nobody references is not emitted.
 fn addAssets(b: *std.Build, exe: *std.Build.Step.Compile, app: App) void {
@@ -228,6 +282,8 @@ const shaders = [_]Shader{
     .{ .import = "tri_fs", .src = "src/shaders/tri.slang", .entry = "fsMain", .stage = "fragment", .short = "frag" },
     .{ .import = "text_vs", .src = "src/shaders/text.slang", .entry = "vsText", .stage = "vertex", .short = "vert" },
     .{ .import = "text_fs", .src = "src/shaders/text.slang", .entry = "fsText", .stage = "fragment", .short = "frag" },
+    .{ .import = "ui_vs", .src = "src/shaders/ui.slang", .entry = "vsUi", .stage = "vertex", .short = "vert" },
+    .{ .import = "ui_fs", .src = "src/shaders/ui.slang", .entry = "fsUi", .stage = "fragment", .short = "frag" },
 };
 
 /// Compile one Slang entry point to GLSL ES. Slang only emits desktop GLSL

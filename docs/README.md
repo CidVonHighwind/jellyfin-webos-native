@@ -9,6 +9,7 @@ marked as unverified.
 | [device.md](device.md) | ABI, toolchain, build and deploy |
 | [display.md](display.md) | How to get pixels on screen; the 1080p60 graphics plane vs the 4K120 video planes |
 | [opengl.md](opengl.md) | OpenGL ES 3.2 capabilities, GPU timing, and the Slang -> GLSL ES pipeline |
+| [fonts.md](fonts.md) | Installed TV fonts and the native UI font selection order |
 | [vulkan.md](vulkan.md) | The Mali ICD, the missing loader, the missing WSI, and how to initialise anyway |
 | [multimedia.md](multimedia.md) | Hardware video decode: NDL_directmedia, GStreamer, device nodes |
 | [codecs.md](codecs.md) | Full codec support: hardware limits, containers, which API to use |
@@ -49,6 +50,7 @@ Working and verified on-device:
 - `inputlog.zig` — on-screen log of every input event; maps the remote and cursor
 - `glinfo.zig` — EGL/GL ES capabilities
 - `gltri.zig` — **1000 instanced rotating triangles at 60 fps** with CPU/GPU frame times
+- `uidemo.zig` — **one-batch MSDF UI**, remote focus and a 10,000-row virtual list
 
 Build and deploy with `build.zig`; SSH target comes from `.env`:
 
