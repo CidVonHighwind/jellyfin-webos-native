@@ -103,3 +103,97 @@ to `dlopen`. (Also present in `libSDL2`, `libWebOSCoreCompositor`,
 `liblsm-connector`, `libwayland-webos-server`, `libuwac0`, `libgm-wayland`.)
 
 Using it means no hand-written protocol tables anywhere in our code.
+
+## Two planes: graphics is 1080p60, video is 4K120
+
+The single most useful thing to understand about this platform: **rendering and
+video playback do not share a path.** "The TV does 4K120" is true of one of them
+and not the other.
+
+`/sys/kernel/debug/dri/0/state` shows three planes on one CRTC:
+
+```
+plane[32]: plane-0    fb allocated by = surface-manager
+                      format=AB24  modifier=0x800000000000062 (AFBC)
+                      size=1920x1080
+plane[34]: plane-1    crtc=(null)   color-encoding=ITU-R BT.601 YCbCr
+plane[36]: plane-2    crtc=(null)   color-encoding=ITU-R BT.601 YCbCr
+crtc[38]: mode: "1920x1080": 60 148500 1920 2008 2052 2200 1080 1084 1089 1125
+```
+
+Plane 0 is the **graphics plane** — the one every Wayland client, including
+everything in this repo, ends up in. The two idle YCbCr planes are **video
+planes**, fed by the hardware decoder, and they are where 4K120 lives.
+
+### Why the graphics plane is 1080p, and where that is decided
+
+It is a per-model configd value, not a negotiation. `surface-manager` reads it
+at startup (`/etc/surface-manager.d/eglfs_starfish.env`) and hands it straight
+to Qt's KMS backend as the DRM connector mode:
+
+```sh
+primary_geometry="$(luna-send ... '{"configNames":["com.webos.surfacemanager.compositorGeometry"]}' \
+                    || printf "1920x1080+0+0r0s1")"
+primary_resolution="${primary_geometry%[-+]?*[-+]?*r?*s?*}"
+WEBOS_COMPOSITOR_DISPLAY_CONFIG='[{"device":"/dev/dri/card0", ... "connector":{"mode":"1920x1080"} ...'
+```
+
+The value comes from a configd layer picked by device name. This set reports
+`o22n2`, which has no layer of its own, so it falls back to
+`/etc/configd/layers/base/com.webos.surfacemanager.json`:
+
+| layer | `compositorGeometry` |
+|---|---|
+| `base` (this TV) | `1920x1080+0+0r0s1` |
+| `e60n`, `o228k`, `o22n28k`, `o22n8k` | `3840x2160+0+0r0s1` |
+
+So a 4K graphics plane is a real configuration that LG ships — on other models.
+It matches their published guidance that app graphics are 1080p on 4K sets and
+720p on FHD sets; the display engine scales the plane to the panel.
+
+Two things follow:
+
+- **No client-side lever exists.** Only the DRM master (`surface-manager`) sets
+  the mode, there is no Wayland protocol to request one, and
+  `com.webos.service.config` refuses the query without the
+  `com.webos.surfacemanager` role. `wl_output` just reports the result.
+- **The only lever at all** is editing that configd layer (or adding a
+  `devicename/o22n2` one) and restarting `surface-manager`. Untested here, and
+  worth being careful with: a geometry the display engine rejects means no UI
+  until it is fixed over SSH. GPU cost would not be the problem — 1000
+  triangles take 0.9 ms at 1080p, so 4x the pixels still fits in a frame.
+
+**120 Hz is not reachable this way regardless.** The geometry string carries
+offset, rotation and scale (`+0+0r0s1`) but no refresh field, the connector
+advertises only three resolutions with no refresh variants, and its EDID reads
+0 bytes — `TV-1` is an internal connector into the SoC's display engine, not a
+link to the panel. See [opengl.md](opengl.md) for the measurements.
+
+### How 4K120 homebrew actually does it
+
+Moonlight-style clients — [moonlight-tv](https://github.com/mariotaku/moonlight-tv)
+and its 4K120-focused fork Aurora — never rasterise 4K120. They receive a
+compressed stream and hand it to the hardware decoder through **NDL
+DirectMedia**, which outputs on a video plane. The GL plane stays 1080p60 and
+carries only the overlay and UI.
+
+The device's own codec table ([device-codec-capability.json](device-codec-capability.json))
+agrees precisely:
+
+| codec | max | fps |
+|---|---|---|
+| H.265 | 4096x2304 | **120** |
+| H.264 | 4096x2304 | 60 |
+| HEVC entry | 4096x2176 | 60 |
+
+H.265 at 120 fps is the only 120 in the whole file. That is why those projects
+insist on HEVC rather than AV1 — and reportedly why AV1 is avoided for
+interactive streaming, at ~8-12 ms of decode latency against ~1 ms for H.265.
+
+So the honest summary for a native app here:
+
+- **Rendering your own frames**: 1080p60. Not negotiable from the client.
+- **Playing a video stream**: up to 4K120 HDR, via NDL DirectMedia on the video
+  plane — see [multimedia.md](multimedia.md) and [codecs.md](codecs.md).
+- Mixing the two is the normal design: video on its plane, your GL overlay on
+  the graphics plane, composited by the display engine.

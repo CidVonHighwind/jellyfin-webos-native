@@ -7,7 +7,7 @@ marked as unverified.
 | doc | contents |
 |---|---|
 | [device.md](device.md) | ABI, toolchain, build and deploy |
-| [display.md](display.md) | How to get pixels on screen; why the framebuffer route is closed |
+| [display.md](display.md) | How to get pixels on screen; the 1080p60 graphics plane vs the 4K120 video planes |
 | [opengl.md](opengl.md) | OpenGL ES 3.2 capabilities, GPU timing, and the Slang -> GLSL ES pipeline |
 | [vulkan.md](vulkan.md) | The Mali ICD, the missing loader, the missing WSI, and how to initialise anyway |
 | [multimedia.md](multimedia.md) | Hardware video decode: NDL_directmedia, GStreamer, device nodes |
@@ -27,7 +27,10 @@ marked as unverified.
    argument passing only* — the FPU is real and fast, but Zig's `gnueabi` target
    disables FP codegen and costs 10.5x. See [device.md](device.md).
 2. **The framebuffer cannot be written directly.** Scanout is AFBC-compressed and
-   owned by `surface-manager`. Wayland is the only route to the screen.
+   owned by `surface-manager`. Wayland is the only route to the screen — and
+   that route is a **1080p60 graphics plane**, set per model by configd. 4K120
+   belongs to the separate video planes and the hardware decoder, which is how
+   Moonlight-style homebrew claims it. See [display.md](display.md).
 3. **Vulkan works but cannot present.** The driver is a complete Vulkan 1.3.260
    ICD, but ships no `VK_KHR_wayland_surface` — so a normal swapchain cannot
    reach the display. Present via `zwp_linux_dmabuf_v1` instead, or use

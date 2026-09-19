@@ -107,7 +107,9 @@ in the app assumes a rate, but the rate that comes back is 60:
   or presentation-timing global is advertised.
 
 So 120 Hz and VRR belong to the TV's video/HDMI path, not to the plane a native
-Wayland client draws into. Nothing here is hardcoded to 60, and if that plane
+Wayland client draws into. The plane's 1920x1080 comes from a per-model configd
+value and 4K120 is a property of the *video* planes, not this one — the whole
+picture is in [display.md](display.md#two-planes-graphics-is-1080p60-video-is-4k120). Nothing here is hardcoded to 60, and if that plane
 ever changes the app follows it automatically:
 
 - the window size comes from `wl_output` (`wl.open(..., 0, 0, ...)`), never from
