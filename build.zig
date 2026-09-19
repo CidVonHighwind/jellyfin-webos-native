@@ -58,6 +58,7 @@ pub fn build(b: *std.Build) void {
     });
     const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSmall });
     const selected = b.option([]const u8, "app", "Which app for run/package/install-app") orelse "wlbox";
+    const strip_mod = b.option(bool, "strip", "Strip the executable") orelse false;
 
     var exes = std.StringHashMap(*std.Build.Step.Compile).init(b.allocator);
     for (apps) |app| {
@@ -68,6 +69,7 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
                 .link_libc = app.libc,
+                .strip = strip_mod,
             }),
         });
         addAssets(b, exe, app);

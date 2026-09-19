@@ -20,7 +20,7 @@ const tri_fs = @embedFile("tri_fs");
 const text_vs = @embedFile("text_vs");
 const text_fs = @embedFile("text_fs");
 
-const INSTANCES = 1000;
+const INSTANCES = 3000;
 const TRI_RADIUS = 0.045;
 
 // ------------------------------------------------------------------- GL bits
@@ -226,13 +226,18 @@ fn smooth(prev: f64, sample: f64) f64 {
 /// Read the frame back and print it as coarse ASCII, so the render can be
 /// checked without looking at a screen:
 ///   GLTRI_DUMP=1 zig build run-host -Dapp=gltri
-var readback: [1920 * 1080 * 4]u8 = undefined;
+const fb_size = 1920 * 1080 * 4;
 
-fn dumpFrame() void {
+fn dumpFrame(gpa: std.mem.Allocator) void {
+    var readback = gpa.alloc(u8, fb_size) catch {
+        std.log.warn("failed to allocate readback buffer", .{});
+        return;
+    };
+    defer gpa.free(readback);
     const w: usize = gl.width;
     const h: usize = gl.height;
     if (w * h * 4 > readback.len) return;
-    glReadPixels(0, 0, @intCast(w), @intCast(h), GL_RGBA, GL_UNSIGNED_BYTE, &readback);
+    glReadPixels(0, 0, @intCast(w), @intCast(h), GL_RGBA, GL_UNSIGNED_BYTE, readback.ptr);
     var lit: usize = 0;
     // 72x24 cells, each reporting the brightest pixel it covers.
     var row: usize = 0;
@@ -272,7 +277,8 @@ fn dumpFrame() void {
     std.debug.print("overlay: {d} white pixels\n", .{white});
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
     const appid = std.c.getenv("APPID") orelse @as([*:0]const u8, "dev.hookedbehemoth.gltri");
     try gl.init(appid, "1000 triangles", 0, 0);
     loadGl();
@@ -294,7 +300,10 @@ pub fn main() !void {
 
     // offset.x, offset.y, direction, speed, phase, size
     const FLOATS = 6;
-    var instances: [INSTANCES * FLOATS]f32 = undefined;
+    var instances = gpa.alloc(f32, INSTANCES * FLOATS) catch {
+        std.log.warn("failed to allocate triangle instances", .{});
+        return;
+    };
     var prng = std.Random.DefaultPrng.init(0x7A1B);
     const rnd = prng.random();
     for (0..INSTANCES) |i| {
@@ -324,7 +333,7 @@ pub fn main() !void {
     glVertexAttribPointer(0, 2, GL_FLOAT, 0, 2 * 4, 0); // position
 
     glBindBuffer(GL_ARRAY_BUFFER, ibo);
-    glBufferData(GL_ARRAY_BUFFER, @sizeOf(@TypeOf(instances)), &instances, GL_STATIC_DRAW);
+    glBufferData(GL_ARRAY_BUFFER, @as(isize, @intCast(@sizeOf(f32) * instances.len)), instances.ptr, GL_STATIC_DRAW);
     // These advance once per instance, not per vertex: { location, floats, byte offset }.
     inline for (.{ .{ 1, 2, 0 }, .{ 2, 1, 8 }, .{ 3, 1, 12 }, .{ 4, 1, 16 }, .{ 5, 1, 20 } }) |a| {
         glEnableVertexAttribArray(a[0]);
@@ -482,7 +491,7 @@ pub fn main() !void {
         if (dump_after > 0) {
             dump_after -= 1;
             if (dump_after == 0) {
-                dumpFrame();
+                dumpFrame(gpa);
                 return;
             }
         }
