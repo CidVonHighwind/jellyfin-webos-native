@@ -2,9 +2,9 @@
 //!
 //! This keeps the useful boundary from `gallery-glfw/src/loom`: layout emits
 //! backend-neutral draw commands and the renderer knows nothing about widgets.
-//! The TV does not need image/custom commands, text editing, clipboard, drag
-//! and drop, right-click state, or retained desktop-window machinery, so those
-//! are deliberately absent here.
+//! The TV does not need custom 3D commands, clipboard, drag and drop,
+//! right-click state, or retained desktop-window machinery. Images are a small
+//! atlas-region command so media art stays in the same instanced batch.
 
 const std = @import("std");
 
@@ -50,6 +50,12 @@ pub const Text = struct {
     size: f32,
 };
 
+pub const Image = struct {
+    uv: [4]f32,
+    tint: Color = .{ 255, 255, 255, 255 },
+    radius: f32 = 0,
+};
+
 pub const Command = struct {
     rect: Rect,
     clip: Rect,
@@ -57,6 +63,7 @@ pub const Command = struct {
         rectangle: Rectangle,
         border: Border,
         text: Text,
+        image: Image,
     },
 };
 
@@ -90,6 +97,10 @@ pub const Context = struct {
 
     pub fn label(self: *Context, rect: Rect, clip: ?Rect, contents: []const u8, color: Color, size: f32) void {
         self.append(rect, clip, .{ .text = .{ .contents = contents, .color = color, .size = size } });
+    }
+
+    pub fn image(self: *Context, rect: Rect, clip: ?Rect, uv: [4]f32, tint: Color, radius: f32) void {
+        self.append(rect, clip, .{ .image = .{ .uv = uv, .tint = tint, .radius = radius } });
     }
 
     fn append(self: *Context, rect: Rect, clip: ?Rect, data: @FieldType(Command, "data")) void {

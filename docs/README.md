@@ -11,6 +11,7 @@ marked as unverified.
 | [opengl.md](opengl.md) | OpenGL ES 3.2 capabilities, GPU timing, and the Slang -> GLSL ES pipeline |
 | [fonts.md](fonts.md) | Installed TV fonts and the native UI font selection order |
 | [vulkan.md](vulkan.md) | The Mali ICD, the missing loader, the missing WSI, and how to initialise anyway |
+| [ndl.md](ndl.md) | **NDL: hardware video decode on the video plane** — interface, the four traps, punch-through |
 | [multimedia.md](multimedia.md) | Hardware video decode: NDL_directmedia, GStreamer, device nodes |
 | [codecs.md](codecs.md) | Full codec support: hardware limits, containers, which API to use |
 | [packaging.md](packaging.md) | .ipk format, installing, and the reserved-namespace trap |
@@ -19,6 +20,7 @@ marked as unverified.
 | [device-codec-capability.json](device-codec-capability.json) | Raw LG codec capability table pulled from the TV |
 | [gstreamer-codec-elements.txt](gstreamer-codec-elements.txt) | Raw inventory: 219 GStreamer codec elements + caps |
 | [vulkan-extensions.txt](vulkan-extensions.txt) | Raw `vkinfo` dump: 9 instance + 102 device extensions |
+| [ndl-symbols.txt](ndl-symbols.txt) | Raw export lists of the four NDL libraries |
 | [opengl-capabilities.txt](opengl-capabilities.txt) | Raw `glinfo` dump: limits + 28 EGL and 101 GL extensions |
 
 ## The three facts that shape everything
@@ -50,6 +52,7 @@ Working and verified on-device:
 - `inputlog.zig` — on-screen log of every input event; maps the remote and cursor
 - `glinfo.zig` — EGL/GL ES capabilities
 - `gltri.zig` — **1000 instanced rotating triangles at 60 fps** with CPU/GPU frame times
+- `ndlplay.zig` — **hardware video via NDL**: 4K30 and 1080p120 from storage, and a live TCP stream
 - `uidemo.zig` — **one-batch MSDF UI**, remote focus and a 10,000-row virtual list
 
 Build and deploy with `build.zig`; SSH target comes from `.env`:

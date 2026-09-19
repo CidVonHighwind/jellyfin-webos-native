@@ -10,6 +10,7 @@ library is `dlopen`'d at runtime.
 
 | | |
 |---|---|
+| `ndlplay` | hardware video via NDL DirectMedia — 1080p120 and 4K H.265 from storage or a live TCP stream, **verified on device** |
 | `gltri` | 1000 instanced rotating triangles via GL ES 3.2, CPU/GPU frame times on screen — **verified on device** |
 | `uidemo` | one-batch instanced UI, MSDF text, remote navigation and a 10,000-row virtual list — **verified on device** |
 | `glinfo` | EGL + OpenGL ES capabilities, limits and extensions |
@@ -29,6 +30,7 @@ ES, Vulkan, codecs, input, network, packaging.
   versions may need small edits)
 - `openssh` — `ssh`/`scp` for deploy
 - `tar`, `sed`, `coreutils` — used by the `.ipk` packager
+- `ffmpeg` — only for `zig build videos` / `zig build stream` (the NDL demo)
 - **`slangc`** ([Slang](https://shader-slang.org/)) — only for the GL apps, which
   compile their shaders from `src/shaders/*.slang` at build time
 - `glslangValidator` — optional; if present, every generated shader is validated
@@ -62,6 +64,10 @@ zig build run-host -Dapp=inputlog  # build for this PC and run it in a local win
 zig build deploy                   # scp every app to the TV's temp dir
 
 zig build shot                     # screenshot the TV over VNC -> zig-out/shot.png
+
+zig build videos                   # encode demo clips with ffmpeg, push to the TV
+zig build play   -Dapp=ndlplay -Dsrc=/media/developer/videos/demo_1920x1080p120.h265
+zig build stream -Dapp=ndlplay -Dgeom=1920x1080p60   # publish a live stream from this PC
 
 zig build package     -Dapp=wlbox  # build zig-out/<id>_<version>_arm.ipk
 zig build install-app -Dapp=wlbox  # package, push and install via luna
@@ -123,7 +129,11 @@ build.zig     build, package, deploy, install, launch
   explained in [docs/opengl.md](docs/opengl.md).
 - The panel is 120 Hz FreeSync but **the graphics plane is a fixed 1080p60**
   (DRM CRTC mode, `wl_output`, and no 120 Hz mode on the connector). Apps here
-  take their size and rate from `wl_output` and never assume one.
+  take their size and rate from `wl_output` and never assume one. 4K and 120 fps
+  live on the **video plane**, via NDL — see [docs/ndl.md](docs/ndl.md).
+- NDL needs a Luna role, which is keyed on the installed binary's exact path, so
+  `zig build play` runs the *installed* binary over SSH rather than a copy in
+  `/tmp`. Three more NDL traps are in [docs/ndl.md](docs/ndl.md).
 
 Each is explained in [docs/](docs/README.md).
 
@@ -141,7 +151,12 @@ without a compositor at all:
 ```sh
 INPUTLOG_DUMP=1 zig build run-host -Dapp=inputlog
 GLTRI_DUMP=1    zig build run-host -Dapp=gltri     # glReadPixels -> ASCII
+UI_SCREEN=library UI_CAPTURE=uidemo.ppm zig build run-host -Dapp=uidemo # glReadPixels -> PPM
 ```
+
+`uidemo` can also capture its current screen with F12. Both paths read this
+application's OpenGL backbuffer directly; they do not use a desktop screenshot
+tool and cannot include other windows.
 
 `assets/font8x16.bin` is the ASCII range of
 [Terminus](https://terminus-font.sourceforge.net/) (OFL-1.1), extracted from

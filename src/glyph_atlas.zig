@@ -1,37 +1,42 @@
-//! MSDF glyph atlas adapted from `gallery-glfw/src/render/TextRenderer.zig`.
+//! Rasterised glyph atlas.
 //!
-//! The pure-Zig MSDF generator reads the TV's LG Smart UI font and glyphs are
-//! packed with the gallery renderer's `SkylineBinPack`. The TV demo prewarms
-//! printable ASCII; the rendering API stays small and has no FreeType or image
-//! renderer dependency.
+//! Glyphs are 8-bit coverage bitmaps rendered from the TV's LG Smart UI font
+//! and packed with the gallery renderer's `SkylineBinPack`. The TV demo
+//! prewarms printable ASCII; the rendering API stays small and has no FreeType
+//! or image renderer dependency.
+//!
+//! Bitmaps, not MSDF: this UI draws text at a handful of fixed sizes, where a
+//! distance field costs three channels and a median-of-three in the shader and
+//! buys nothing. `base_px` is the size glyphs are rasterised at; drawing far
+//! above it softens, which is the tradeoff. The packing, the gutter and the
+//! region bookkeeping are unchanged.
 
 const std = @import("std");
 const Skyline = @import("skyline");
 
 pub const base_px: f32 = 48;
-const glyph_px_size: u16 = 48;
-const glyph_px_range: u16 = 8;
 const gutter: u16 = 1;
-pub const bytes_per_pixel: u3 = 3;
+pub const bytes_per_pixel: u3 = 1;
 
 const KernelResult = extern struct {
     width: u16 = 0,
     height: u16 = 0,
     pixel_len: u32 = 0,
     advance: f32 = 0,
-    bearing_x: f32 = 0,
-    bearing_y: f32 = 0,
+    off_x: f32 = 0,
+    off_y: f32 = 0,
 };
 
-extern fn uiMsdfCreate(font: [*]const u8, font_len: usize) callconv(.c) ?*anyopaque;
-extern fn uiMsdfDestroy(context: ?*anyopaque) callconv(.c) void;
-extern fn uiMsdfGlyph(context: ?*anyopaque, codepoint: u32, result: *KernelResult, pixels: [*]u8, pixel_capacity: usize) callconv(.c) u32;
+extern fn uiFontCreate(font: [*]const u8, font_len: usize, px_size: u32) callconv(.c) ?*anyopaque;
+extern fn uiFontDestroy(context: ?*anyopaque) callconv(.c) void;
+extern fn uiFontGlyph(context: ?*anyopaque, codepoint: u32, result: *KernelResult, pixels: [*]u8, pixel_capacity: usize) callconv(.c) u32;
 
+/// Metrics are in pixels at `base_px`; `quad` scales them to the drawn size.
 pub const Glyph = struct {
     region: Skyline.Region = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     advance: f32 = 0,
-    bearing_x: f32 = 0,
-    bearing_y: f32 = 0,
+    off_x: f32 = 0,
+    off_y: f32 = 0,
 };
 
 pub const Atlas = struct {
@@ -65,11 +70,11 @@ pub const Atlas = struct {
         const bytes = font_bytes orelse return error.NoUiFont;
         errdefer allocator.free(bytes);
         var packer = try Skyline.init(512, bytes_per_pixel, allocator);
-        const kernel = uiMsdfCreate(bytes.ptr, bytes.len) orelse {
+        const kernel = uiFontCreate(bytes.ptr, bytes.len, @intFromFloat(base_px)) orelse {
             packer.deinit();
             return error.InvalidUiFont;
         };
-        defer uiMsdfDestroy(kernel);
+        defer uiFontDestroy(kernel);
 
         var out: Atlas = .{
             .allocator = allocator,
@@ -103,12 +108,6 @@ pub const Atlas = struct {
         return self.packer.data;
     }
 
-    pub fn unitRange(self: *const Atlas) [2]f32 {
-        const extent: f32 = @floatFromInt(self.packer.size);
-        const range: f32 = glyph_px_range;
-        return .{ range / extent, range / extent };
-    }
-
     pub fn glyph(self: *const Atlas, ch: u8) ?Glyph {
         return self.glyphs[if (ch < 128) ch else '?'];
     }
@@ -117,14 +116,14 @@ pub const Atlas = struct {
         const scale = size_px / base_px;
         var width: f32 = 0;
         for (text) |ch| if (self.glyph(ch)) |g| {
-            width += g.advance * base_px * scale;
+            width += g.advance * scale;
         };
         return width;
     }
 
     fn generate(self: *Atlas, kernel: ?*anyopaque, codepoint: u21, scratch: []u8) !?Glyph {
         var rendered: KernelResult = .{};
-        const result = uiMsdfGlyph(kernel, codepoint, &rendered, scratch.ptr, scratch.len);
+        const result = uiFontGlyph(kernel, codepoint, &rendered, scratch.ptr, scratch.len);
         if (result == 1) {
             self.glyphs[codepoint] = null;
             return null;
@@ -142,15 +141,15 @@ pub const Atlas = struct {
         const padded_h = h + 2 * gutter;
         const padded = try self.allocator.alloc(u8, @as(usize, padded_w) * padded_h * bytes_per_pixel);
         defer self.allocator.free(padded);
+        // Transparent gutter, not the edge-replicated one an MSDF needs: these
+        // are coverage values, so bilinear at a glyph's edge must fall to zero
+        // rather than smear the neighbour that got packed next to it.
+        @memset(padded, 0);
         const src = scratch[0..rendered.pixel_len];
-        for (0..padded_h) |dy| {
-            const sy = @min(@as(usize, h) - 1, dy -| gutter);
-            for (0..padded_w) |dx| {
-                const sx = @min(@as(usize, w) - 1, dx -| gutter);
-                const src_at = (sy * w + sx) * bytes_per_pixel;
-                const dst_at = (dy * padded_w + dx) * bytes_per_pixel;
-                @memcpy(padded[dst_at..][0..bytes_per_pixel], src[src_at..][0..bytes_per_pixel]);
-            }
+        for (0..h) |sy| {
+            const dst_at = ((sy + gutter) * padded_w + gutter) * bytes_per_pixel;
+            const src_at = sy * w * bytes_per_pixel;
+            @memcpy(padded[dst_at..][0 .. @as(usize, w) * bytes_per_pixel], src[src_at..][0 .. @as(usize, w) * bytes_per_pixel]);
         }
 
         var region = try self.packer.allocResizing(.{ .w = padded_w, .h = padded_h });
@@ -162,8 +161,8 @@ pub const Atlas = struct {
         const glyph_value: Glyph = .{
             .region = region,
             .advance = rendered.advance,
-            .bearing_x = rendered.bearing_x,
-            .bearing_y = rendered.bearing_y,
+            .off_x = rendered.off_x,
+            .off_y = rendered.off_y,
         };
         self.glyphs[codepoint] = glyph_value;
         return glyph_value;
@@ -172,17 +171,14 @@ pub const Atlas = struct {
 
 pub fn quad(atlas: *const Atlas, glyph_value: Glyph, pen_x: f32, baseline: f32, size_px: f32) struct { rect: [4]f32, uv: [4]f32 } {
     const scale = size_px / base_px;
-    const inv_gen = 1.0 / @as(f32, glyph_px_size);
-    const half_range_em = 0.5 * @as(f32, glyph_px_range) * inv_gen;
-    const s = base_px * scale;
     const region = glyph_value.region;
     const extent: f32 = @floatFromInt(atlas.packer.size);
     return .{
         .rect = .{
-            pen_x + (glyph_value.bearing_x - half_range_em) * s,
-            baseline - (glyph_value.bearing_y + half_range_em) * s,
-            @as(f32, @floatFromInt(region.w)) * inv_gen * s,
-            @as(f32, @floatFromInt(region.h)) * inv_gen * s,
+            pen_x + glyph_value.off_x * scale,
+            baseline + glyph_value.off_y * scale,
+            @as(f32, @floatFromInt(region.w)) * scale,
+            @as(f32, @floatFromInt(region.h)) * scale,
         },
         .uv = .{
             @as(f32, @floatFromInt(region.x)) / extent,

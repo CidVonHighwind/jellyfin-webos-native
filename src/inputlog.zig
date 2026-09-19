@@ -127,6 +127,10 @@ fn onEvent(ev: wl.Event) void {
         .touch_down => |t| push("seat{d} touch  down id={d} at {d},{d}", .{ t.seat, t.id, wl.toInt(t.x), wl.toInt(t.y) }),
         .touch_up => |t| push("seat{d} touch  up   id={d}", .{ t.seat, t.id }),
         .touch_motion => |t| push("seat{d} touch  move id={d} at {d},{d}", .{ t.seat, t.id, wl.toInt(t.x), wl.toInt(t.y) }),
+        .text_commit => |text_value| push("text commit  {s}", .{text_value}),
+        .text_delete => |edit| push("text delete  offset={d} length={d}", .{ edit.offset, edit.length }),
+        .text_keysym => |key_value| push("text keysym  0x{x} {s}", .{ key_value.sym, if (key_value.pressed) "DOWN" else "up" }),
+        .input_panel => |visible| push("input panel {s}", .{if (visible) "shown" else "hidden"}),
         .resized => |r| push("window resized to {d}x{d}", .{ r.width, r.height }),
         .close => wl.running = false,
     }

@@ -208,9 +208,9 @@ pub fn build(b: *std.Build) void {
     b.step("stream", "Publish a live stream from this PC and play it on the TV").dependOn(&stream.step);
 }
 
-/// The UI uses the same pure-Zig MSDF generator and SkylineBinPack as the
-/// sibling gallery project. They stay modules instead of becoming a C/system
-/// dependency, which keeps the TV cross-build sysroot-free.
+/// The UI uses the sibling gallery project's TrueType reader and
+/// SkylineBinPack. They stay modules instead of becoming a C/system dependency,
+/// which keeps the TV cross-build sysroot-free.
 fn addUiDeps(
     b: *std.Build,
     root: *std.Build.Module,
@@ -218,7 +218,7 @@ fn addUiDeps(
     optimize: std.builtin.OptimizeMode,
 ) void {
     // Zig's gnueabi backend forces software float even with cortex-a55. Keep
-    // the app's required base ABI, but compile the pointer/integer-only MSDF
+    // the app's required base ABI, but compile the pointer/integer-only glyph
     // kernel boundary as hard-float so its private math uses VFP.
     const kernel_target = if (target.result.cpu.arch == .arm)
         b.resolveTargetQuery(.{
@@ -239,40 +239,15 @@ fn addUiDeps(
     tt_options.addOption(bool, "debug_todo", false);
     tt.addOptions("build_options", tt_options);
 
-    // Overlay the upstream sources in the cache. Only edge_color differs: two
-    // random indices need an explicit usize narrowing on the TV's 32-bit ABI.
-    const msdf_files = [_][]const u8{
-        "Contour.zig",  "EdgeSegment.zig", "ErrorCorrection.zig", "Generator.zig",
-        "Scanline.zig", "Shape.zig",       "SignedDistance.zig",  "coloring.zig",
-        "math.zig",
-    };
-    const msdf_sources = b.addWriteFiles();
-    var msdf_root: std.Build.LazyPath = undefined;
-    for (msdf_files) |name| {
-        const copied = msdf_sources.addCopyFile(
-            b.path(b.fmt("../gallery-glfw/vendor/msdf-zig/src/{s}", .{name})),
-            name,
-        );
-        if (std.mem.eql(u8, name, "Generator.zig")) msdf_root = copied;
-    }
-    _ = msdf_sources.addCopyFile(b.path("src/msdf_edge_color.zig"), "edge_color.zig");
-    _ = msdf_sources.addCopyFile(b.path("src/msdf_equations.zig"), "equations.zig");
-
-    const msdf = b.createModule(.{
-        .root_source_file = msdf_root,
-        .target = kernel_target,
-        .optimize = .ReleaseFast,
-        .imports = &.{.{ .name = "TrueType", .module = tt }},
-    });
     const kernel = b.addLibrary(.{
-        .name = "ui_msdf_kernel",
+        .name = "ui_glyph_kernel",
         .linkage = .static,
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/msdf_kernel.zig"),
+            .root_source_file = b.path("src/glyph_kernel.zig"),
             .target = kernel_target,
             .optimize = .ReleaseFast,
             .link_libc = true,
-            .imports = &.{.{ .name = "msdf", .module = msdf }},
+            .imports = &.{.{ .name = "TrueType", .module = tt }},
         }),
     });
     const skyline = b.createModule(.{
@@ -288,6 +263,8 @@ fn addUiDeps(
 /// Unused ones cost nothing: an @embedFile nobody references is not emitted.
 fn addAssets(b: *std.Build, exe: *std.Build.Step.Compile, app: App) void {
     exe.root_module.addAnonymousImport("font", .{ .root_source_file = b.path("assets/font8x16.bin") });
+    if (std.mem.eql(u8, app.name, "uidemo"))
+        exe.root_module.addAnonymousImport("media_atlas", .{ .root_source_file = b.path("assets/media-atlas.rgb") });
     if (!app.shaders) return; // don't make every app wait on slangc
     for (shaders) |sh_| {
         exe.root_module.addAnonymousImport(sh_.import, .{ .root_source_file = slangc(b, sh_) });
@@ -309,7 +286,12 @@ const shaders = [_]Shader{
     .{ .import = "text_vs", .src = "src/shaders/text.slang", .entry = "vsText", .stage = "vertex", .short = "vert" },
     .{ .import = "text_fs", .src = "src/shaders/text.slang", .entry = "fsText", .stage = "fragment", .short = "frag" },
     .{ .import = "ui_vs", .src = "src/shaders/ui.slang", .entry = "vsUi", .stage = "vertex", .short = "vert" },
-    .{ .import = "ui_fs", .src = "src/shaders/ui.slang", .entry = "fsUi", .stage = "fragment", .short = "frag" },
+    // One fragment program per kind of instance; see the note in ui.slang.
+    .{ .import = "ui_fill", .src = "src/shaders/ui.slang", .entry = "fsFill", .stage = "fragment", .short = "frag" },
+    .{ .import = "ui_round", .src = "src/shaders/ui.slang", .entry = "fsRound", .stage = "fragment", .short = "frag" },
+    .{ .import = "ui_border", .src = "src/shaders/ui.slang", .entry = "fsBorder", .stage = "fragment", .short = "frag" },
+    .{ .import = "ui_glyph", .src = "src/shaders/ui.slang", .entry = "fsGlyph", .stage = "fragment", .short = "frag" },
+    .{ .import = "ui_image", .src = "src/shaders/ui.slang", .entry = "fsImage", .stage = "fragment", .short = "frag" },
 };
 
 /// Compile one Slang entry point to GLSL ES. Slang only emits desktop GLSL

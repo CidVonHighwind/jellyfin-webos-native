@@ -195,3 +195,77 @@ so the render can be checked over SSH. For a real picture, `zig build shot`
 grabs a frame from the TV's VNC server on 5900 (`tools/vncshot.py`) -- that is
 what caught the overlay being white-on-nothing and unreadable over the scene;
 it now draws its glyphs on a dim plate.
+
+## What the UI renderer costs, and why
+
+`uidemo` at 1080p on the TV, library screen, 3.14x overdraw, measured with the
+`glFinish` stopwatch (`GL_EXT_disjoint_timer_query` is dead here, see above).
+Each row is a single change from the row above:
+
+| variant | GPU |
+|---|---|
+| MSDF glyphs, `discard` clipping, one branchy shader | 9.74 ms |
+| clip by shrinking the quad in the vertex shader instead of `discard` | 8.28 ms |
+| rasterised glyphs instead of MSDF | 8.13 ms |
+| **one fragment program per instance kind + skip corner math in interiors** | **3.85 ms** |
+
+Two reference points for where that can go, same scene and geometry:
+
+| probe | GPU |
+|---|---|
+| fragment shader replaced by `return i.color` | 2.80 ms |
+| real shaders with `glDisable(GL_BLEND)` | 2.29 ms |
+| real shaders, rounded-corner math stubbed out | 3.94 ms |
+
+So the final version is *at* the no-rounded-math figure while still drawing
+rounded corners: the remaining time is rasterisation and blending, not shading.
+
+### Where the time actually went
+
+**`roundedDistance` over large areas, not branching.** It was 4.2 ms of the
+8.1 ms. Every panel, card and the full-screen background ran a `length()` and a
+`smoothstep` per fragment for corners that occupy a few hundred pixels of a
+half-megapixel rect. Two changes fix it, and together they account for almost
+the whole win:
+
+- **an interior test**: `min(local, size - local) >= radius` is four
+  instructions and skips the corner math for everything that no corner can
+  reach;
+- **one program per kind** (fill, round, border, glyph, image) so a square fill
+  runs `return i.color` and nothing else. Branching itself was only worth about
+  1 ms; the value is that specialised programs *have no other code to run*.
+
+This is cheap precisely because the renderer already batches on binding
+changes, so the program is just another part of the batch state. It took the
+frame from 17 draw calls to 32, which cost nothing measurable.
+
+**`discard` is expensive on Mali.** Clipping by discarding fragments outside a
+clip rect disables early-ZS and Forward Pixel Kill, so every overdrawn fragment
+runs the shader to completion. Clipping by shrinking the quad to its clip
+rectangle in the vertex shader was worth 1.5 ms, and fully clipped instances --
+most rows of a virtual list -- now cost nothing at all.
+
+### Overdraw, and why depth testing does not help
+
+Overdraw was measured directly, and it is not the problem:
+
+- Removing the full-screen background fill, a whole **1.0x of overdraw**, made
+  the frame **slower**: 3.83 -> 4.57 ms. An opaque full-screen write lets the
+  driver skip loading the framebuffer into each tile; without it every tile has
+  to be read back before blending. On a tile-based GPU that fill is closer to a
+  clear than to overdraw.
+- Of the remaining 2.14x, essentially all of it is *visible* UI with soft edges:
+  rounded panels (1.21x) and border rings (0.80x). Blending it costs 1.6 ms.
+
+A depth test removes fragments hidden behind opaque geometry that was drawn
+**earlier**. A UI is painter-ordered, so occluders come later, and at the moment
+an occluded fragment is shaded there is nothing in front of it yet. Getting any
+benefit would mean splitting every rounded rect into an opaque interior and
+translucent edges, sorting the opaque set front-to-back into its own pass, then
+drawing the translucent set back-to-front against a depth buffer. The prize is
+whatever opaque area is covered by later opaque area -- which this measurement
+says is nearly all the background fill, and that is already free.
+
+Marking genuinely opaque square fills as non-blended is in the renderer anyway
+(it is the correct state, and blending is part of the batch key), but it
+measured flat: 3.88 -> 3.85 ms.

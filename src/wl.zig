@@ -192,6 +192,11 @@ pub const Event = union(enum) {
     touch_down: struct { seat: u8, id: i32, x: Fixed, y: Fixed },
     touch_up: struct { seat: u8, id: i32 },
     touch_motion: struct { seat: u8, id: i32, x: Fixed, y: Fixed },
+    /// Text committed by an input method such as the webOS on-screen keyboard.
+    text_commit: []const u8,
+    text_delete: struct { offset: i32, length: u32 },
+    text_keysym: struct { sym: u32, pressed: bool },
+    input_panel: bool,
     resized: struct { width: u32, height: u32 },
     close,
 };
@@ -229,6 +234,8 @@ var buffer: Proxy = .{};
 var output: Proxy = .{};
 var foreign: Proxy = .{};
 var exported: Proxy = .{};
+var text_model_factory: Proxy = .{};
+var text_model: Proxy = .{};
 var configured = false;
 var seat_count: u8 = 0;
 var seats: [4]Proxy = @splat(.{});
@@ -291,6 +298,10 @@ pub fn open(app_id: [*:0]const u8, title: [*:0]const u8, w: u32, h: u32, buffers
     try connect();
     marshal_raw = sym("wl_proxy_marshal_flags");
     surface = compositor.new("create_surface", iface("wl_surface_interface"), .{});
+    if (text_model_factory.ok()) if (ifaceOpt("text_model_interface")) |text_i| {
+        text_model = text_model_factory.new("create_text_model", text_i, .{});
+        text_model.listen(&text_model_listener, null);
+    };
     width = if (w != 0) w else output_width;
     height = if (h != 0) h else output_height;
     if (width == 0 or height == 0) return error.NoOutputMode;
@@ -401,6 +412,9 @@ fn onGlobal(_: ?*anyopaque, _: ?*anyopaque, name: u32, i: [*:0]const u8, version
     } else if (std.mem.eql(u8, s, "wl_webos_foreign")) {
         if (symOpt("wl_webos_foreign_interface") != null)
             foreign = bindGlobal(name, iface("wl_webos_foreign_interface"), 1);
+    } else if (std.mem.eql(u8, s, "text_model_factory")) {
+        if (symOpt("text_model_factory_interface") != null)
+            text_model_factory = bindGlobal(name, iface("text_model_factory_interface"), 1);
     } else if (std.mem.eql(u8, s, "wl_output") and !output.ok()) {
         output = bindGlobal(name, iface("wl_output_interface"), 1);
         output.listen(&output_listener, null);
@@ -512,6 +526,91 @@ pub fn exportVideoWindow(src: [4]i32, dst: [4]i32) ![*:0]const u8 {
     }
     return error.NoWindowId;
 }
+
+// -------------------------------------------------------------- text input
+
+pub const TextPurpose = enum(u32) { normal = 0, url = 5, password = 8 };
+
+/// Activate the TV's text model and show its on-screen keyboard. Desktop
+/// compositors do not expose this webOS protocol; physical wl_keyboard input
+/// remains available on both platforms.
+pub fn beginTextInput(text: [:0]const u8, rect: [4]i32, purpose: TextPurpose) bool {
+    if (!text_model.ok() or seat_count == 0) return false;
+    text_model.call("activate", .{ @as(u32, 0), seats[0].p, surface.p });
+    text_model.call("set_surrounding_text", .{ text.ptr, @as(u32, @intCast(text.len)), @as(u32, @intCast(text.len)) });
+    const hint: u32 = switch (purpose) {
+        .url => 0x100, // latin
+        .password => 0xc0, // hidden_text | sensitive_data
+        .normal => 0,
+    };
+    text_model.call("set_content_type", .{ hint, @intFromEnum(purpose) });
+    text_model.call("set_cursor_rectangle", .{ rect[0], rect[1], rect[2], rect[3] });
+    text_model.call("set_max_text_length", .{@as(u32, 255)});
+    text_model.call("commit", .{});
+    text_model.call("show_input_panel", .{});
+    return true;
+}
+
+pub fn updateTextInput(text: [:0]const u8) void {
+    if (!text_model.ok()) return;
+    text_model.call("set_surrounding_text", .{ text.ptr, @as(u32, @intCast(text.len)), @as(u32, @intCast(text.len)) });
+    text_model.call("commit", .{});
+}
+
+pub fn endTextInput() void {
+    if (!text_model.ok() or seat_count == 0) return;
+    text_model.call("hide_input_panel", .{});
+    text_model.call("deactivate", .{seats[0].p});
+}
+
+fn tmCommit(_: ?*anyopaque, _: ?*anyopaque, _: u32, text: [*:0]const u8) callconv(.c) void {
+    on_event(.{ .text_commit = std.mem.sliceTo(text, 0) });
+}
+fn tmPreedit(_: ?*anyopaque, _: ?*anyopaque, _: u32, _: [*:0]const u8, _: [*:0]const u8) callconv(.c) void {}
+fn tmDelete(_: ?*anyopaque, _: ?*anyopaque, _: u32, offset: i32, length: u32) callconv(.c) void {
+    on_event(.{ .text_delete = .{ .offset = offset, .length = length } });
+}
+fn tmCursor(_: ?*anyopaque, _: ?*anyopaque, _: u32, _: i32, _: i32) callconv(.c) void {}
+fn tmStyle(_: ?*anyopaque, _: ?*anyopaque, _: u32, _: u32, _: u32, _: u32) callconv(.c) void {}
+fn tmPreeditCursor(_: ?*anyopaque, _: ?*anyopaque, _: u32, _: i32) callconv(.c) void {}
+fn tmModifiers(_: ?*anyopaque, _: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {}
+fn tmKeysym(_: ?*anyopaque, _: ?*anyopaque, _: u32, _: u32, key_sym: u32, state: u32, _: u32) callconv(.c) void {
+    on_event(.{ .text_keysym = .{ .sym = key_sym, .pressed = state != 0 } });
+}
+fn tmEnter(_: ?*anyopaque, _: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {}
+fn tmLeave(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {}
+fn tmPanel(_: ?*anyopaque, _: ?*anyopaque, state: u32) callconv(.c) void {
+    on_event(.{ .input_panel = state != 0 });
+}
+fn tmPanelRect(_: ?*anyopaque, _: ?*anyopaque, _: i32, _: i32, _: u32, _: u32) callconv(.c) void {}
+
+const text_model_listener = extern struct {
+    commit_string: @TypeOf(&tmCommit),
+    preedit_string: @TypeOf(&tmPreedit),
+    delete_surrounding_text: @TypeOf(&tmDelete),
+    cursor_position: @TypeOf(&tmCursor),
+    preedit_styling: @TypeOf(&tmStyle),
+    preedit_cursor: @TypeOf(&tmPreeditCursor),
+    modifiers_map: @TypeOf(&tmModifiers),
+    keysym: @TypeOf(&tmKeysym),
+    enter: @TypeOf(&tmEnter),
+    leave: @TypeOf(&tmLeave),
+    input_panel_state: @TypeOf(&tmPanel),
+    input_panel_rect: @TypeOf(&tmPanelRect),
+}{
+    .commit_string = tmCommit,
+    .preedit_string = tmPreedit,
+    .delete_surrounding_text = tmDelete,
+    .cursor_position = tmCursor,
+    .preedit_styling = tmStyle,
+    .preedit_cursor = tmPreeditCursor,
+    .modifiers_map = tmModifiers,
+    .keysym = tmKeysym,
+    .enter = tmEnter,
+    .leave = tmLeave,
+    .input_panel_state = tmPanel,
+    .input_panel_rect = tmPanelRect,
+};
 
 // -------------------------------------------------------------------- input
 //
