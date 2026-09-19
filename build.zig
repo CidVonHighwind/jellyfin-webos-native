@@ -27,6 +27,7 @@ const apps = [_]App{
     .{ .name = "wlbox", .src = "src/wlbox.zig", .libc = true },
     .{ .name = "vkinfo", .src = "src/vkinfo.zig", .libc = true },
     .{ .name = "fptest", .src = "src/fptest.zig", .libc = true },
+    .{ .name = "inputlog", .src = "src/inputlog.zig", .libc = true },
 };
 
 /// Sourced by every remote step. Defaults keep a fresh clone working.
@@ -65,9 +66,17 @@ pub fn build(b: *std.Build) void {
                 .link_libc = app.libc,
             }),
         });
+        exe.root_module.addAnonymousImport("font", .{ .root_source_file = b.path("assets/font8x16.bin") });
         b.installArtifact(exe);
         exes.put(app.name, exe) catch @panic("OOM");
     }
+
+    var chosen_src: []const u8 = "";
+    var chosen_libc = true;
+    for (apps) |a| if (std.mem.eql(u8, a.name, selected)) {
+        chosen_src = a.src;
+        chosen_libc = a.libc;
+    };
 
     const chosen = exes.get(selected) orelse {
         std.debug.print("unknown -Dapp={s}; known:", .{selected});
@@ -97,11 +106,37 @@ pub fn build(b: *std.Build) void {
     // A Wayland client needs LSM's environment; an SSH session does not have it.
     const run = sh(b, env_preamble ++
         \\app="$1"; bin="$2"
+        \\# An interactive app outlives an interrupted ssh session and then holds
+        \\# the binary open, so scp fails with a bare "Failure". Clear it first.
+        \\ssh "$T" "killall '$app' 2>/dev/null; true"
         \\scp -q "$bin" "$T:$TMP/$app"
         \\exec ssh "$T" "XDG_RUNTIME_DIR=/tmp/xdg WAYLAND_DISPLAY=wayland-0 $TMP/$app"
     , &.{selected});
     run.addFileArg(chosen.getEmittedBin());
+    // Interactive apps print as they go; without this the build swallows it all
+    // and only replays it if the command fails.
+    run.stdio = .inherit;
     b.step("run", "Deploy and run -Dapp on the TV").dependOn(&run.step);
+
+    // ---- run-host: same source, this machine's compositor ----
+    // The Wayland shim picks xdg_wm_base when wl_webos_shell is absent, so the
+    // TV app runs as a normal window here. Develop locally, deploy when it works.
+    const host_exe = b.addExecutable(.{
+        .name = selected,
+        // Zig 0.16's self-hosted x86_64 backend miscompiles @memset over a
+        // large global slice here (a later `i % 2` reads back wrong). The ARM
+        // build goes through LLVM anyway; pin the host build to it too.
+        .use_llvm = true,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(chosen_src),
+            .target = b.resolveTargetQuery(.{}),
+            .optimize = optimize,
+            .link_libc = chosen_libc,
+        }),
+    });
+    host_exe.root_module.addAnonymousImport("font", .{ .root_source_file = b.path("assets/font8x16.bin") });
+    const run_host = b.addRunArtifact(host_exe);
+    b.step("run-host", "Build -Dapp for this PC and run it locally").dependOn(&run_host.step);
 
     // ---- package: a real .ipk ----
     const pkg = sh(b, ipk_script, &.{selected});

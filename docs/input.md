@@ -55,3 +55,44 @@ cursor is not wanted on the TV. Recorded only so it is not re-proposed.
 If it is ever revived, the one non-obvious detail: `struct input_event` is
 **24 bytes on x86-64 but 16 on the 32-bit TV** (`timeval` differs), so a
 forwarder must translate rather than pipe raw bytes.
+
+## Measured: what `wl_seat` actually delivers
+
+`inputlog` (`zig build run -Dapp=inputlog`) draws every event it receives and
+prints the same lines to the terminal. Findings on this device:
+
+- **Three seats are advertised and all three are live.** They are not labelled,
+  so the app binds every one and tags events with the seat index. On the test
+  set, remote key presses arrive on **seat 1**; seats 0 and 2 mirror the
+  modifier traffic. Bind all of them — picking "the" seat loses input.
+- **A `modifiers` event is sent on all three seats for every key**, essentially
+  always all-zero. `inputlog` suppresses unchanged ones or the log is unreadable.
+- Key codes are plain **evdev keycodes** (`KEY_LEFT` = 105, `KEY_UP` = 103,
+  `KEY_ENTER` = 28, …) delivered by `wl_keyboard.key`. No xkb is needed to map
+  the remote: read the number, name it.
+- Seats are bound at **version 1** deliberately, so only the original event set
+  can arrive and the listener tables stay small.
+
+To map a button: run `inputlog`, press it, read the code off the screen, and add
+it to `key_names` in `src/inputlog.zig`.
+
+## The shim
+
+`src/wl.zig` is the shared Wayland layer: connect, bind globals, create one
+window with one `wl_shm` buffer, and deliver input as a tagged union. It chooses
+`wl_webos_shell` on the TV and `xdg_wm_base` on a desktop, so the same source
+runs in both places (`zig build run` vs `zig build run-host`).
+
+xdg-shell is the one place where wire order is taken on trust: unlike every
+other protocol here it lives in generated code rather than a shared library, so
+its three interfaces are spelled out in `wl.zig`. Everything else looks its
+opcodes up by name in the `wl_interface` tables libwayland already carries.
+
+Two details worth keeping:
+
+- `wl_registry.bind` is signature `usun` — the new_id placeholder comes **last**,
+  unlike every other request, where it comes first. Getting this wrong segfaults
+  inside libffi with no useful message.
+- `wl_pointer`/`wl_keyboard`/`wl_touch` listener structs must have as many
+  entries as the *library's* interface declares events, not as many as the bound
+  version can send; libwayland indexes the struct by event opcode.

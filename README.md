@@ -10,6 +10,7 @@ library is `dlopen`'d at runtime.
 
 | | |
 |---|---|
+| `inputlog` | on-screen log of every input event — maps the remote and the cursor, **verified on device** |
 | `wlbox` | fullscreen red box via Wayland `wl_shm` + `wl_webos_shell` — **verified on device** |
 | `wlinfo` | lists the compositor's Wayland globals |
 | `vkinfo` | enumerates the Mali Vulkan ICD (1.3.260, 102 device extensions) |
@@ -48,6 +49,7 @@ zig build                          # build every app into zig-out/bin
 zig build info                     # show the resolved .env settings
 
 zig build run   -Dapp=wlbox        # scp one app to /tmp and run it on the TV
+zig build run-host -Dapp=inputlog  # build for this PC and run it in a local window
 zig build deploy                   # scp every app to the TV's temp dir
 
 zig build package     -Dapp=wlbox  # build zig-out/<id>_<version>_arm.ipk
@@ -55,7 +57,8 @@ zig build install-app -Dapp=wlbox  # package, push and install via luna
 zig build launch                   # start the installed app through SAM
 ```
 
-`-Dapp=` selects the app for `run` / `package` / `install-app` (default `wlbox`).
+`-Dapp=` selects the app for `run` / `run-host` / `package` / `install-app`
+(default `wlbox`).
 `zig build run` is the fast development loop: a bare binary renders fullscreen
 without being installed at all, so packaging is only needed to get an entry in
 the TV's app list.
@@ -67,8 +70,11 @@ host instead.
 ## Layout
 
 ```
+src/wl.zig  Wayland shim: one window, one shm buffer, all input.
+            Picks wl_webos_shell on the TV and xdg_wm_base on a PC, so the
+            same binary source runs in both places.
 src/        application sources
-assets/     icon.png and other packaged files
+assets/     icon.png, font8x16.bin and other packaged files
 docs/       findings from investigating the device
 appinfo.json  webOS app manifest (`main` is rewritten per -Dapp at package time)
 build.zig     build, package, deploy, install, launch
@@ -84,5 +90,26 @@ build.zig     build, package, deploy, install, launch
   route to the screen.
 - Vulkan works but has **no `VK_KHR_wayland_surface`**, so a swapchain cannot
   present; use `zwp_linux_dmabuf_v1`.
+- Zig 0.16's self-hosted x86_64 backend miscompiles `@memset` over a large
+  global slice, so `run-host` pins `use_llvm`. The ARM build is unaffected.
 
 Each is explained in [docs/](docs/README.md).
+
+## Developing on the PC
+
+`zig build run-host -Dapp=<app>` builds the same source for this machine and
+runs it as an ordinary window, so the edit/run loop does not need the TV. The
+shim binds `xdg_wm_base` when `wl_webos_shell` is absent; the app code does not
+know the difference.
+
+`inputlog` additionally renders one frame into a buffer and prints it as ASCII
+when `INPUTLOG_DUMP=1` is set, which checks the log formatting and the font
+without a compositor at all:
+
+```sh
+INPUTLOG_DUMP=1 zig build run-host -Dapp=inputlog
+```
+
+`assets/font8x16.bin` is the ASCII range of
+[Terminus](https://terminus-font.sourceforge.net/) (OFL-1.1), extracted from
+`Lat2-Terminus16.psfu` as 95 glyphs of 16 bytes.
