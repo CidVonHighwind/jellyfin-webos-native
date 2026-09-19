@@ -76,7 +76,10 @@ the TV's app list.
 
 Cross-compilation target is set in `build.zig`: **`arm-linux-gnueabi`**,
 armv7-a soft-float ABI, glibc 2.31. Override with `-Dtarget=` to build for the
-host instead.
+host instead. Zig emits software FP for that target, so the FP-heavy MSDF glyph
+generator is a separate VFP-compiled static kernel with a pointer/integer-only
+boundary; the final executable and every TV-library call retain the required
+base ABI.
 
 ## Seeing what the TV actually drew
 
@@ -105,7 +108,8 @@ build.zig     build, package, deploy, install, launch
 ## Gotchas that cost real time
 
 - `uname -m` says `aarch64`; **userland is 32-bit ARM, soft-float ABI**. A
-  `gnueabihf` build fails with a confusing `not found`.
+  `gnueabihf` build requests the wrong loader and passes float arguments in the
+  wrong registers. It fails with a confusing `not found`, or miscalls TV APIs.
 - App ids may **not** start with `com.webos.` — developer-mode installs of that
   reserved namespace are refused with a generic `errorCode: -15`.
 - `/dev/fb0` cannot be mapped — scanout is AFBC-compressed. Wayland is the only

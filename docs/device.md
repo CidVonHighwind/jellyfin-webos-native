@@ -79,7 +79,13 @@ neither does subtracting the `soft_float` CPU feature; the triple's ABI decides.
 
    Hardware FP *and* device-compatible argument passing. This is the clean
    escape hatch for anything FP-heavy.
-4. **Put it on the GPU** — for genuinely heavy math, Vulkan compute beats any of
+4. **Isolate a Zig hard-float kernel behind a pointer/integer-only boundary.**
+   `uidemo` does this for MSDF generation: the final process remains `gnueabi`,
+   while a private `gnueabihf` static object uses VFP internally. No float may
+   cross that boundary by value, and the kernel must not call a base-ABI function
+   with float arguments. This brought on-TV renderer initialization to about
+   250 ms.
+5. **Put it on the GPU** — for genuinely heavy math, Vulkan compute beats any of
    the above.
 
 ## Building

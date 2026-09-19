@@ -295,8 +295,10 @@ pub fn main(init: std.process.Init) !void {
     glViewport(0, 0, @intCast(gl.width), @intCast(gl.height));
     glClearColor(12.0 / 255.0, 16.0 / 255.0, 25.0 / 255.0, 1);
 
+    const renderer_start = nowNs();
     var renderer = try UiRenderer.init(init.gpa, init.io);
     defer renderer.deinit();
+    std.debug.print("UI renderer init: {d:.2} ms\n", .{@as(f64, @floatFromInt(nowNs() - renderer_start)) / std.time.ns_per_ms});
     var ctx = loom.Context.init(init.gpa);
     defer ctx.deinit();
     std.debug.print("UI demo: {d}x{d}, {d} logical rows, one instanced batch\n", .{ gl.width, gl.height, ITEM_COUNT });

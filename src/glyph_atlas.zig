@@ -6,7 +6,6 @@
 //! renderer dependency.
 
 const std = @import("std");
-const Generator = @import("msdf");
 const Skyline = @import("skyline");
 
 pub const base_px: f32 = 48;
@@ -15,13 +14,18 @@ const glyph_px_range: u16 = 8;
 const gutter: u16 = 1;
 pub const bytes_per_pixel: u3 = 3;
 
-const gen_opts: Generator.GenerationOptions = .{
-    .sdf_type = .msdf,
-    .px_size = glyph_px_size,
-    .px_range = glyph_px_range,
-    .scanline_fill_rule = .non_zero,
-    .error_correction_opts = .{ .check_distance = false },
+const KernelResult = extern struct {
+    width: u16 = 0,
+    height: u16 = 0,
+    pixel_len: u32 = 0,
+    advance: f32 = 0,
+    bearing_x: f32 = 0,
+    bearing_y: f32 = 0,
 };
+
+extern fn uiMsdfCreate(font: [*]const u8, font_len: usize) callconv(.c) ?*anyopaque;
+extern fn uiMsdfDestroy(context: ?*anyopaque) callconv(.c) void;
+extern fn uiMsdfGlyph(context: ?*anyopaque, codepoint: u32, result: *KernelResult, pixels: [*]u8, pixel_capacity: usize) callconv(.c) u32;
 
 pub const Glyph = struct {
     region: Skyline.Region = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
@@ -32,9 +36,7 @@ pub const Glyph = struct {
 
 pub const Atlas = struct {
     allocator: std.mem.Allocator,
-    font_bytes: []u8,
     font_path: []const u8,
-    generator: Generator,
     packer: Skyline,
     glyphs: [128]?Glyph = @splat(null),
 
@@ -62,28 +64,34 @@ pub const Atlas = struct {
         }
         const bytes = font_bytes orelse return error.NoUiFont;
         errdefer allocator.free(bytes);
-        var generator = try Generator.create(bytes);
-        errdefer generator.destroy();
         var packer = try Skyline.init(512, bytes_per_pixel, allocator);
-        errdefer packer.deinit();
+        const kernel = uiMsdfCreate(bytes.ptr, bytes.len) orelse {
+            packer.deinit();
+            return error.InvalidUiFont;
+        };
+        defer uiMsdfDestroy(kernel);
 
         var out: Atlas = .{
             .allocator = allocator,
-            .font_bytes = bytes,
             .font_path = font_path,
-            .generator = generator,
             .packer = packer,
         };
-        errdefer out.deinit();
-        for (32..127) |cp| _ = try out.generate(@intCast(cp));
+        const scratch = allocator.alloc(u8, 128 * 128 * @as(usize, bytes_per_pixel)) catch |err| {
+            out.deinit();
+            return err;
+        };
+        defer allocator.free(scratch);
+        for (32..127) |cp| _ = out.generate(kernel, @intCast(cp), scratch) catch |err| {
+            out.deinit();
+            return err;
+        };
         out.packer.dirty = true;
+        allocator.free(bytes);
         return out;
     }
 
     pub fn deinit(self: *Atlas) void {
         self.packer.deinit();
-        self.generator.destroy();
-        self.allocator.free(self.font_bytes);
         self.* = undefined;
     }
 
@@ -114,31 +122,27 @@ pub const Atlas = struct {
         return width;
     }
 
-    fn generate(self: *Atlas, codepoint: u21) !?Glyph {
-        var shape = self.generator.extractShape(self.allocator, codepoint, gen_opts) catch {
+    fn generate(self: *Atlas, kernel: ?*anyopaque, codepoint: u21, scratch: []u8) !?Glyph {
+        var rendered: KernelResult = .{};
+        const result = uiMsdfGlyph(kernel, codepoint, &rendered, scratch.ptr, scratch.len);
+        if (result == 1) {
             self.glyphs[codepoint] = null;
             return null;
-        };
-        defer shape.deinit(self.allocator);
-
-        if (shape.shape.contours.items.len == 0) {
-            const empty: Glyph = .{ .advance = @floatCast(shape.advance) };
+        }
+        if (result != 0) return error.GlyphGenerationFailed;
+        if (rendered.width == 0 or rendered.height == 0) {
+            const empty: Glyph = .{ .advance = rendered.advance };
             self.glyphs[codepoint] = empty;
             return empty;
         }
 
-        const rendered = try Generator.renderShape(self.allocator, &shape, gen_opts);
-        defer rendered.deinit(self.allocator);
-        const w: u16 = rendered.glyph_data.width;
-        const h: u16 = rendered.glyph_data.height;
+        const w = rendered.width;
+        const h = rendered.height;
         const padded_w = w + 2 * gutter;
         const padded_h = h + 2 * gutter;
         const padded = try self.allocator.alloc(u8, @as(usize, padded_w) * padded_h * bytes_per_pixel);
         defer self.allocator.free(padded);
-        const src = switch (rendered.pixels) {
-            .normal => |data| data,
-            .msdf10 => unreachable,
-        };
+        const src = scratch[0..rendered.pixel_len];
         for (0..padded_h) |dy| {
             const sy = @min(@as(usize, h) - 1, dy -| gutter);
             for (0..padded_w) |dx| {
@@ -157,9 +161,9 @@ pub const Atlas = struct {
         region.h -= 2 * gutter;
         const glyph_value: Glyph = .{
             .region = region,
-            .advance = @floatCast(rendered.glyph_data.advance),
-            .bearing_x = @floatCast(rendered.glyph_data.bearing_x),
-            .bearing_y = @floatCast(rendered.glyph_data.bearing_y),
+            .advance = rendered.advance,
+            .bearing_x = rendered.bearing_x,
+            .bearing_y = rendered.bearing_y,
         };
         self.glyphs[codepoint] = glyph_value;
         return glyph_value;

@@ -2,8 +2,9 @@
 //!
 //! The TV is armv7-a with a SOFT-FLOAT EABI (`arm-linux-gnueabi`, NOT gnueabihf)
 //! and glibc 2.35; we target glibc 2.31 so binaries stay forward-compatible.
-//! -mcpu is set so the FPU is actually used -- see docs/device.md, this is an
-//! ABI choice, not software float emulation.
+//! Zig currently lowers FP arithmetic to helper calls for this target even with
+//! the correct CPU selected. The FP-heavy UI glyph kernel is isolated behind a
+//! pointer/integer ABI and compiled for VFP; see docs/device.md.
 //! All device libraries are dlopen'd at runtime, so nothing here needs a sysroot.
 //!
 //!   zig build                        build every app into zig-out/bin
@@ -52,8 +53,8 @@ pub fn build(b: *std.Build) void {
             .os_tag = .linux,
             .abi = .gnueabi,
             .glibc_version = .{ .major = 2, .minor = 31, .patch = 0 },
-            // Cortex-A55 has VFPv4/NEON. Without this, a generic armv7 CPU model
-            // makes LLVM emit real software-float calls -- which WOULD be slow.
+            // Match the TV CPU for instruction selection. This does not override
+            // Zig's software-FP lowering for the gnueabi target (see addUiDeps).
             .cpu_model = .{ .explicit = &std.Target.arm.cpu.cortex_a55 },
         },
     });
@@ -216,9 +217,22 @@ fn addUiDeps(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
 ) void {
+    // Zig's gnueabi backend forces software float even with cortex-a55. Keep
+    // the app's required base ABI, but compile the pointer/integer-only MSDF
+    // kernel boundary as hard-float so its private math uses VFP.
+    const kernel_target = if (target.result.cpu.arch == .arm)
+        b.resolveTargetQuery(.{
+            .cpu_arch = .arm,
+            .os_tag = .linux,
+            .abi = .gnueabihf,
+            .glibc_version = .{ .major = 2, .minor = 31, .patch = 0 },
+            .cpu_model = .{ .explicit = &std.Target.arm.cpu.cortex_a55 },
+        })
+    else
+        target;
     const tt = b.createModule(.{
         .root_source_file = b.path("../gallery-glfw/vendor/TrueType/TrueType.zig"),
-        .target = target,
+        .target = kernel_target,
         .optimize = .ReleaseFast,
     });
     const tt_options = b.addOptions();
@@ -228,9 +242,9 @@ fn addUiDeps(
     // Overlay the upstream sources in the cache. Only edge_color differs: two
     // random indices need an explicit usize narrowing on the TV's 32-bit ABI.
     const msdf_files = [_][]const u8{
-        "Contour.zig",   "EdgeSegment.zig", "ErrorCorrection.zig", "Generator.zig",
-        "Scanline.zig",  "Shape.zig",       "SignedDistance.zig",  "coloring.zig",
-        "equations.zig", "math.zig",
+        "Contour.zig",  "EdgeSegment.zig", "ErrorCorrection.zig", "Generator.zig",
+        "Scanline.zig", "Shape.zig",       "SignedDistance.zig",  "coloring.zig",
+        "math.zig",
     };
     const msdf_sources = b.addWriteFiles();
     var msdf_root: std.Build.LazyPath = undefined;
@@ -242,20 +256,32 @@ fn addUiDeps(
         if (std.mem.eql(u8, name, "Generator.zig")) msdf_root = copied;
     }
     _ = msdf_sources.addCopyFile(b.path("src/msdf_edge_color.zig"), "edge_color.zig");
+    _ = msdf_sources.addCopyFile(b.path("src/msdf_equations.zig"), "equations.zig");
 
     const msdf = b.createModule(.{
         .root_source_file = msdf_root,
-        .target = target,
+        .target = kernel_target,
         .optimize = .ReleaseFast,
         .imports = &.{.{ .name = "TrueType", .module = tt }},
+    });
+    const kernel = b.addLibrary(.{
+        .name = "ui_msdf_kernel",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/msdf_kernel.zig"),
+            .target = kernel_target,
+            .optimize = .ReleaseFast,
+            .link_libc = true,
+            .imports = &.{.{ .name = "msdf", .module = msdf }},
+        }),
     });
     const skyline = b.createModule(.{
         .root_source_file = b.path("../gallery-glfw/src/render/SkylineBinPack.zig"),
         .target = target,
         .optimize = optimize,
     });
-    root.addImport("msdf", msdf);
     root.addImport("skyline", skyline);
+    root.linkLibrary(kernel);
 }
 
 /// Every app gets the font and the compiled shaders as embeddable modules.

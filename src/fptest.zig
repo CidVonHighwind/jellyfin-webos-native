@@ -1,5 +1,5 @@
-//! Measures double-precision throughput on the device, to settle whether the
-//! soft-float *ABI* implies software float *emulation*. (It does not.)
+//! Measures double-precision throughput on the device. Its base-register float
+//! ABI does not require emulation, but Zig's `gnueabi` target currently emits it.
 //!   zig build -Dapp=fptest && zig build run -Dapp=fptest
 const std = @import("std");
 const linux = std.os.linux;
