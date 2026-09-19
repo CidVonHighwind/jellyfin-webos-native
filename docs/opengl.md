@@ -189,4 +189,7 @@ The frame-time overlay is an R8 coverage texture rasterised on the CPU by
 other HUD in this repo should work: no glyph atlas, no text shaping, ~60 lines.
 
 `GLTRI_DUMP=1` reads the frame back with `glReadPixels` and prints it as ASCII,
-so the render can be checked over SSH without pointing a camera at the TV.
+so the render can be checked over SSH. For a real picture, `zig build shot`
+grabs a frame from the TV's VNC server on 5900 (`tools/vncshot.py`) -- that is
+what caught the overlay being white-on-nothing and unreadable over the scene;
+it now draws its glyphs on a dim plate.

@@ -11,6 +11,7 @@
 //!   zig build deploy                 scp every app to $WEBOS_TMP
 //!   zig build package -Dapp=wlbox    build an installable .ipk
 //!   zig build install-app -Dapp=wlbox    package, push and install via luna
+//!   zig build shot                   screenshot the TV over VNC
 //!   zig build info                   show the resolved .env settings
 //!
 //! SSH details come from .env (see .env.example), which is sourced by the shell
@@ -152,6 +153,17 @@ pub fn build(b: *std.Build) void {
         \\ssh "$T" "luna-send -n 1 -f luna://com.webos.applicationManager/launch '{\"id\":\"$id\"}'"
     , &.{b.pathFromRoot("appinfo.json")});
     b.step("launch", "Launch the installed app on the TV").dependOn(&launch.step);
+
+    // ---- shot: a PNG of whatever is on the TV right now ----
+    // There is no screenshot service a native app can reach, but the TV runs a
+    // VNC server; this is the only way to see the real output from here.
+    const shot = sh(b, env_preamble ++
+        \\out="$1/shot.png"
+        \\mkdir -p "$1"
+        \\python3 tools/vncshot.py "$HOST" "$out" "${WEBOS_VNC_PASS:-}"
+    , &.{b.pathFromRoot("zig-out")});
+    shot.stdio = .inherit;
+    b.step("shot", "Screenshot the TV over VNC into zig-out/shot.png").dependOn(&shot.step);
 
     // ---- install-app ----
     const inst = sh(b, env_preamble ++ install_script, &.{b.pathFromRoot("zig-out")});

@@ -25,5 +25,8 @@ TOut vsText(float2 corner : POSITION) {
 [shader("fragment")]
 float4 fsText(float2 uv : TEXCOORD0) : SV_Target {
     float coverage = atlas.Sample(uv).r;
-    return float4(coverage, coverage, coverage, coverage);
+    // White glyphs on a dim plate: over a busy scene, plain white-on-nothing
+    // is unreadable. Premultiplied by the usual src-alpha blend, so the plate
+    // darkens what is behind it and the glyphs sit at full white.
+    return float4(coverage.xxx, max(coverage, 0.6));
 }

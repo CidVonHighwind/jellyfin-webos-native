@@ -58,6 +58,8 @@ zig build run   -Dapp=wlbox        # scp one app to /tmp and run it on the TV
 zig build run-host -Dapp=inputlog  # build for this PC and run it in a local window
 zig build deploy                   # scp every app to the TV's temp dir
 
+zig build shot                     # screenshot the TV over VNC -> zig-out/shot.png
+
 zig build package     -Dapp=wlbox  # build zig-out/<id>_<version>_arm.ipk
 zig build install-app -Dapp=wlbox  # package, push and install via luna
 zig build launch                   # start the installed app through SAM
@@ -73,6 +75,14 @@ Cross-compilation target is set in `build.zig`: **`arm-linux-gnueabi`**,
 armv7-a soft-float ABI, glibc 2.31. Override with `-Dtarget=` to build for the
 host instead.
 
+## Seeing what the TV actually drew
+
+webOS exposes no screenshot service a native app can reach, but the TV runs a
+VNC server on 5900. `zig build shot` grabs one frame into `zig-out/shot.png`
+(`tools/vncshot.py`, needs `python3` + `pycryptodome`, password from
+`WEBOS_VNC_PASS` in `.env`). This is the only honest check of on-device
+rendering; the `*_DUMP=1` ASCII readbacks below are the offline fallback.
+
 ## Layout
 
 ```
@@ -80,7 +90,9 @@ src/wl.zig  Wayland shim: one window, one shm buffer, all input.
             Picks wl_webos_shell on the TV and xdg_wm_base on a PC, so the
             same binary source runs in both places.
 src/        application sources
+src/shaders/ Slang shaders, compiled to GLSL ES at build time
 assets/     icon.png, font8x16.bin and other packaged files
+tools/      dev-machine helpers (VNC screenshot)
 docs/       findings from investigating the device
 appinfo.json  webOS app manifest (`main` is rewritten per -Dapp at package time)
 build.zig     build, package, deploy, install, launch
