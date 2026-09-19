@@ -1,0 +1,9 @@
+fbflash
+wlinfo
+wlbox
+vkinfo
+fptest
+.zig-cache/
+zig-out/
+.env
+*.ipk

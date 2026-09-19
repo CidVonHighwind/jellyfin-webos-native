@@ -1,0 +1,219 @@
+3gppmux|Codec/Muxer|audio/AMR audio/AMR-WB audio/mpeg audio/x-ac3 text/x-raw video/mpeg video/x-divx video/x-h263 video/x-h264 
+aac_audiodec|Codec/Decoder/Audio|audio/mpeg 
+aacparse|Codec/Parser/Audio|audio/mpeg 
+ac3_audiodec|Codec/Decoder/Audio|audio/x-ac3 audio/x-eac3 audio/x-private1-ac3 
+ac3parse|Codec/Parser/Converter/Audio|audio/ac3 audio/x-ac3 audio/x-eac3 audio/x-private1-ac3 
+ac4_audiodec|Codec/Decoder/Audio|audio/x-ac4 
+ac4parse|Codec/Parser/Converter/Audio|audio/ac4 audio/x-ac4 
+adpcm_audiodec|Codec/Decoder/Audio|audio/x-adpcm 
+adpcmdec|Codec/Decoder/Audio|audio/x-adpcm 
+aiffmux|Muxer/Audio|audio/x-raw 
+aiffparse|Codec/Demuxer/Audio|audio/x-aiff 
+alac_audiodec|Codec/Decoder/Audio|audio/x-alac 
+alawdec|Codec/Decoder/Audio|audio/x-alaw 
+alawenc|Codec/Encoder/Audio|audio/x-raw 
+amr_audiodec|Codec/Decoder/Audio|audio/AMR audio/AMR-WB 
+amrparse|Codec/Parser/Audio|audio/x-amr-nb-sh audio/x-amr-wb-sh 
+apedemux|Codec/Demuxer/Metadata|application/x-apetag 
+asfdemux|Codec/Demuxer|video/x-ms-asf 
+asfmux|Codec/Muxer|audio/mpeg audio/x-wma video/x-wmv 
+asfparse|Parser|video/x-ms-asf 
+asteriskh263|Codec/Depayloader/Network/RTP|application/x-rtp 
+atscmux|Codec/Muxer|audio/x-ac3 audio/x-eac3 video/mpeg video/x-h264 
+auparse|Codec/Demuxer/Audio|audio/x-au 
+avdec_aac|Codec/Decoder/Audio|audio/mpeg 
+avdec_ac3|Codec/Decoder/Audio|audio/x-ac3 
+avdec_alac|Codec/Decoder/Audio|audio/x-alac 
+avdec_amrnb|Codec/Decoder/Audio|audio/AMR 
+avdec_amrwb|Codec/Decoder/Audio|audio/AMR-WB 
+avdec_eac3|Codec/Decoder/Audio|audio/x-eac3 
+avdec_flac|Codec/Decoder/Audio|audio/x-flac 
+avdec_h264|Codec/Decoder/Video|video/x-h264 
+avdec_mjpeg|Codec/Decoder/Video|image/jpeg 
+avdec_mp3|Codec/Decoder/Audio|audio/mpeg 
+avdec_vp8|Codec/Decoder/Video|video/x-vp8 
+avdec_vp9|Codec/Decoder/Video|video/x-vp9 
+avdec_wmapro|Codec/Decoder/Audio|audio/x-wma 
+avdec_wmav1|Codec/Decoder/Audio|audio/x-wma 
+avdec_wmav2|Codec/Decoder/Audio|audio/x-wma 
+avdec_wmavoice|Codec/Decoder/Audio|audio/x-wms 
+avenc_ac3|Codec/Encoder/Audio|audio/x-raw 
+avenc_eac3|Codec/Encoder/Audio|audio/x-raw 
+avidemux|Codec/Demuxer|video/x-msvideo 
+avimux|Codec/Muxer|audio/mpeg audio/x-ac3 audio/x-alaw audio/x-mulaw audio/x-raw audio/x-wma image/jpeg image/png image/x-jpc video/mpeg video/x-divx video/x-dv video/x-h263 video/x-h264 video/x-huffyuv video/x-msmpeg video/x-raw video/x-vp8 video/x-wmv 
+avisubtitle|Codec/Parser/Subtitle|application/x-subtitle-avi 
+bz2dec|Codec/Decoder|application/x-bzip 
+bz2enc|Codec/Encoder|
+dashdemux|Codec/Demuxer/Adaptive|application/dash+xml 
+dashdemux2|Codec/Demuxer/Adaptive|application/dash+xml 
+dcaparse|Codec/Parser/Audio|audio/x-dts audio/x-dtse audio/x-dtsh audio/x-dtsl audio/x-private1-dts 
+decodebin|Generic/Bin/Decoder|
+decodebin3|Generic/Bin/Decoder|
+decodebin3_shvc|Generic/Bin/Decoder|
+decproxy|Codec/Decoder/Bin|audio/AMR audio/AMR-WB audio/mpeg audio/mpeg-h audio/x-ac3 audio/x-ac4 audio/x-adpcm audio/x-alaw audio/x-dts audio/x-dtse audio/x-dtsh audio/x-dtsl audio/x-dtsx audio/x-eac3 audio/x-flac audio/x-lpcm audio/x-lpcm-1 audio/x-mulaw audio/x-opus audio/x-private-lg-lpcm audio/x-private-ts-lpcm audio/x-private1-ac3 audio/x-private1-dts audio/x-private1-lpcm audio/x-private2-lpcm audio/x-vorbis audio/x-wma image/jpeg video/mpeg video/x-3ivx video/x-av1 video/x-cavs video/x-divx video/x-ffv video/x-flash-video video/x-h263 video/x-h264 video/x-h265 video/x-intel-h263 video/x-msmpeg video/x-svq video/x-vp8 video/x-vp9 video/x-wmv video/x-xvid 
+diracparse|Codec/Parser/Video|video/x-dirac 
+dolbystreamcombiner|Codec/Parser/Converter/Video|video/x-h264 video/x-h265 
+dts_audiodec|Codec/Decoder/Audio|audio/x-dts audio/x-dtse audio/x-dtsh audio/x-dtsl audio/x-dtsx audio/x-private1-dts 
+dvbin|Codec/Decoder/Video|video/mpeg video/x-3ivx video/x-av1 video/x-avs2 video/x-cavs video/x-fd video/x-ffv video/x-flash-video video/x-h263 video/x-h264 video/x-h265 video/x-h266 video/x-hevc video/x-intel-h263 video/x-pn-realvideo video/x-raw video/x-svq video/x-vp8 video/x-vp9 video/x-wmv video/x-xvid 
+dvcombbin|Bin/Converter/Video/Codec/Parser|video/x-h264 video/x-h265 
+dvdlpcmdec|Codec/Decoder/Audio|audio/x-lpcm audio/x-private-ts-lpcm audio/x-private1-lpcm audio/x-private2-lpcm 
+dvr3gppmux|Codec/Muxer|audio/AMR audio/AMR-WB audio/mpeg audio/x-ac3 text/x-raw video/mpeg video/x-divx video/x-h263 video/x-h264 
+dvrdashdemux|Codec/Demuxer/Adaptive|application/dash+xml 
+dvrismlmux|Codec/Muxer|audio/mpeg video/mpeg video/x-divx video/x-h264 
+dvrmj2mux|Codec/Muxer|audio/x-raw image/x-j2c image/x-jpc 
+dvrmp4dashmux|Codec/Muxer|audio/mpeg audio/mpeg-h video/x-h264 video/x-h265 
+dvrmp4mux|Codec/Muxer|audio/mpeg audio/mpeg-h audio/x-ac3 audio/x-alac audio/x-opus text/x-raw video/mpeg video/x-av1 video/x-divx video/x-h264 video/x-h265 video/x-mp4-part 
+dvrqtdemux|Codec/Demuxer|application/x-3gp audio/x-m4a video/mj2 video/quicktime 
+dvrqtmux|Codec/Muxer|audio/AMR audio/AMR-WB audio/mpeg audio/x-ac3 audio/x-adpcm audio/x-alac audio/x-alaw audio/x-mulaw audio/x-opus audio/x-raw image/jpeg image/png text/x-raw video/mpeg video/x-av1 video/x-cineform video/x-dirac video/x-divx video/x-dv video/x-h263 video/x-h264 video/x-h265 video/x-prores video/x-qt-part video/x-raw video/x-svq video/x-vp8 video/x-vp9 
+dvrtsdemux|Codec/Demuxer|video/mpegts 
+dvrtsparse|Codec/Parser|video/mpegts 
+encodebin|Generic/Bin/Encoder|
+fakeadec|Codec/Decoder/Audio|audio/AMR audio/AMR-WB audio/mpeg audio/mpeg-h audio/x-ac3 audio/x-ac4 audio/x-adpcm audio/x-alaw audio/x-dts audio/x-dtse audio/x-dtsh audio/x-dtsl audio/x-dtsx audio/x-eac3 audio/x-flac audio/x-lpcm audio/x-lpcm-1 audio/x-mulaw audio/x-opus audio/x-private-lg-lpcm audio/x-private-ts-lpcm audio/x-private1-ac3 audio/x-private1-dts audio/x-private1-lpcm audio/x-raw audio/x-vorbis audio/x-wma 
+fakevdec|Codec/Decoder/Video|image/jpeg video/mpeg video/x-3ivx video/x-av1 video/x-divx video/x-ffv video/x-flash-video video/x-h263 video/x-h264 video/x-h265 video/x-intel-h263 video/x-msmpeg video/x-raw video/x-svq video/x-vp8 video/x-vp9 video/x-wmv video/x-xvid 
+flac_audiodec|Codec/Decoder/Audio|audio/x-flac 
+flacdec|Codec/Decoder/Audio|audio/x-flac 
+flacenc|Codec/Encoder/Audio|audio/x-raw 
+flacparse|Codec/Parser/Audio|audio/x-flac 
+flvdemux|Codec/Demuxer|video/x-flv 
+flvmux|Codec/Muxer|audio/mpeg audio/x-adpcm audio/x-alaw audio/x-mulaw audio/x-nellymoser audio/x-raw audio/x-speex video/x-flash-screen video/x-flash-video video/x-h264 video/x-vp6-alpha video/x-vp6-flash 
+flxdec|Codec/Decoder/Video|video/x-fli 
+h263parse|Codec/Parser/Video|video/x-h263 
+h264parse|Codec/Parser/Converter/Video|video/x-h264 
+h265parse|Codec/Parser/Converter/Video|video/x-h265 
+hlsdemux|Codec/Demuxer/Adaptive|application/x-hls 
+Segmentation fault
+hlsdemux2|Codec/Demuxer/Adaptive|application/x-hls 
+icydemux|Codec/Demuxer/Metadata|application/x-icy 
+id3demux|Codec/Demuxer/Metadata|application/x-id3 
+irtspparse|Raw/Parser|
+ismlmux|Codec/Muxer|audio/mpeg video/mpeg video/x-divx video/x-h264 
+ivfparse|Codec/Demuxer|video/x-ivf 
+ivorbisdec|Codec/Decoder/Audio|audio/x-vorbis 
+jpeg2000parse|Codec/Parser/Video/Image|image/jp2 image/x-j2c image/x-jpc 
+lxmjpegdec|Codec/Decoder/Video/Hardware|image/jpeg 
+lxmjpegdec_cmn|Codec/Decoder/Video/Hardware|image/jpeg 
+lxvideodec|Codec/Decoder/Video/Hardware|video/mpeg video/x-3ivx video/x-av1 video/x-avs2 video/x-cavs video/x-fd video/x-ffv video/x-flash-video video/x-h263 video/x-h264 video/x-h265 video/x-h266 video/x-hevc video/x-intel-h263 video/x-raw video/x-svq video/x-vp8 video/x-vp9 video/x-wmv video/x-xvid 
+lxvideoenc|Encoder/Video|video/x-raw 
+matroskademux|Codec/Demuxer|audio/webm audio/x-matroska video/webm video/x-matroska video/x-matroska-3d 
+matroskamux|Codec/Muxer|application/x-ass application/x-ssa application/x-subtitle-unknown application/x-usf audio/G722 audio/mpeg audio/x-ac3 audio/x-adpcm audio/x-alaw audio/x-dts audio/x-eac3 audio/x-flac audio/x-mulaw audio/x-opus audio/x-raw audio/x-speex audio/x-tta audio/x-vorbis audio/x-wma image/jpeg subpicture/x-dvd text/x-raw video/mpeg video/x-av1 video/x-dirac video/x-divx video/x-dv video/x-h263 video/x-h264 video/x-h265 video/x-huffyuv video/x-msmpeg video/x-prores video/x-raw video/x-theora video/x-vp8 video/x-vp9 video/x-wmv 
+matroskaparse|Codec/Parser|audio/webm audio/x-matroska video/webm video/x-matroska video/x-matroska-3d 
+mediainfo|Codec/Parser/Decoder/Audio|application/x-ass application/x-ssa application/x-teletext audio/x-raw subpicture/x-dvb subpicture/x-dvd subpicture/x-xsub text/x-avi-internal text/x-avi-unknown text/x-raw 
+midiparse|Codec/Demuxer/Audio|audio/midi audio/riff-midi 
+mj2mux|Codec/Muxer|audio/x-raw image/x-j2c image/x-jpc 
+mp4mux|Codec/Muxer|audio/mpeg audio/x-ac3 audio/x-alac audio/x-opus text/x-raw video/mpeg video/x-av1 video/x-divx video/x-h264 video/x-h265 video/x-mp4-part 
+mpeg4videoparse|Codec/Parser/Video|video/mpeg 
+mpegaudioparse|Codec/Parser/Audio|audio/mpeg 
+mpegh_audiodec|Codec/Decoder/Audio|audio/mpeg-h 
+mpegpsdemux|Codec/Demuxer|video/mpeg video/x-cdxa 
+mpegpsmux|Codec/Muxer|audio/mpeg audio/x-lpcm video/mpeg video/x-dirac video/x-h264 
+mpegtsmux|Codec/Muxer|application/x-teletext audio/mpeg audio/x-ac3 audio/x-dts audio/x-lpcm audio/x-opus image/x-jpc subpicture/x-dvb video/mpeg video/x-dirac video/x-h264 video/x-h265 
+mpegvideoparse|Codec/Parser/Video|video/mpeg 
+mssdemux|Codec/Demuxer/Adaptive|application/vnd.ms-sstr+xml 
+mulawdec|Codec/Decoder/Audio|audio/x-mulaw 
+mulawenc|Codec/Encoder/Audio|audio/x-raw 
+multipartdemux|Codec/Demuxer|
+multipartmux|Codec/Muxer|
+mxfdemux|Codec/Demuxer|application/mxf 
+mxfmux|Codec/Muxer|audio/mpeg audio/x-ac3 audio/x-alaw audio/x-raw image/x-jpc video/mpeg video/x-dnxhd video/x-dv video/x-h264 video/x-raw 
+oggaviparse|Codec/Parser|application/x-ogg-avi 
+oggdemux|Codec/Demuxer|application/kate application/ogg audio/ogg video/ogg 
+oggmux|Codec/Muxer|application/x-kate application/x-ogm-audio application/x-ogm-video audio/x-celt audio/x-flac audio/x-opus audio/x-speex audio/x-vorbis text/x-cmml video/x-daala video/x-dirac video/x-smoke video/x-theora video/x-vp8 
+oggparse|Codec/Parser|application/ogg 
+ogmaudioparse|Codec/Parser/Audio|application/x-ogm-audio 
+ogmtextparse|Codec/Decoder/Subtitle|application/x-ogm-text 
+ogmvideoparse|Codec/Parser/Video|application/x-ogm-video 
+omx_lxvideodec|Codec/Decoder/Video/Hardware|video/mpeg video/x-3ivx video/x-av1 video/x-avs2 video/x-cavs video/x-fd video/x-ffv video/x-flash-video video/x-h263 video/x-h264 video/x-h265 video/x-h266 video/x-hevc video/x-intel-h263 video/x-raw video/x-svq video/x-vp8 video/x-vp9 video/x-wmv video/x-xvid 
+opus_audiodec|Codec/Decoder/Audio|audio/x-opus 
+parsebin|Generic/Bin/Parser|
+parsebin_shvc|Generic/Bin/Parser|
+pcapparse|Raw/Parser|
+pcm_audiodec|Codec/Decoder/Audio|audio/x-alaw audio/x-lpcm audio/x-lpcm-1 audio/x-mulaw audio/x-private-lg-lpcm audio/x-private-ts-lpcm audio/x-private1-lpcm audio/x-private2-lpcm 
+pngparse|Codec/Parser/Video/Image|image/png 
+qtdemux|Codec/Demuxer|application/x-3gp audio/x-m4a video/mj2 video/quicktime 
+qtdemux_1_8|Codec/Demuxer|application/x-3gp audio/x-m4a video/mj2 video/quicktime 
+qtmux|Codec/Muxer|audio/AMR audio/AMR-WB audio/mpeg audio/x-ac3 audio/x-adpcm audio/x-alac audio/x-alaw audio/x-mulaw audio/x-opus audio/x-raw image/jpeg image/png text/x-raw video/mpeg video/x-av1 video/x-cineform video/x-dirac video/x-divx video/x-dv video/x-h263 video/x-h264 video/x-h265 video/x-prores video/x-qt-part video/x-raw video/x-svq video/x-vp8 video/x-vp9 
+rawaudioparse|Codec/Parser/Audio|audio/x-alaw audio/x-mulaw audio/x-raw audio/x-unaligned-raw 
+rawvideoparse|Codec/Parser/Video|video/x-raw video/x-unaligned-raw 
+reformatter|Codec/Parser/Decoder/Audio|audio/x-raw 
+rtpac3depay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpamrdepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpasfdepay|Codec/Depayloader/Network|application/x-rtp 
+rtpbvdepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpceltdepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpdec|Codec/Parser/Network|application/x-rtcp application/x-rtp 
+rtpdtmfmux|Codec/Muxer|application/x-rtp 
+rtpdvdepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpg722depay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpg723depay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpg726depay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpg729depay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpgsmdepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpgstdepay|Codec/Depayloader/Network|application/x-rtp 
+rtph261depay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtph263depay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtph263pdepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtph264depay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtph265depay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpilbcdepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpj2kdepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpjpegdepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpklvdepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpmp1sdepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpmp2tdepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpmp4adepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpmp4gdepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpmp4vdepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpmpadepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpmparobustdepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpmpvdepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpmux|Codec/Muxer|application/x-rtp 
+rtpopusdepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtppcmadepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtppcmudepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpqcelpdepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpqdm2depay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpreddec|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpsbcdepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpsirendepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpspeexdepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpstreamdepay|Codec/Depayloader/Network|application/x-rtcp-stream application/x-rtp-stream application/x-srtcp-stream application/x-srtp-stream 
+rtpsv3vdepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtptheoradepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpulpfecdec|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpvorbisdepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpvp8depay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpvp9depay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpvrawdepay|Codec/Depayloader/Network/RTP|application/x-rtp 
+rtpxqtdepay|Codec/Depayloader/Network|application/x-rtp 
+sbcparse|Codec/Parser/Audio|audio/x-sbc 
+sdpdemux|Codec/Demuxer/Network/RTP|application/sdp 
+speexdec|Codec/Decoder/Audio|audio/x-speex 
+speexenc|Codec/Encoder/Audio|audio/x-raw 
+splitmuxsink|Generic/Bin/Muxer|
+splitmuxsrc|Generic/Bin/Demuxer|
+srtenc|Codec/Encoder/Subtitle|text/x-raw 
+ssaparse|Codec/Parser/Subtitle|application/x-ass application/x-ssa 
+subparse|Codec/Parser/Subtitle|application/x-subtitle application/x-subtitle-dks application/x-subtitle-lrc application/x-subtitle-mpl2 application/x-subtitle-qttext application/x-subtitle-sami application/x-subtitle-tmplayer application/x-subtitle-vtt 
+tsdemux|Codec/Demuxer|video/mpegts 
+tsparse|Codec/Parser|video/mpegts 
+unalignedaudioparse|Codec/Parser/Bin/Audio|audio/x-unaligned-raw 
+unalignedvideoparse|Codec/Parser/Bin/Video|video/x-unaligned-raw 
+uridecodebin|Generic/Bin/Decoder|
+uridecodebin3|Generic/Bin/Decoder|
+uridecodebin3_shvc|Generic/Bin/Decoder|
+v4l2h264dec|Codec/Decoder/Video/Hardware|video/x-h264 
+v4l2h264enc|Codec/Encoder/Video/Hardware|video/x-raw 
+v4l2vp8enc|Codec/Encoder/Video/Hardware|video/x-raw 
+vc1parse|Codec/Parser/Converter/Video|video/x-wmv 
+vorbis_audiodec|Codec/Decoder/Audio|audio/x-vorbis 
+vorbisdec|Codec/Decoder/Audio|audio/x-vorbis 
+vorbisenc|Codec/Encoder/Audio|audio/x-raw 
+vorbisparse|Codec/Parser/Audio|audio/x-vorbis 
+wavenc|Codec/Muxer/Audio|audio/x-alaw audio/x-mulaw audio/x-raw 
+wavpackdec|Codec/Decoder/Audio|audio/x-wavpack 
+wavpackenc|Codec/Encoder/Audio|audio/x-raw 
+wavpackparse|Codec/Parser/Audio|audio/x-wavpack audio/x-wavpack-correction 
+wavparse|Codec/Demuxer/Audio|audio/x-rf64 audio/x-wav 
+webmmux|Codec/Muxer|application/x-ass application/x-ssa application/x-subtitle-unknown application/x-usf audio/x-opus audio/x-vorbis subpicture/x-dvd text/x-raw video/x-av1 video/x-vp8 video/x-vp9 
+webvttenc|Codec/Encoder/Subtitle|text/x-raw 
+wma_audiodec|Codec/Decoder/Audio|audio/x-wma 
