@@ -29,10 +29,17 @@ Sandstone Icons.
 3. Droid Sans;
 4. common DejaVu/Liberation Sans paths for host development.
 
-The selected path is printed at startup. The current atlas prewarms printable
-ASCII because the remote UI demo needs no shaping or multilingual strings. The
-font/parser and skyline packer already support extending this to an on-demand
-Unicode cache when an application needs it.
+The selected path is printed at startup. The atlas prewarms printable ASCII,
+then caches additional Unicode glyphs on demand. Font data and rasterizer kernels
+remain alive so new titles and symbols can extend the cache at any time. Missing
+glyphs try installed Droid Sans Fallback, Droid Sans, and host DejaVu Sans faces;
+unsupported characters use `?`, with misses cached to avoid repeated work.
+
+The skyline atlas grows as needed, preserving existing glyph positions, up to
+the GPU's supported texture size. The renderer prepares all text before building
+UVs and uploads changed atlas pixels, replacing the texture when it grows.
+Coverage depends on the installed fonts; complex-script shaping and bidirectional
+layout are not implemented.
 
 To repeat the inventory on another set:
 

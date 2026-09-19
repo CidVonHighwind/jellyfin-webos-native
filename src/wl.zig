@@ -181,7 +181,7 @@ pub fn toInt(f: Fixed) i32 {
 }
 
 pub const Event = union(enum) {
-    /// evdev keycode + 8, exactly as the remote/keyboard sends it.
+    /// Raw evdev keycode (no XKB +8 offset).
     key: struct { seat: u8, code: u32, pressed: bool },
     modifiers: struct { seat: u8, depressed: u32, latched: u32, locked: u32, group: u32 },
     pointer_enter: struct { seat: u8, x: Fixed, y: Fixed },
@@ -212,6 +212,12 @@ pub var running = true;
 /// True on the TV: the surface is fullscreen and managed by LSM.
 pub var on_webos = false;
 
+/// LG's keycodes/lg maps IR_KEY_BACK to XKB 420, i.e. Wayland key 412.
+/// On desktops 412 is KEY_PREVIOUS, so only treat it as Back on the TV.
+pub fn isBackKey(code: u32) bool {
+    return code == 1 or code == 158 or (on_webos and code == 412);
+}
+
 /// The current mode of the first wl_output, from the compositor. `refresh_mhz`
 /// is millihertz, as the protocol reports it (60000 = 60 Hz); 0 means the
 /// compositor never sent a mode.
@@ -227,6 +233,23 @@ var shm: Proxy = .{};
 /// The wl_surface, for wl_egl_window_create.
 pub var surface: Proxy = .{};
 var webos_shell: Proxy = .{};
+var webos_surface: Proxy = .{};
+var handles_back = false;
+
+/// Claim Back while the app can navigate or dismiss an editor. Root screens
+/// release it to webOS. The property also works on older TV shell protocols.
+/// See Kodi's ShellSurfaceWebOSShell.cpp (_WEBOS_ACCESS_POLICY_KEYS_BACK).
+pub fn setBackHandled(handled: bool) void {
+    if (handles_back == handled) return;
+    handles_back = handled;
+    if (webos_surface.ok()) {
+        webos_surface.call("set_property", .{
+            @as([*:0]const u8, "_WEBOS_ACCESS_POLICY_KEYS_BACK"),
+            @as([*:0]const u8, if (handled) "true" else "false"),
+        });
+        _ = flushFn(display);
+    }
+}
 var xdg_wm: Proxy = .{};
 var xdg_surf: Proxy = .{};
 var xdg_top: Proxy = .{};
@@ -309,8 +332,13 @@ pub fn open(app_id: [*:0]const u8, title: [*:0]const u8, w: u32, h: u32, buffers
     if (webos_shell.ok()) {
         on_webos = true;
         const ss = webos_shell.new("get_shell_surface", iface("wl_webos_shell_surface_interface"), .{surface.p});
+        webos_surface = ss;
         // LSM only shows surfaces it can attribute to an app.
         ss.call("set_property", .{ @as([*:0]const u8, "appId"), app_id });
+        ss.call("set_property", .{
+            @as([*:0]const u8, "_WEBOS_ACCESS_POLICY_KEYS_BACK"),
+            @as([*:0]const u8, if (handles_back) "true" else "false"),
+        });
         ss.call("set_state", .{@as(u32, 1)}); // 1 = fullscreen
         configured = true;
     } else if (xdg_wm.ok()) {

@@ -45,6 +45,31 @@ whichever library grid happened to still be loaded, so
 An entry stores enough to **re-enter** a screen, not a snapshot of it.
 Re-entering refetches, which is also what keeps a details screen current.
 
+Back belongs to webOS only at the server picker and signed-in home. Other
+screens, and an open text editor, claim it through the shared Wayland layer.
+Home rows and episode lists have persistent wheel scroll positions; remote
+navigation reveals the focused row without overriding wheel scrolling each
+frame. Returning home restores its scroll position.
+
+Show and season pages share the series' first backdrop as a full-screen
+background. Season cards and the season's left-hand poster use the season's
+own Primary image, falling back to the show poster if absent. Series metadata
+shows its year span (or an open span for continuing shows), without type or
+season-count labels. Episode rows use their own landscape Primary image and
+show episode number/title, humanized duration, and `★ rating` when available.
+The star is yellow. Blue poster badges count unfinished seasons on shows and
+unwatched episodes on seasons; watched episodes show white check marks in blue
+badges. Zero counts, counts still loading, and unwatched episode badges are hidden.
+The series count is fetched from season watch states, since Jellyfin's
+series-level `UnplayedItemCount` counts episodes, not seasons. Opening a show
+or season focuses its first unfinished child (first child if all are watched),
+while Back restores the previous selection. Overview `<br>` tags become real
+line breaks and unknown movie years are omitted.
+Scroll content reaches the screen edges; selection padding is not a clip.
+Grid Up/Down preserve the selected item when no item exists in that column in
+the adjacent row. The texture cache distinguishes image type and requested size;
+backdrops also have a separate disk-cache key.
+
 ## Storage
 
 Two roots, chosen without any environment, because SAM provides none:
@@ -264,7 +289,8 @@ UI_SCRIPT=oddo UI_CAPTURE=/tmp/home.ppm zig build run-host -Dapp=jellyfin
 ```
 
 `UI_SCRIPT` letters are `u`/`d`/`l`/`r` for the arrows, `o` for OK, `b` for
-Back, `.` to wait a beat. A press is held until nothing is outstanding in the
+Back, `[`/`]` to scroll up/down, and `.` to wait a beat. Back uses the native
+LG keycode on the TV. A press is held until nothing is outstanding in the
 fetcher, so a script does not race a request. `UI_CAPTURE` saves the screen it
 ends on — this application's own OpenGL backbuffer, the same path as `uidemo`'s
 F12 — and exits.
@@ -296,6 +322,9 @@ a server:
 ```sh
 set -a; . ./.env; set +a; zig test -lc src/jellyfin/api.zig
 ```
+
+`zig build test` also runs the Back ownership/navigation, artwork metadata,
+home scrolling and shared virtual-list regression tests on the host.
 
 ## Credentials
 

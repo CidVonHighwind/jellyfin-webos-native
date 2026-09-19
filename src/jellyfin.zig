@@ -40,6 +40,7 @@ const TEXT: loom.Color = .{ 239, 244, 250, 255 };
 const DIM: loom.Color = .{ 148, 163, 182, 255 };
 const BORDER: loom.Color = .{ 55, 70, 91, 255 };
 const WHITE: loom.Color = .{ 255, 255, 255, 255 };
+const YELLOW: loom.Color = .{ 255, 206, 64, 255 };
 
 // ----------------------------------------------------------- poster cache
 //
@@ -58,6 +59,9 @@ const cache_size = 48;
 const Slot = struct {
     id: api.Text(40) = .{},
     tag: api.Text(40) = .{},
+    kind: api.ImageKind = .primary,
+    requested_width: u32 = 0,
+    requested_height: u32 = 0,
     texture: u32 = 0,
     width: u32 = 0,
     height: u32 = 0,
@@ -77,13 +81,18 @@ var poster_requests: u8 = 0;
 /// Calling this is also what keeps a slot alive, so it must be called every
 /// frame for every visible card.
 fn poster(id: []const u8, tag: []const u8) ?*const Slot {
+    return artwork(id, tag, .primary, poster_w, poster_h);
+}
+
+fn artwork(id: []const u8, tag: []const u8, kind: api.ImageKind, width: u32, height: u32) ?*const Slot {
     if (id.len == 0) return null;
     for (&slots) |*slot| {
         if (!std.mem.eql(u8, slot.id.get(), id) or !std.mem.eql(u8, slot.tag.get(), tag)) continue;
+        if (slot.kind != kind or slot.requested_width != width or slot.requested_height != height) continue;
         slot.used = frame_index;
         return if (slot.texture != 0) slot else null;
     }
-    if (poster_requests >= 4) return null;
+    if (poster_requests >= 4 or fetcher.pending() >= 24) return null;
 
     var victim: ?*Slot = null;
     var oldest: u64 = std.math.maxInt(u64);
@@ -102,10 +111,11 @@ fn poster(id: []const u8, tag: []const u8) ?*const Slot {
     const task = fetcher.submit(.poster, index) orelse return null;
     task.a.set(id);
     task.b.set(tag);
-    task.start = poster_w;
-    task.limit = poster_h;
+    task.start = width;
+    task.limit = height;
+    task.image_kind = kind;
     renderer.destroyTexture(claimed.texture);
-    claimed.* = .{ .used = frame_index, .loading = true };
+    claimed.* = .{ .used = frame_index, .loading = true, .kind = kind, .requested_width = width, .requested_height = height };
     claimed.id.set(id);
     claimed.tag.set(tag);
     fetcher.start(task);
@@ -140,19 +150,45 @@ const Card = struct {
     poster_id: api.Text(40) = .{},
     poster_tag: api.Text(40) = .{},
     series_id: api.Text(40) = .{},
+    thumbnail_tag: api.Text(40) = .{},
+    backdrop_id: api.Text(40) = .{},
+    backdrop_tag: api.Text(40) = .{},
     title: api.Text(96) = .{},
+    episode_title: api.Text(128) = .{},
+    overview: api.Text(1024) = .{},
+    rating: api.Text(32) = .{},
     subtitle: api.Text(72) = .{},
     kind: api.Text(16) = .{},
     runtime: api.Text(24) = .{},
     progress: f32 = 0,
+    played: bool = false,
+    remaining: ?u32 = null,
     present: bool = false,
 
     fn from(item: api.Item) Card {
-        var card: Card = .{ .present = true, .progress = item.progress() };
+        var card: Card = .{ .present = true, .progress = item.progress(), .played = item.finished() };
+        if (std.mem.eql(u8, item.Type, "Season")) {
+            card.remaining = if (card.played) 0 else if (item.UserData) |data| data.UnplayedItemCount orelse item.ChildCount else item.ChildCount;
+        }
         card.id.set(item.Id);
         card.poster_id.set(item.posterId());
         card.poster_tag.set(item.posterTag());
         card.series_id.set(item.SeriesId orelse "");
+        if (item.ImageTags) |tags| card.thumbnail_tag.set(tags.Primary orelse "");
+        const backdrops = item.BackdropImageTags orelse &.{};
+        const inherited = item.ParentBackdropImageTags orelse &.{};
+        if (backdrops.len != 0) {
+            card.backdrop_id.set(item.Id);
+            card.backdrop_tag.set(backdrops[0]);
+        } else if (inherited.len != 0) {
+            card.backdrop_id.set(item.ParentBackdropItemId orelse "");
+            card.backdrop_tag.set(inherited[0]);
+        }
+        setOverview(&card.overview, item.Overview orelse "");
+        if (item.IndexNumber) |number| {
+            card.episode_title.set(build("{d}. {s}", .{ number, item.Name }));
+        } else card.episode_title.set(item.Name);
+        if (item.CommunityRating) |rating| card.rating.set(build("{d:.1}", .{rating}));
         card.kind.set(item.Type);
         card.title.set(if (std.mem.eql(u8, item.Type, "Episode"))
             item.SeriesName orelse item.Name
@@ -161,7 +197,12 @@ const Card = struct {
         // Each `build` reuses one buffer, so every result is copied into the
         // card before the next call.
         card.subtitle.set(subtitleFor(item));
-        if (item.minutes() != 0) card.runtime.set(build("{d}h {d:0>2}m", .{ item.minutes() / 60, item.minutes() % 60 }));
+        if (item.RunTimeTicks) |ticks| {
+            const minutes = item.minutes();
+            card.runtime.set(if (minutes >= 60)
+                if (minutes % 60 == 0) build("{d} hr", .{minutes / 60}) else build("{d} hr {d} min", .{ minutes / 60, minutes % 60 })
+            else if (minutes > 0) build("{d} min", .{minutes}) else build("{d} sec", .{ticks / 10_000_000}));
+        }
         return card;
     }
 
@@ -176,13 +217,106 @@ fn subtitleFor(item: api.Item) []const u8 {
         return build("S{d}E{d}  {s}", .{ item.ParentIndexNumber orelse 0, item.IndexNumber orelse 0, item.Name });
     if (std.mem.eql(u8, item.Type, "CollectionFolder"))
         return item.CollectionType orelse "Library";
-    if (std.mem.eql(u8, item.Type, "Series"))
-        return build("Series  -  {d}  -  {d} seasons", .{ item.ProductionYear orelse 0, item.ChildCount orelse 0 });
+    if (std.mem.eql(u8, item.Type, "Series")) {
+        const start = item.ProductionYear orelse dateYear(item.PremiereDate) orelse return "";
+        if (dateYear(item.EndDate)) |end| {
+            if (end > start) return build("{d}-{d}", .{ start, end });
+        } else if (std.mem.eql(u8, item.Status orelse "", "Continuing")) return build("{d}-Present", .{start});
+        return build("{d}", .{start});
+    }
     if (std.mem.eql(u8, item.Type, "Season"))
         return build("{d} episodes", .{item.ChildCount orelse 0});
-    if (item.RunTimeTicks != null and item.minutes() != 0)
-        return build("{d}  -  {d}h {d:0>2}m", .{ item.ProductionYear orelse 0, item.minutes() / 60, item.minutes() % 60 });
+    if (item.RunTimeTicks != null and item.minutes() != 0) {
+        if (item.ProductionYear) |year| if (year != 0)
+            return build("{d}  -  {d}h {d:0>2}m", .{ year, item.minutes() / 60, item.minutes() % 60 });
+        return build("{d}h {d:0>2}m", .{ item.minutes() / 60, item.minutes() % 60 });
+    }
     return item.CollectionType orelse item.Type;
+}
+
+fn dateYear(date: ?[]const u8) ?u32 {
+    const value = date orelse return null;
+    if (value.len < 4) return null;
+    const year = std.fmt.parseInt(u32, value[0..4], 10) catch return null;
+    return if (year > 0) year else null;
+}
+
+fn setOverview(out: *api.Text(1024), text: []const u8) void {
+    var input: usize = 0;
+    var len: usize = 0;
+    while (input < text.len and len < out.buffer.len - 1) {
+        if (text[input] == '<') if (std.mem.indexOfScalar(u8, text[input..], '>')) |end| {
+            const tag = std.mem.trim(u8, text[input + 1 .. input + end], " \t\r\n/");
+            if (std.ascii.eqlIgnoreCase(tag, "br")) {
+                out.buffer[len] = '\n';
+                len += 1;
+                input += end + 1;
+                continue;
+            }
+        };
+        out.buffer[len] = text[input];
+        input += 1;
+        len += 1;
+    }
+    out.len = len;
+    out.buffer[len] = 0;
+}
+
+fn firstUnfinished(cards: []const Card) usize {
+    for (cards, 0..) |card, index| if (!card.played) return index;
+    return 0;
+}
+
+fn unfinishedSeasons(items: []const api.Item) u32 {
+    var count: u32 = 0;
+    for (items) |item| if (!item.finished()) {
+        count += 1;
+    };
+    return count;
+}
+
+// Series UserData counts episodes, so fetch seasons to count unfinished seasons.
+const SeriesStatus = struct {
+    id: api.Text(40) = .{},
+    count: ?u32 = null,
+    loading: bool = false,
+    used: u64 = 0,
+    failed: bool = false,
+};
+var series_status: [128]SeriesStatus = @splat(.{});
+var status_requests: u8 = 0;
+
+fn remainingSeasons(card: *const Card) ?u32 {
+    if (card.played) return 0;
+    if (std.mem.eql(u8, card.id.get(), detail.id.get()) and !seasons_row.loading and (screen == .details or screen == .season)) {
+        var count: u32 = 0;
+        for (seasons_row.cards[0..seasons_row.count]) |season| if (!season.played) {
+            count += 1;
+        };
+        return count;
+    }
+    var victim: usize = 0;
+    var oldest: u64 = std.math.maxInt(u64);
+    for (&series_status, 0..) |*entry, index| {
+        if (std.mem.eql(u8, entry.id.get(), card.id.get())) {
+            entry.used = frame_index;
+            return entry.count;
+        }
+        if (!entry.loading and entry.used < oldest) {
+            oldest = entry.used;
+            victim = index;
+        }
+    }
+    // Leave task slots available for opening a show/season while scrolling.
+    if (status_requests >= 2 or oldest == std.math.maxInt(u64) or fetcher.pending() >= 24) return null;
+    const task = request(.season_status, @intCast(victim)) orelse return null;
+    const entry = &series_status[victim];
+    entry.* = .{ .loading = true, .used = frame_index };
+    entry.id = card.id;
+    task.a.set(card.id.get());
+    fetcher.start(task);
+    status_requests += 1;
+    return null;
 }
 
 /// Per-frame scratch for formatted labels. A draw command borrows the slice
@@ -215,21 +349,24 @@ const Screen = enum { server, auth, quick, home, grid, details, season };
 const EditField = enum { none, url, username, password };
 
 const row_capacity = 24;
-const Row = struct {
-    title: []const u8,
-    /// Libraries are 16:9 banners on the server, not posters. Cropping one to
-    /// a portrait card cuts the library's name out of the middle of it.
-    wide: bool = false,
-    cards: [row_capacity]Card = @splat(.{}),
-    count: usize = 0,
-    loading: bool = false,
+const Row = ItemRow(row_capacity);
+fn ItemRow(comptime capacity: usize) type {
+    return struct {
+        title: []const u8,
+        /// Libraries are 16:9 banners on the server, not posters. Cropping one to
+        /// a portrait card cuts the library's name out of the middle of it.
+        wide: bool = false,
+        cards: [capacity]Card = @splat(.{}),
+        count: usize = 0,
+        loading: bool = false,
 
-    fn fill(self: *Row, items: []const api.Item) void {
-        self.count = @min(items.len, row_capacity);
-        for (items[0..self.count], self.cards[0..self.count]) |item, *card| card.* = .from(item);
-        self.loading = false;
-    }
-};
+        fn fill(self: *@This(), items: []const api.Item) void {
+            self.count = @min(items.len, capacity);
+            for (items[0..self.count], self.cards[0..self.count]) |item, *card| card.* = .from(item);
+            self.loading = false;
+        }
+    };
+}
 
 /// Fixed home layout, top to bottom. Libraries last because the first two are
 /// what a returning user actually wants.
@@ -242,11 +379,17 @@ var rows = [_]Row{
 
 var session: api.Session = .{};
 var fetcher: api.Fetcher = undefined;
+/// Back cancels the UI's interest in pending sign-in / Quick Connect replies.
+var auth_generation: u32 = 0;
 
 var screen: Screen = .server;
 var focus: usize = 0;
 var row_focus: usize = 0;
 var col_focus: [rows.len]usize = @splat(0);
+var home_scroll: f32 = 0;
+var home_rect: loom.Rect = .{};
+var home_row_height: f32 = 470;
+var home_reveal = false;
 
 /// Where Back goes, as a stack rather than a rule per screen.
 ///
@@ -286,7 +429,11 @@ fn here() Entry {
             .season => episode_selected,
             else => 0,
         },
-        .scroll = grid_scroll,
+        .scroll = switch (screen) {
+            .home => home_scroll,
+            .season => episode_scroll,
+            else => grid_scroll,
+        },
         .focus = focus,
         .row_focus = row_focus,
         .col_focus = col_focus,
@@ -314,7 +461,10 @@ fn pop() void {
     row_focus = entry.row_focus;
     col_focus = entry.col_focus;
     switch (entry.screen) {
-        .home => screen = .home,
+        .home => {
+            screen = .home;
+            home_scroll = entry.scroll;
+        },
         .grid => {
             // Returning to the grid we are still holding pages for is free;
             // a different library has to be fetched again.
@@ -329,11 +479,14 @@ fn pop() void {
         .details => {
             openDetails(entry.card);
             focus = entry.focus;
+            select_unfinished_season = false;
         },
         .season => {
             detail = entry.series;
             openSeason(entry.card);
             episode_selected = entry.selected;
+            episode_scroll = entry.scroll;
+            select_unfinished_episode = false;
         },
         // Nothing above the sign-in screens is ever pushed.
         else => {
@@ -352,11 +505,7 @@ fn libraryCard() Card {
 }
 
 fn seasonCard() Card {
-    var card: Card = .{ .present = true };
-    card.id.set(season_id.get());
-    card.title.set(season_title.get());
-    card.series_id.set(detail.id.get());
-    return card;
+    return season_detail;
 }
 
 // Discovery / manual server entry.
@@ -391,13 +540,18 @@ var grid_row_height: f32 = 360;
 
 // Details and season screens.
 var detail: Card = .{};
-var detail_overview: api.Text(640) = .{};
 var detail_extra: api.Text(96) = .{};
-var seasons_row: Row = .{ .title = "Seasons" };
-var episodes_row: Row = .{ .title = "Episodes" };
+var seasons_row: ItemRow(128) = .{ .title = "Seasons" };
+var episodes_row: ItemRow(512) = .{ .title = "Episodes" };
 var episode_selected: usize = 0;
-var season_title: api.Text(96) = .{};
-var season_id: api.Text(40) = .{};
+var season_detail: Card = .{};
+var episode_scroll: f32 = 0;
+var episode_rect: loom.Rect = .{};
+var episode_row_height: f32 = 170;
+var episode_reveal = false;
+var episode_jump = false;
+var select_unfinished_season = false;
+var select_unfinished_episode = false;
 var stream_url: api.Text(256) = .{};
 
 // Text entry, remote and pointer, all as in uidemo.
@@ -435,7 +589,14 @@ fn setError(comptime pattern: []const u8, args: anytype) void {
 // ------------------------------------------------------------- requests
 
 fn request(job: api.Job, tag: u32) ?*api.Task {
-    return fetcher.submit(job, tag);
+    return fetcher.submit(job, if (isAuthJob(job)) auth_generation else tag);
+}
+
+fn isAuthJob(job: api.Job) bool {
+    return switch (job) {
+        .login, .quick_initiate, .quick_poll, .quick_authenticate => true,
+        else => false,
+    };
 }
 
 fn simple(job: api.Job) void {
@@ -478,8 +639,8 @@ fn requestPage(index: u32) void {
 }
 
 fn openDetails(card: Card) void {
+    select_unfinished_season = true;
     detail = card;
-    detail_overview.set("");
     detail_extra.set("");
     stream_url.set("");
     seasons_row.count = 0;
@@ -505,8 +666,11 @@ fn openDetails(card: Card) void {
 }
 
 fn openSeason(card: Card) void {
-    season_title = card.title;
-    season_id = card.id;
+    select_unfinished_episode = true;
+    episode_jump = false;
+    season_detail = card;
+    episode_scroll = 0;
+    episode_reveal = true;
     episodes_row.count = 0;
     episodes_row.loading = true;
     episode_selected = 0;
@@ -522,6 +686,7 @@ fn openSeason(card: Card) void {
 var relogin_attempts: u8 = 0;
 
 fn signedIn(auth: api.Auth, used_password: []const u8) void {
+    auth_generation +%= 1;
     const silent = screen == .home and session.token.len != 0;
     session.token.set(auth.AccessToken);
     session.user_id.set(auth.User.Id);
@@ -538,6 +703,7 @@ fn signedIn(auth: api.Auth, used_password: []const u8) void {
         return;
     }
     screen = .home;
+    home_scroll = 0;
     row_focus = 0;
     col_focus = @splat(0);
     depth = 0;
@@ -563,6 +729,8 @@ fn reauthenticate() bool {
 }
 
 fn signOut() void {
+    series_status = @splat(.{});
+    auth_generation +%= 1;
     api.forget();
     session.token.set("");
     session.user_id.set("");
@@ -579,6 +747,7 @@ fn signOut() void {
 // --------------------------------------------------------- task results
 
 fn consume(task: *api.Task) void {
+    if (isAuthJob(task.job) and task.tag != auth_generation) return;
     if (task.state == .failed) {
         onFailure(task);
         return;
@@ -640,15 +809,35 @@ fn consume(task: *api.Task) void {
             }
         },
         .item => {
-            detail_overview.set(task.one.Overview orelse "");
-            detail_extra.set(build("{s}   {s}   {d}", .{
-                task.one.Type,
-                task.one.OfficialRating orelse "Unrated",
-                task.one.ProductionYear orelse 0,
-            }));
+            if (!std.mem.eql(u8, task.a.get(), detail.id.get())) return;
+            detail = .from(task.one);
+            detail_extra.set(task.one.OfficialRating orelse "");
         },
-        .seasons => seasons_row.fill(task.list.Items),
-        .episodes => episodes_row.fill(task.list.Items),
+        .seasons => if (std.mem.eql(u8, task.a.get(), detail.id.get())) {
+            seasons_row.fill(task.list.Items);
+            if (select_unfinished_season and screen == .details) {
+                focus = firstUnfinished(seasons_row.cards[0..seasons_row.count]);
+                select_unfinished_season = false;
+            }
+            for (&series_status) |*entry| if (std.mem.eql(u8, entry.id.get(), task.a.get())) {
+                entry.count = unfinishedSeasons(task.list.Items);
+            };
+        },
+        .season_status => {
+            const entry = &series_status[task.tag];
+            if (!std.mem.eql(u8, task.a.get(), entry.id.get())) return;
+            entry.count = unfinishedSeasons(task.list.Items);
+            entry.loading = false;
+        },
+        .episodes => if (std.mem.eql(u8, task.b.get(), season_detail.id.get())) {
+            episodes_row.fill(task.list.Items);
+            if (select_unfinished_episode and screen == .season) {
+                episode_selected = firstUnfinished(episodes_row.cards[0..episodes_row.count]);
+                episode_reveal = true;
+                episode_jump = true;
+                select_unfinished_episode = false;
+            }
+        },
         .poster => if (task.image) |art| {
             const slot = &slots[task.tag];
             slot.texture = renderer.createTexture(art.width, art.height, art.rgb);
@@ -666,6 +855,13 @@ fn onFailure(task: *api.Task) void {
         // marks the slot done and leaves the placeholder card showing. The
         // id stays, so the same item is not asked for again every frame.
         .poster => slots[task.tag].loading = false,
+        .season_status => {
+            const entry = &series_status[task.tag];
+            if (std.mem.eql(u8, entry.id.get(), task.a.get())) {
+                entry.loading = false;
+                entry.failed = true;
+            }
+        },
         .discover => {
             discovering = false;
             setError("Discovery failed: {s}", .{task.err.get()});
@@ -784,6 +980,7 @@ fn gridCard(index: usize) ?*const Card {
 }
 
 fn useServer(address: []const u8) void {
+    auth_generation +%= 1;
     server_url.set(address);
     session.url.set(address);
     fetcher.setSession(session);
@@ -800,10 +997,12 @@ fn goBack() void {
     switch (screen) {
         .server => wl.running = false,
         .auth => {
+            auth_generation +%= 1;
             screen = .server;
             focus = 0;
         },
         .quick => {
+            auth_generation +%= 1;
             quick_secret.set("");
             screen = .auth;
             focus = 0;
@@ -878,7 +1077,7 @@ fn activateDetails() void {
     if (focus == 0) {
         setStatus("Stream URL: {s}", .{stream_url.get()});
         std.debug.print("play {s}\n", .{stream_url.get()});
-    } else goBack();
+    }
 }
 
 /// How many focusable things the current screen has, so navigation clamps
@@ -888,14 +1087,14 @@ fn focusCount() usize {
         .server => discovered_count + 3,
         .auth => 4,
         .quick => 1,
-        .details => if (detail.is("Series")) @max(1, seasons_row.count) else 2,
+        .details => if (detail.is("Series")) @max(1, seasons_row.count) else 1,
         else => 1,
     };
 }
 
 fn navigate(code: u32) void {
+    if (wl.isBackKey(code)) return goBack();
     switch (code) {
-        1, 158 => goBack(),
         103 => move(.up),
         108 => move(.down),
         105 => move(.left),
@@ -911,10 +1110,13 @@ fn move(direction: Direction) void {
     switch (screen) {
         .home => moveHome(direction),
         .grid => moveGrid(direction),
-        .season => switch (direction) {
-            .up => episode_selected -|= 1,
-            .down => episode_selected = @min(episode_selected + 1, episodes_row.count -| 1),
-            else => {},
+        .season => {
+            switch (direction) {
+                .up => episode_selected -|= 1,
+                .down => episode_selected = @min(episode_selected + 1, episodes_row.count -| 1),
+                else => {},
+            }
+            episode_reveal = true;
         },
         // Every other screen is a single column of controls, except the
         // details screen's seasons, which read as a row.
@@ -936,6 +1138,7 @@ fn move(direction: Direction) void {
 }
 
 fn moveHome(direction: Direction) void {
+    home_reveal = true;
     switch (direction) {
         .up => row_focus -|= 1,
         .down => row_focus = @min(row_focus + 1, rows.len - 1),
@@ -946,16 +1149,22 @@ fn moveHome(direction: Direction) void {
 }
 
 fn moveGrid(direction: Direction) void {
-    const last = grid_total -| 1;
-    switch (direction) {
-        .left => grid_selected -|= 1,
-        .right => grid_selected = @min(grid_selected + 1, last),
-        .up => grid_selected -|= grid_columns,
-        .down => grid_selected = @min(grid_selected + grid_columns, last),
-    }
+    const next = gridMove(grid_selected, grid_total, grid_columns, direction);
+    if (next == grid_selected) return;
+    grid_selected = next;
     const list = loom.VirtualList.init(grid_rect, gridRows(), grid_row_height, grid_scroll);
     grid_scroll = list.scrollToReveal(grid_selected / grid_columns);
     requestPage(@intCast(grid_selected));
+}
+
+fn gridMove(selected: usize, total: usize, columns: usize, direction: Direction) usize {
+    if (total == 0) return selected;
+    return switch (direction) {
+        .left => selected -| 1,
+        .right => @min(selected + 1, total - 1),
+        .up => if (selected >= columns) selected - columns else selected,
+        .down => if (selected + columns < total) selected + columns else selected,
+    };
 }
 
 fn gridRows() usize {
@@ -1006,6 +1215,7 @@ fn onKey(code: u32, pressed: bool) void {
         return;
     }
     if (!pressed) return;
+    if (wl.isBackKey(code)) return goBack();
     if (code == 88) { // F12
         capture_requested = true;
         return;
@@ -1038,6 +1248,7 @@ fn moveCursor(x: wl.Fixed, y: wl.Fixed) void {
 }
 
 fn onEvent(event: wl.Event) void {
+    defer syncBackHandling();
     switch (event) {
         .key => |e| onKey(e.code, e.pressed),
         .text_commit => |text| appendText(text),
@@ -1059,12 +1270,35 @@ fn onEvent(event: wl.Event) void {
         .pointer_button => |e| if (e.pressed and e.button == 0x110) {
             pointer_press = true;
         },
-        .pointer_axis => |e| if (screen == .grid and e.axis == 0) {
-            grid_scroll += @as(f32, @floatFromInt(wl.toInt(e.value))) * 1.4;
+        .pointer_axis => |e| if (e.axis == 0) {
+            const delta = @as(f32, @floatFromInt(e.value)) / 256 * 5;
+            switch (screen) {
+                .home => {
+                    home_scroll += delta;
+                    home_reveal = false;
+                },
+                .grid => grid_scroll += delta,
+                .season => {
+                    episode_scroll += delta;
+                    episode_reveal = false;
+                },
+                .details => if (detail.is("Series") and delta != 0) {
+                    if (delta > 0) focus = @min(focus + 1, seasons_row.count -| 1) else focus -|= 1;
+                },
+                else => {},
+            }
         },
         .close => wl.running = false,
         else => {},
     }
+}
+
+fn syncBackHandling() void {
+    wl.setBackHandled(handlesBack());
+}
+
+fn handlesBack() bool {
+    return active_field != .none or (screen != .server and screen != .home);
 }
 
 fn hovered(rect: loom.Rect) bool {
@@ -1075,37 +1309,18 @@ fn hovered(rect: loom.Rect) bool {
 
 var renderer: UiRenderer = undefined;
 
-fn drawChrome(ctx: *loom.Context, width: f32, height: f32, scale: f32) void {
+fn drawHeadingAndStatus(ctx: *loom.Context, width: f32, height: f32, scale: f32) void {
     const margin = 64 * scale;
-    ctx.label(.{ .x = margin, .y = 30 * scale, .w = 700 * scale, .h = 52 * scale }, null, "Jellyfin", TEXT, 38 * scale);
-    const where: []const u8 = switch (screen) {
+    const heading: []const u8 = switch (screen) {
         .server => "Choose a server",
         .auth => "Sign in",
         .quick => "Quick Connect",
-        .home => fmt("{s} - {s}", .{ session.user_name.get(), session.url.get() }),
-        .grid => grid_title.get(),
-        .details => detail.title.get(),
-        .season => fmt("{s} - {s}", .{ detail.title.get(), season_title.get() }),
+        else => "",
     };
-    ctx.label(.{ .x = margin + 160 * scale, .y = 40 * scale, .w = width - margin * 2 - 400 * scale, .h = 38 * scale }, null, where, ACCENT, 24 * scale);
-
-    const busy = fetcher.pending();
-    if (busy != 0)
-        ctx.label(.{ .x = width - 260 * scale, .y = 40 * scale, .w = 200 * scale, .h = 32 * scale }, null, fmt("{d} loading", .{busy}), DIM, 20 * scale);
-
-    const hint = if (status.len != 0)
-        status.get()
-    else switch (screen) {
-        .home, .grid => "Arrows move  -  OK selects  -  Back returns  -  F9 signs out",
-        else => "Arrows move  -  OK selects  -  Back returns",
-    };
-    ctx.label(
-        .{ .x = margin, .y = height - 46 * scale, .w = width - margin * 2, .h = 32 * scale },
-        null,
-        hint,
-        if (status.len == 0) DIM else if (status_error) RED else GREEN,
-        19 * scale,
-    );
+    if (heading.len != 0)
+        ctx.label(.{ .x = margin, .y = 40 * scale, .w = width - margin * 2, .h = 50 * scale }, null, heading, TEXT, 32 * scale);
+    if (status.len != 0 and (status_error or screen == .server or screen == .auth or screen == .quick))
+        ctx.label(.{ .x = margin, .y = height - 46 * scale, .w = width - margin * 2, .h = 32 * scale }, null, status.get(), if (status_error) RED else DIM, 19 * scale);
 }
 
 fn drawButton(ctx: *loom.Context, rect: loom.Rect, label: []const u8, index: usize, scale: f32) void {
@@ -1147,15 +1362,19 @@ fn drawField(ctx: *loom.Context, rect: loom.Rect, label: []const u8, which: Edit
 fn ellipsize(text: []const u8, width: f32, size: f32) []const u8 {
     if (renderer.measure(text, size) <= width) return text;
     var take = text.len;
-    while (take > 1 and renderer.measure(text[0..take], size) > width - renderer.measure("...", size))
+    while (take > 1 and renderer.measure(text[0..take], size) > width - renderer.measure("...", size)) {
         take -= 1;
+        while (take > 0 and text[take] & 0xc0 == 0x80) take -= 1;
+    }
     return fmt("{s}...", .{text[0..take]});
 }
 
 fn drawCard(ctx: *loom.Context, rect: loom.Rect, clip: loom.Rect, card: *const Card, focused: bool, scale: f32) bool {
+    const visible = loom.Rect.intersect(rect, clip);
+    if (visible.w <= 0 or visible.h <= 0) return false;
     const hot = hovered(rect) and clip.contains(cursor_x, cursor_y);
     const art = loom.Rect{ .x = rect.x, .y = rect.y, .w = rect.w, .h = rect.h - 78 * scale };
-    if (poster(card.poster_id.get(), card.poster_tag.get())) |slot| {
+    if (cardPoster(card)) |slot| {
         ctx.textured(art, clip, slot.texture, coverUv(slot, art), WHITE, 10 * scale);
     } else {
         ctx.fill(art, clip, if (hot) HOT else CARD, 10 * scale);
@@ -1168,6 +1387,7 @@ fn drawCard(ctx: *loom.Context, rect: loom.Rect, clip: loom.Rect, card: *const C
         );
     }
     if (focused) ctx.stroke(art.inset(-4 * scale), clip, ACCENT, 4 * scale, 12 * scale);
+    drawWatchBadge(ctx, art, clip, card, scale);
 
     if (card.progress > 1) {
         const bar = loom.Rect{ .x = art.x, .y = art.y + art.h - 8 * scale, .w = art.w, .h = 6 * scale };
@@ -1177,6 +1397,41 @@ fn drawCard(ctx: *loom.Context, rect: loom.Rect, clip: loom.Rect, card: *const C
     ctx.label(.{ .x = rect.x, .y = art.y + art.h + 12 * scale, .w = rect.w, .h = 32 * scale }, loom.Rect.intersect(rect, clip), ellipsize(card.title.get(), rect.w, 21 * scale), if (focused) TEXT else DIM, 21 * scale);
     ctx.label(.{ .x = rect.x, .y = art.y + art.h + 44 * scale, .w = rect.w, .h = 28 * scale }, loom.Rect.intersect(rect, clip), ellipsize(card.subtitle.get(), rect.w, 17 * scale), DIM, 17 * scale);
     return hot and pointer_press;
+}
+
+fn drawWatchBadge(ctx: *loom.Context, art: loom.Rect, clip: loom.Rect, card: *const Card, scale: f32) void {
+    const episode = card.is("Episode");
+    if (!episode and !card.is("Season") and !card.is("Series")) return;
+    if (episode and !card.played) return;
+    const count = if (card.is("Series")) remainingSeasons(card) else card.remaining;
+    if (!episode and (count orelse 0) == 0) return;
+    const label = if (episode) @as([]const u8, "✓") else fmt("{d}", .{count.?});
+    const size = 22 * scale;
+    const w = @max(36 * scale, renderer.measure(label, size) + 16 * scale);
+    const badge = loom.Rect{ .x = art.x + art.w - w - 8 * scale, .y = art.y + 8 * scale, .w = w, .h = 36 * scale };
+    ctx.fill(badge, clip, ACCENT, 6 * scale);
+    ctx.label(.{ .x = badge.x + (badge.w - renderer.measure(label, size)) / 2, .y = badge.y + 3 * scale, .w = badge.w, .h = badge.h }, clip, label, WHITE, size);
+}
+
+fn drawMetadata(ctx: *loom.Context, rect: loom.Rect, clip: ?loom.Rect, prefix: []const u8, rating: []const u8, size: f32, color: loom.Color) void {
+    var x = rect.x;
+    if (prefix.len != 0) {
+        ctx.label(rect, clip, prefix, color, size);
+        x += renderer.measure(prefix, size) + size;
+    }
+    if (rating.len != 0) {
+        ctx.label(.{ .x = x, .y = rect.y, .w = size * 1.5, .h = rect.h }, clip, "★", YELLOW, size);
+        x += renderer.measure("★", size) + size * 0.3;
+        ctx.label(.{ .x = x, .y = rect.y, .w = @max(0, rect.x + rect.w - x), .h = rect.h }, clip, rating, TEXT, size);
+    }
+}
+
+fn cardPoster(card: *const Card) ?*const Slot {
+    // Seasons may omit both SeriesId and the inherited image tag. The show
+    // details already carry the fallback and remain loaded on the season page.
+    if (card.is("Season") and card.thumbnail_tag.len == 0)
+        return poster(detail.poster_id.get(), detail.poster_tag.get());
+    return poster(card.poster_id.get(), card.poster_tag.get());
 }
 
 fn drawServer(ctx: *loom.Context, width: f32, scale: f32) void {
@@ -1267,7 +1522,7 @@ fn drawRow(ctx: *loom.Context, row: *const Row, id: usize, top: f32, width: f32,
     const first = if (col_focus[id] >= visible) col_focus[id] - visible + 1 else 0;
     for (first..row.count) |index| {
         const x = strip.x + @as(f32, @floatFromInt(index - first)) * (card_w + gap);
-        if (x > strip.x + strip.w) break;
+        if (x >= width) break;
         const rect = loom.Rect{ .x = x, .y = strip.y, .w = card_w, .h = card_h };
         const focused = row_focus == id and col_focus[id] == index;
         if (drawCard(ctx, rect, clip, &row.cards[index], focused, scale)) {
@@ -1279,16 +1534,16 @@ fn drawRow(ctx: *loom.Context, row: *const Row, id: usize, top: f32, width: f32,
 }
 
 fn drawHome(ctx: *loom.Context, width: f32, height: f32, scale: f32) void {
-    const row_height = 470 * scale;
-    // Rows scroll under the header, so everything here is clipped to the band
-    // between it and the status line.
-    const clip = loom.Rect{ .x = 0, .y = 108 * scale, .w = width, .h = height - 170 * scale };
-    const first = row_focus -| 1;
-    var top = 120 * scale - @as(f32, @floatFromInt(first)) * row_height;
-    for (&rows, 0..) |*row, id| {
-        if (top + row_height > clip.y and top < clip.y + clip.h)
-            drawRow(ctx, row, id, top, width, clip, scale);
-        top += row_height;
+    home_row_height = 470 * scale;
+    home_rect = .{ .x = 0, .y = 64 * scale, .w = width, .h = height - 128 * scale };
+    var list = loom.VirtualList.init(home_rect, rows.len, home_row_height, home_scroll);
+    if (home_reveal) {
+        list = loom.VirtualList.init(home_rect, rows.len, home_row_height, list.scrollToReveal(row_focus));
+        home_reveal = false;
+    }
+    home_scroll = list.scroll;
+    for (0..rows.len) |id| {
+        drawRow(ctx, &rows[id], id, list.itemRect(id).y, width, ctx.viewport, scale);
     }
 }
 
@@ -1301,15 +1556,18 @@ fn drawGrid(ctx: *loom.Context, width: f32, height: f32, scale: f32) void {
     grid_row_height = 404 * scale;
 
     if (grid_total == 0) {
+        ctx.label(.{ .x = margin, .y = 40 * scale, .w = width - margin * 2, .h = 50 * scale }, null, grid_title.get(), TEXT, 32 * scale);
         ctx.label(.{ .x = margin, .y = grid_rect.y + 40 * scale, .w = 800 * scale, .h = 36 * scale }, null, "Loading library...", DIM, 24 * scale);
         return;
     }
 
     var list = loom.VirtualList.init(grid_rect, gridRows(), grid_row_height, grid_scroll);
     grid_scroll = list.scroll;
-    const content = list.viewport;
+    ctx.label(.{ .x = margin, .y = 40 * scale - grid_scroll, .w = width - margin * 2, .h = 50 * scale }, null, grid_title.get(), TEXT, 32 * scale);
+    const content = ctx.viewport;
 
-    for (list.first..list.last) |row_index| {
+    // Selection padding isn't a scissor: include the rows that extend into it.
+    for (list.first -| 1..@min(list.last + 1, gridRows())) |row_index| {
         const row_rect = list.itemRect(row_index);
         for (0..grid_columns) |column| {
             const index = row_index * grid_columns + column;
@@ -1337,79 +1595,104 @@ fn drawGrid(ctx: *loom.Context, width: f32, height: f32, scale: f32) void {
         ctx.fill(track, null, BORDER, track.w / 2);
         ctx.fill(.{ .x = track.x, .y = track.y + (track.h - thumb_h) * (grid_scroll / list.maxScroll()), .w = track.w, .h = thumb_h }, null, ACCENT, track.w / 2);
     }
-    ctx.label(.{ .x = width - 340 * scale, .y = 46 * scale, .w = 260 * scale, .h = 30 * scale }, null, fmt("{d} of {d}", .{ grid_selected + 1, grid_total }), DIM, 19 * scale);
 }
 
-fn drawDetails(ctx: *loom.Context, width: f32, height: f32, scale: f32) void {
+fn drawDetails(ctx: *loom.Context, width: f32, scale: f32) void {
     const margin = 64 * scale;
-    const art = loom.Rect{ .x = margin, .y = 130 * scale, .w = 340 * scale, .h = 510 * scale };
+    const art = loom.Rect{ .x = margin, .y = margin, .w = 320 * scale, .h = 480 * scale };
     if (poster(detail.poster_id.get(), detail.poster_tag.get())) |slot|
         ctx.textured(art, null, slot.texture, coverUv(slot, art), WHITE, 16 * scale)
     else {
         ctx.fill(art, null, CARD, 16 * scale);
         ctx.label(.{ .x = art.x + 20 * scale, .y = art.y + art.h / 2, .w = art.w - 40 * scale, .h = 32 * scale }, art, "No artwork", DIM, 20 * scale);
     }
+    drawWatchBadge(ctx, art, ctx.viewport, &detail, scale);
 
     const x = art.x + art.w + 60 * scale;
     const w = width - x - margin;
-    ctx.label(.{ .x = x, .y = 140 * scale, .w = w, .h = 62 * scale }, null, detail.title.get(), TEXT, 44 * scale);
-    ctx.label(.{ .x = x, .y = 210 * scale, .w = w, .h = 34 * scale }, null, detail.subtitle.get(), GREEN, 22 * scale);
-    ctx.label(.{ .x = x, .y = 250 * scale, .w = w, .h = 34 * scale }, null, detail_extra.get(), DIM, 20 * scale);
-    drawWrapped(ctx, .{ .x = x, .y = 310 * scale, .w = w, .h = 200 * scale }, detail_overview.get(), 22 * scale);
+    ctx.label(.{ .x = x, .y = margin, .w = w, .h = 72 * scale }, null, ellipsize(detail.title.get(), w, 52 * scale), TEXT, 52 * scale);
+    ctx.label(.{ .x = x, .y = 150 * scale, .w = w, .h = 34 * scale }, null, detail.subtitle.get(), TEXT, 24 * scale);
+    drawMetadata(ctx, .{ .x = x, .y = 195 * scale, .w = w, .h = 34 * scale }, null, detail_extra.get(), detail.rating.get(), 20 * scale, DIM);
+    drawWrapped(ctx, .{ .x = x, .y = 255 * scale, .w = w, .h = 180 * scale }, detail.overview.get(), 22 * scale);
 
     if (detail.is("Series")) {
         if (seasons_row.count == 0) {
-            ctx.label(.{ .x = x, .y = 560 * scale, .w = w, .h = 34 * scale }, null, if (seasons_row.loading) "Loading seasons..." else "No seasons", DIM, 22 * scale);
+            ctx.label(.{ .x = x, .y = 480 * scale, .w = w, .h = 34 * scale }, null, if (seasons_row.loading) "Loading seasons..." else "No seasons", DIM, 22 * scale);
             return;
         }
-        ctx.label(.{ .x = x, .y = 545 * scale, .w = w, .h = 34 * scale }, null, "Seasons", DIM, 22 * scale);
-        for (0..seasons_row.count) |index| {
-            const rect = loom.Rect{ .x = x + @as(f32, @floatFromInt(index)) * 220 * scale, .y = 595 * scale, .w = 200 * scale, .h = 80 * scale };
-            if (rect.x + rect.w > width - margin) break;
-            const hot = hovered(rect);
-            ctx.fill(rect, null, if (hot) HOT else CARD, 12 * scale);
-            ctx.stroke(rect, null, if (focus == index) ACCENT else BORDER, if (focus == index) 4 * scale else 2 * scale, 12 * scale);
-            ctx.label(.{ .x = rect.x + 18 * scale, .y = rect.y + 14 * scale, .w = rect.w - 36 * scale, .h = 34 * scale }, rect, seasons_row.cards[index].title.get(), TEXT, 22 * scale);
-            ctx.label(.{ .x = rect.x + 18 * scale, .y = rect.y + 46 * scale, .w = rect.w - 36 * scale, .h = 28 * scale }, rect, seasons_row.cards[index].subtitle.get(), DIM, 17 * scale);
-            if (hot and pointer_press) {
+        ctx.label(.{ .x = x, .y = 470 * scale, .w = w, .h = 34 * scale }, null, "Seasons", TEXT, 26 * scale);
+        const clip = ctx.viewport;
+        const visible: usize = @max(1, @as(usize, @intFromFloat((w + 26 * scale) / (226 * scale))));
+        const first = (focus + 1) -| visible;
+        for (first..seasons_row.count) |index| {
+            const rect = loom.Rect{ .x = x + @as(f32, @floatFromInt(index - first)) * 226 * scale, .y = 524 * scale, .w = 200 * scale, .h = 378 * scale };
+            if (rect.x >= width) break;
+            if (drawCard(ctx, rect, clip, &seasons_row.cards[index], focus == index, scale)) {
                 focus = index;
                 activate();
+                break;
             }
         }
         return;
     }
 
     drawButton(ctx, .{ .x = x, .y = 570 * scale, .w = 250 * scale, .h = 74 * scale }, "Play", 0, scale);
-    drawButton(ctx, .{ .x = x + 280 * scale, .y = 570 * scale, .w = 250 * scale, .h = 74 * scale }, "Back", 1, scale);
-    ctx.label(.{ .x = x, .y = height - 110 * scale, .w = w, .h = 30 * scale }, null, stream_url.get(), DIM, 17 * scale);
 }
 
 fn drawSeason(ctx: *loom.Context, width: f32, height: f32, scale: f32) void {
     const margin = 64 * scale;
-    const list_rect = loom.Rect{ .x = margin, .y = 120 * scale, .w = width - margin * 2, .h = height - 200 * scale };
-    ctx.fill(list_rect, null, PANEL, 16 * scale);
-    ctx.stroke(list_rect, null, BORDER, 2 * scale, 16 * scale);
+    const art = loom.Rect{ .x = margin, .y = margin, .w = 320 * scale, .h = 480 * scale };
+    if (cardPoster(&season_detail)) |slot|
+        ctx.textured(art, null, slot.texture, coverUv(slot, art), WHITE, 12 * scale)
+    else
+        ctx.fill(art, null, CARD, 12 * scale);
+    drawWatchBadge(ctx, art, ctx.viewport, &season_detail, scale);
+    const x = art.x + art.w + 60 * scale;
+    const w = width - x - margin;
+    ctx.label(.{ .x = x, .y = margin, .w = w, .h = 72 * scale }, null, ellipsize(detail.title.get(), w, 52 * scale), TEXT, 52 * scale);
+    ctx.label(.{ .x = x, .y = 152 * scale, .w = w, .h = 48 * scale }, null, season_detail.title.get(), TEXT, 32 * scale);
+    const overview = if (season_detail.overview.len != 0) season_detail.overview.get() else detail.overview.get();
+    drawWrapped(ctx, .{ .x = x, .y = 220 * scale, .w = w, .h = 145 * scale }, overview, 22 * scale);
+    episode_rect = .{ .x = x, .y = 400 * scale, .w = w, .h = height - 464 * scale };
+    episode_row_height = 170 * scale;
     if (episodes_row.count == 0) {
-        ctx.label(.{ .x = margin + 30 * scale, .y = list_rect.y + 40 * scale, .w = 700 * scale, .h = 34 * scale }, list_rect, if (episodes_row.loading) "Loading episodes..." else "No episodes", DIM, 23 * scale);
+        ctx.label(.{ .x = x, .y = episode_rect.y + 20 * scale, .w = w, .h = 34 * scale }, episode_rect, if (episodes_row.loading) "Loading episodes..." else "No episodes", DIM, 23 * scale);
         return;
     }
 
-    const height_per = 118 * scale;
-    var list = loom.VirtualList.init(list_rect.inset(10 * scale), episodes_row.count, height_per, @as(f32, @floatFromInt(episode_selected)) * height_per - list_rect.h / 2);
-    const content = list.viewport;
+    if (episode_jump) {
+        episode_scroll = @as(f32, @floatFromInt(episode_selected)) * episode_row_height;
+        episode_jump = false;
+    }
+    var list = loom.VirtualList.init(episode_rect, episodes_row.count, episode_row_height, episode_scroll);
+    if (episode_reveal) {
+        list = loom.VirtualList.init(episode_rect, episodes_row.count, episode_row_height, list.scrollToReveal(episode_selected));
+        episode_reveal = false;
+    }
+    episode_scroll = list.scroll;
+    // Keep episodes below their heading, but let them reach the screen bottom.
+    const content = loom.Rect{ .x = x, .y = episode_rect.y, .w = width - x, .h = height - episode_rect.y };
     for (list.first..list.last) |index| {
         const raw = list.itemRect(index);
         const row = loom.Rect{ .x = raw.x + 10 * scale, .y = raw.y + 6 * scale, .w = raw.w - 20 * scale, .h = raw.h - 12 * scale };
-        const hot = hovered(row);
+        const hot = hovered(row) and content.contains(cursor_x, cursor_y);
         const focused = index == episode_selected;
         const card = &episodes_row.cards[index];
-        ctx.fill(row, content, if (focused) SELECTED else if (hot) HOT else CARD, 11 * scale);
+        if (focused or hot) ctx.fill(row, content, if (focused) .{ 20, 42, 60, 210 } else .{ 30, 40, 55, 180 }, 11 * scale);
         if (focused) ctx.stroke(row, content, ACCENT, 4 * scale, 11 * scale);
         const clip = loom.Rect.intersect(row, content);
-        ctx.label(.{ .x = row.x + 26 * scale, .y = row.y + 22 * scale, .w = row.w - 52 * scale, .h = 36 * scale }, clip, card.subtitle.get(), TEXT, 25 * scale);
-        ctx.label(.{ .x = row.x + 26 * scale, .y = row.y + 64 * scale, .w = row.w - 52 * scale, .h = 30 * scale }, clip, card.runtime.get(), DIM, 18 * scale);
+        const thumb = loom.Rect{ .x = row.x + 12 * scale, .y = row.y + 12 * scale, .w = 232 * scale, .h = 130.5 * scale };
+        if (artwork(card.id.get(), card.thumbnail_tag.get(), .primary, 384, 216)) |slot|
+            ctx.textured(thumb, clip, slot.texture, coverUv(slot, thumb), WHITE, 7 * scale)
+        else
+            ctx.fill(thumb, clip, CARD, 7 * scale);
+        drawWatchBadge(ctx, thumb, clip, card, scale);
+        const text_x = thumb.x + thumb.w + 28 * scale;
+        const text_w = row.x + row.w - text_x - 24 * scale;
+        ctx.label(.{ .x = text_x, .y = row.y + 34 * scale, .w = text_w, .h = 44 * scale }, clip, ellipsize(card.episode_title.get(), text_w, 28 * scale), TEXT, 28 * scale);
+        drawMetadata(ctx, .{ .x = text_x, .y = row.y + 90 * scale, .w = text_w, .h = 32 * scale }, clip, card.runtime.get(), card.rating.get(), 21 * scale, TEXT);
         if (card.progress > 1) {
-            const bar = loom.Rect{ .x = row.x + 26 * scale, .y = row.y + row.h - 14 * scale, .w = row.w - 52 * scale, .h = 5 * scale };
+            const bar = loom.Rect{ .x = thumb.x, .y = thumb.y + thumb.h - 5 * scale, .w = thumb.w, .h = 5 * scale };
             ctx.fill(.{ .x = bar.x, .y = bar.y, .w = bar.w * @min(card.progress, 100) / 100, .h = bar.h }, clip, ACCENT, 2 * scale);
         }
         if (hot and pointer_press) {
@@ -1425,36 +1708,51 @@ fn drawSeason(ctx: *loom.Context, width: f32, height: f32, scale: f32) void {
 fn drawWrapped(ctx: *loom.Context, rect: loom.Rect, text: []const u8, size: f32) void {
     var y = rect.y;
     var rest = text;
-    while (rest.len != 0 and y < rect.y + rect.h) {
-        var take = rest.len;
+    while (rest.len != 0 and y + size * 1.4 <= rect.y + rect.h) {
+        const newline = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+        if (newline == 0) {
+            rest = rest[1..];
+            y += size * 1.45;
+            continue;
+        }
+        var take = newline;
         while (take > 0 and renderer.measure(rest[0..take], size) > rect.w) {
             take = std.mem.lastIndexOfScalar(u8, rest[0..take], ' ') orelse break;
         }
         if (take == 0) break;
-        ctx.label(.{ .x = rect.x, .y = y, .w = rect.w, .h = size * 1.4 }, null, rest[0..take], TEXT, size);
-        rest = std.mem.trimStart(u8, rest[take..], " ");
+        ctx.label(.{ .x = rect.x, .y = y, .w = rect.w, .h = size * 1.4 }, rect, rest[0..take], TEXT, size);
+        rest = if (take == newline and newline < rest.len) rest[take + 1 ..] else std.mem.trimStart(u8, rest[take..], " \t\r");
         y += size * 1.45;
     }
 }
 
 fn buildUi(ctx: *loom.Context) void {
+    defer syncBackHandling();
     const width: f32 = @floatFromInt(gl.width);
     const height: f32 = @floatFromInt(gl.height);
     const scale = @min(width / 1920.0, height / 1080.0);
     scratch_used = 0;
     poster_requests = 0;
+    status_requests = 0;
     frame_index += 1;
 
     ctx.begin(width, height);
     ctx.fill(.{ .w = width, .h = height }, null, BG, 0);
-    drawChrome(ctx, width, height, scale);
+    if (screen == .details or screen == .season) {
+        const background = loom.Rect{ .w = width, .h = height };
+        if (artwork(detail.backdrop_id.get(), detail.backdrop_tag.get(), .backdrop, 1920, 1080)) |slot| {
+            ctx.textured(background, null, slot.texture, coverUv(slot, background), WHITE, 0);
+            ctx.fill(background, null, .{ 5, 9, 16, 185 }, 0);
+        }
+    }
+    drawHeadingAndStatus(ctx, width, height, scale);
     switch (screen) {
         .server => drawServer(ctx, width, scale),
         .auth => drawAuth(ctx, width, scale),
         .quick => drawQuick(ctx, width, scale),
         .home => drawHome(ctx, width, height, scale),
         .grid => drawGrid(ctx, width, height, scale),
-        .details => drawDetails(ctx, width, height, scale),
+        .details => drawDetails(ctx, width, scale),
         .season => drawSeason(ctx, width, height, scale),
     }
     renderer.draw(ctx.commands.items, width, height);
@@ -1548,12 +1846,17 @@ fn stepScript() bool {
         'l' => 105,
         'r' => 106,
         'o' => 28,
-        'b' => 1,
+        'b' => if (wl.on_webos) 412 else 158,
         else => 0,
     };
     script_at += 1;
     script_wait = script_beat;
     if (key != 0) onKey(key, true);
+    switch (script[script_at - 1]) {
+        '[' => onEvent(.{ .pointer_axis = .{ .seat = 0, .axis = 0, .value = -180 * 256 } }),
+        ']' => onEvent(.{ .pointer_axis = .{ .seat = 0, .axis = 0, .value = 180 * 256 } }),
+        else => {},
+    }
     std.debug.print("script: '{c}' -> {s} focus={d} row={d} servers={d} depth={d}\n", .{ script[script_at - 1], @tagName(screen), focus, row_focus, discovered_count, depth });
     return false;
 }
@@ -1628,4 +1931,194 @@ pub fn main(init: std.process.Init) !void {
         }
         gl.swap();
     }
+}
+
+test "Back belongs to the OS only on unedited root screens" {
+    defer {
+        screen = .server;
+        active_field = .none;
+        wl.on_webos = false;
+        wl.running = true;
+        depth = 0;
+    }
+    active_field = .none;
+    inline for (std.meta.tags(Screen)) |current| {
+        screen = current;
+        try std.testing.expectEqual(current != .server and current != .home, handlesBack());
+    }
+    screen = .server;
+    active_field = .url;
+    try std.testing.expect(handlesBack());
+    active_field = .none;
+    wl.on_webos = true;
+    screen = .quick;
+    onKey(412, true);
+    try std.testing.expectEqual(Screen.auth, screen);
+    try std.testing.expect(handlesBack());
+    onKey(412, false);
+    try std.testing.expectEqual(Screen.auth, screen);
+    onKey(412, true);
+    try std.testing.expectEqual(Screen.server, screen);
+    try std.testing.expect(!handlesBack());
+    screen = .home;
+    push();
+    screen = .grid;
+    onKey(412, true);
+    try std.testing.expectEqual(Screen.home, screen);
+    try std.testing.expect(!handlesBack());
+    try std.testing.expect(wl.running);
+    wl.on_webos = false;
+    try std.testing.expect(!wl.isBackKey(412));
+    try std.testing.expect(wl.isBackKey(158));
+    try std.testing.expect(wl.isBackKey(1));
+}
+
+test "Back cancels late Quick Connect and sign-in replies" {
+    defer {
+        screen = .server;
+        auth_generation = 0;
+    }
+    var task: api.Task = .{ .arena = .init(std.testing.allocator), .job = .quick_initiate, .tag = auth_generation, .state = .ready };
+    defer task.arena.deinit();
+    screen = .auth;
+    goBack();
+    consume(&task);
+    try std.testing.expectEqual(Screen.server, screen);
+    task.job = .login;
+    consume(&task);
+    try std.testing.expectEqual(Screen.server, screen);
+}
+
+test "season artwork stays distinct from series and episode artwork" {
+    const season = Card.from(.{
+        .Id = "season",
+        .Name = "Season 2",
+        .Type = "Season",
+        .SeriesId = "show",
+        .ImageTags = .{ .Primary = "season-art" },
+        .SeriesPrimaryImageTag = "series-art",
+        .Overview = "Season description",
+    });
+    try std.testing.expectEqualStrings("season", season.poster_id.get());
+    try std.testing.expectEqualStrings("season-art", season.poster_tag.get());
+    try std.testing.expectEqualStrings("Season description", season.overview.get());
+    const episode = Card.from(.{
+        .Id = "episode",
+        .Name = "The Return",
+        .Type = "Episode",
+        .SeriesId = "show",
+        .SeriesName = "A show",
+        .ImageTags = .{ .Primary = "still" },
+        .SeriesPrimaryImageTag = "series-art",
+        .IndexNumber = 3,
+        .RunTimeTicks = 23 * 60 * 10_000_000,
+        .CommunityRating = 8.2,
+    });
+    try std.testing.expectEqualStrings("show", episode.poster_id.get());
+    try std.testing.expectEqualStrings("still", episode.thumbnail_tag.get());
+    try std.testing.expectEqualStrings("3. The Return", episode.episode_title.get());
+    try std.testing.expectEqualStrings("23 min", episode.runtime.get());
+    try std.testing.expectEqualStrings("8.2", episode.rating.get());
+    const long = Card.from(.{ .RunTimeTicks = 85 * 60 * 10_000_000 });
+    try std.testing.expectEqualStrings("1 hr 25 min", long.runtime.get());
+    try std.testing.expectEqualStrings("", long.rating.get());
+}
+
+test "home wheel scrolling survives frames and Back; remote reveals selected row" {
+    defer {
+        screen = .server;
+        home_scroll = 0;
+        row_focus = 0;
+        home_reveal = false;
+        depth = 0;
+    }
+    screen = .home;
+    home_scroll = 0;
+    onEvent(.{ .pointer_axis = .{ .seat = 0, .axis = 0, .value = 100 * 256 } });
+    try std.testing.expectApproxEqAbs(@as(f32, 500), home_scroll, 0.01);
+    try std.testing.expect(!home_reveal);
+    push();
+    screen = .grid;
+    goBack();
+    try std.testing.expectApproxEqAbs(@as(f32, 500), home_scroll, 0.01);
+    moveHome(.down);
+    moveHome(.down);
+    try std.testing.expect(home_reveal);
+    const list = loom.VirtualList.init(.{ .w = 1920, .h = 952 }, rows.len, 470, home_scroll);
+    const revealed = loom.VirtualList.init(list.viewport, rows.len, 470, list.scrollToReveal(row_focus));
+    const selected = revealed.itemRect(row_focus);
+    try std.testing.expect(selected.y >= revealed.viewport.y);
+    try std.testing.expect(selected.y + selected.h <= revealed.viewport.y + revealed.viewport.h);
+}
+
+test "grid navigation preserves the column at top, bottom and an incomplete row" {
+    try std.testing.expectEqual(@as(usize, 4), gridMove(4, 16, 6, .up));
+    try std.testing.expectEqual(@as(usize, 14), gridMove(14, 16, 6, .down));
+    try std.testing.expectEqual(@as(usize, 10), gridMove(10, 16, 6, .down));
+    try std.testing.expectEqual(@as(usize, 13), gridMove(7, 16, 6, .down));
+    try std.testing.expectEqual(@as(usize, 7), gridMove(13, 16, 6, .up));
+}
+
+test "series metadata uses real year spans and seasons fall back to series posters" {
+    try std.testing.expectEqualStrings("1992-1997", subtitleFor(.{
+        .Type = "Series",
+        .ProductionYear = 1992,
+        .EndDate = "1997-02-08T00:00:00Z",
+        .ChildCount = 5,
+    }));
+    try std.testing.expectEqualStrings("2024-Present", subtitleFor(.{
+        .Type = "Series",
+        .PremiereDate = "2024-01-01T00:00:00Z",
+        .Status = "Continuing",
+    }));
+    try std.testing.expectEqualStrings("2020", subtitleFor(.{
+        .Type = "Series",
+        .ProductionYear = 2020,
+        .EndDate = "2020-12-01T00:00:00Z",
+    }));
+    try std.testing.expectEqualStrings("", subtitleFor(.{ .Type = "Series" }));
+    const season = Card.from(.{ .Type = "Season", .Id = "season", .SeriesId = "show", .SeriesPrimaryImageTag = "show-art" });
+    try std.testing.expectEqualStrings("show", season.poster_id.get());
+    try std.testing.expectEqualStrings("show-art", season.poster_tag.get());
+}
+
+test "missing movie years and HTML line breaks are cleaned up" {
+    try std.testing.expectEqualStrings("1h 30m", subtitleFor(.{ .Type = "Movie", .RunTimeTicks = 90 * 60 * 10_000_000 }));
+    try std.testing.expectEqualStrings("1h 30m", subtitleFor(.{ .Type = "Movie", .ProductionYear = 0, .RunTimeTicks = 90 * 60 * 10_000_000 }));
+    const card = Card.from(.{ .Overview = "First<br>Second<BR />Third<br/>\nFourth" });
+    try std.testing.expectEqualStrings("First\nSecond\nThird\n\nFourth", card.overview.get());
+}
+
+test "watch state chooses the first unfinished item and counts unfinished seasons" {
+    const items = [_]api.Item{
+        .{ .Type = "Season", .ChildCount = 12, .UserData = .{ .Played = true, .UnplayedItemCount = 0 } },
+        .{ .Type = "Season", .ChildCount = 12, .UserData = .{ .UnplayedItemCount = 4 } },
+        .{ .Type = "Season", .ChildCount = 12, .UserData = .{ .UnplayedItemCount = 12 } },
+    };
+    const cards = [_]Card{ .from(items[0]), .from(items[1]), .from(items[2]) };
+    try std.testing.expectEqual(@as(u32, 2), unfinishedSeasons(&items));
+    try std.testing.expectEqual(@as(usize, 1), firstUnfinished(&cards));
+    try std.testing.expectEqual(@as(?u32, 4), cards[1].remaining);
+    const episodes = [_]Card{
+        .from(.{ .Type = "Episode", .UserData = .{ .Played = true } }),
+        .from(.{ .Type = "Episode", .UserData = .{ .PlaybackPositionTicks = 500 } }),
+    };
+    try std.testing.expectEqual(@as(usize, 1), firstUnfinished(&episodes));
+    try std.testing.expectEqual(@as(usize, 0), firstUnfinished(&.{ episodes[0], episodes[0] }));
+    try std.testing.expectEqual(@as(usize, 0), firstUnfinished(&.{}));
+}
+
+test "zero counts and unwatched episodes emit no badge" {
+    var ctx = loom.Context.init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.begin(1920, 1080);
+    const art = loom.Rect{ .w = 200, .h = 300 };
+    const cards = [_]Card{
+        .from(.{ .Type = "Episode", .UserData = .{ .Played = false } }),
+        .from(.{ .Type = "Season", .ChildCount = 12, .UserData = .{ .UnplayedItemCount = 0 } }),
+        .from(.{ .Type = "Season" }), // No known count yet.
+        .from(.{ .Type = "Series", .UserData = .{ .Played = true } }),
+    };
+    for (&cards) |*card| drawWatchBadge(&ctx, art, art, card, 1);
+    try std.testing.expectEqual(@as(usize, 0), ctx.commands.items.len);
 }

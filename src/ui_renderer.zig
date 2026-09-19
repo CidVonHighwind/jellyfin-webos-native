@@ -147,7 +147,8 @@ fn loadGl() void {
         .{ "glBindBuffer", &glBindBuffer },                   .{ "glBufferData", &glBufferData },                   .{ "glBufferSubData", &glBufferSubData },             .{ "glBindBufferBase", &glBindBufferBase },
         .{ "glGenVertexArrays", &glGenVertexArrays },         .{ "glBindVertexArray", &glBindVertexArray },         .{ "glVertexAttribPointer", &glVertexAttribPointer }, .{ "glEnableVertexAttribArray", &glEnableVertexAttribArray },
         .{ "glVertexAttribDivisor", &glVertexAttribDivisor }, .{ "glDrawArraysInstanced", &glDrawArraysInstanced }, .{ "glGenTextures", &glGenTextures },                 .{ "glBindTexture", &glBindTexture },
-        .{ "glActiveTexture", &glActiveTexture },             .{ "glTexStorage2D", &glTexStorage2D },               .{ "glTexSubImage2D", &glTexSubImage2D },             .{ "glTexParameteri", &glTexParameteri },        .{ "glDeleteTextures", &glDeleteTextures },
+        .{ "glActiveTexture", &glActiveTexture },             .{ "glTexStorage2D", &glTexStorage2D },               .{ "glTexSubImage2D", &glTexSubImage2D },             .{ "glTexParameteri", &glTexParameteri },
+        .{ "glDeleteTextures", &glDeleteTextures },
     }) |entry| entry[1].* = gl.proc(@TypeOf(entry[1].*), entry[0]);
 }
 
@@ -191,6 +192,7 @@ pub const Renderer = struct {
     instance_buffer: u32,
     uniform_buffer: u32,
     texture: u32,
+    atlas_texture_size: u16,
     media_texture: u32,
 
     /// Open batch: the state it needs, and where its instances start.
@@ -214,6 +216,10 @@ pub const Renderer = struct {
         loadGl();
         var atlas = try glyphs.Atlas.init(allocator, io);
         errdefer atlas.deinit();
+        const getInteger = gl.proc(*const fn (u32, *i32) callconv(.c) void, "glGetIntegerv");
+        var max_texture_size: i32 = 0;
+        getInteger(0x0D33, &max_texture_size); // GL_MAX_TEXTURE_SIZE
+        atlas.max_size = @intCast(@min(max_texture_size, 16384));
 
         var vao: u32 = 0;
         glGenVertexArrays(1, @ptrCast(&vao));
@@ -251,6 +257,7 @@ pub const Renderer = struct {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        atlas.packer.dirty = false;
 
         // Same unit as the glyph atlas: only one texture is bound at a time.
         const media_texture = if (media) |m| makeTexture(m.width, m.height, m.pixels) else texture;
@@ -270,6 +277,7 @@ pub const Renderer = struct {
             .instance_buffer = buffers[1],
             .uniform_buffer = buffers[2],
             .texture = texture,
+            .atlas_texture_size = atlas.size(),
             .media_texture = media_texture,
         };
     }
@@ -301,11 +309,14 @@ pub const Renderer = struct {
         self.state = null;
     }
 
-    pub fn measure(self: *const Renderer, text: []const u8, size: f32) f32 {
+    pub fn measure(self: *Renderer, text: []const u8, size: f32) f32 {
         return self.atlas.measure(text, size);
     }
 
     pub fn draw(self: *Renderer, commands: []const loom.Command, width: f32, height: f32) void {
+        // Finish all atlas growth before emitting UVs or submitting any batch.
+        for (commands) |command| if (command.data == .text) self.atlas.prepare(command.data.text.contents);
+        self.syncAtlas();
         self.instances.clearRetainingCapacity();
         self.state = null;
         self.batch_start = 0;
@@ -339,6 +350,28 @@ pub const Renderer = struct {
             },
         };
         self.flush();
+    }
+
+    fn syncAtlas(self: *Renderer) void {
+        if (!self.atlas.packer.dirty) return;
+        glActiveTexture(ATLAS_UNIT);
+        if (self.atlas_texture_size != self.atlas.size()) {
+            const previous = self.texture;
+            glGenTextures(1, @ptrCast(&self.texture));
+            glBindTexture(GL_TEXTURE_2D, self.texture);
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, self.atlas.size(), self.atlas.size());
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            if (self.media_texture == previous) self.media_texture = self.texture;
+            glDeleteTextures(1, @ptrCast(&previous));
+            self.atlas_texture_size = self.atlas.size();
+        } else glBindTexture(GL_TEXTURE_2D, self.texture);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, self.atlas.size(), self.atlas.size(), GL_RED, GL_UNSIGNED_BYTE, self.atlas.pixels().ptr);
+        self.atlas.packer.dirty = false;
+        self.state = null;
     }
 
     /// Declare what the next instances need. `texture` of null means "whatever
@@ -379,8 +412,8 @@ pub const Renderer = struct {
         const scale = text.size / glyphs.base_px;
         var pen_x = rect.x;
         const baseline = rect.y + text.size;
-        for (text.contents) |byte| {
-            const ch: u8 = if (byte >= 32 and byte < 127) byte else '?';
+        var codepoints: glyphs.Codepoints = .{ .text = text.contents };
+        while (codepoints.next()) |ch| {
             if (self.atlas.glyph(ch)) |g| {
                 if (g.region.w != 0 and g.region.h != 0) {
                     const placed = glyphs.quad(&self.atlas, g, pen_x, baseline, text.size);

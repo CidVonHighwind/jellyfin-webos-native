@@ -68,6 +68,7 @@ const key_names = [_]struct { u32, []const u8 }{
 };
 
 fn keyName(code: u32) []const u8 {
+    if (wl.on_webos and code == 412) return "BACK";
     for (key_names) |e| if (e[0] == code) return e[1];
     return "?";
 }
@@ -90,7 +91,7 @@ fn onEvent(ev: wl.Event) void {
             push("seat{d} key    code={d:<5} 0x{x:<3} {s:<12} {s}", .{
                 k.seat, k.code, k.code, keyName(k.code), if (k.pressed) "DOWN" else "up",
             });
-            if (k.pressed and (k.code == 1 or k.code == 158)) wl.running = false;
+            if (k.pressed and wl.isBackKey(k.code)) wl.running = false;
         },
         .modifiers => |m| {
             // The TV sends a modifiers event on all three seats for every key,

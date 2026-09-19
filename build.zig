@@ -147,6 +147,19 @@ pub fn build(b: *std.Build) void {
     const run_host = b.addRunArtifact(host_exe);
     b.step("run-host", "Build -Dapp for this PC and run it locally").dependOn(&run_host.step);
 
+    const ui_tests = b.addTest(.{
+        .use_llvm = true,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/jellyfin.zig"),
+            .target = b.resolveTargetQuery(.{}),
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    for (apps) |app| if (std.mem.eql(u8, app.name, "jellyfin")) addAssets(b, ui_tests, app);
+    addUiDeps(b, ui_tests.root_module, b.resolveTargetQuery(.{}), optimize);
+    b.step("test", "Run Jellyfin navigation, artwork and shared geometry tests on the host").dependOn(&b.addRunArtifact(ui_tests).step);
+
     // ---- package: a real .ipk ----
     const pkg = sh(b, ipk_script, &.{selected});
     pkg.addFileArg(chosen.getEmittedBin());

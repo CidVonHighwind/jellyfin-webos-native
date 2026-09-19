@@ -26,6 +26,11 @@
 //! raw elementary stream carries no container to read them from. `NDL_GEOM`
 //! (e.g. `3840x2160p120`) and `NDL_CODEC` (`h264`/`h265`) override it, which is
 //! what a TCP source needs.
+//!
+//! `NDL_OVERLAY=0` hides the control-overlay test. By default `ndlplay` draws
+//! a translucent bottom strip over the video, including a moving progress bar
+//! and settings button. This proves that ordinary ARGB Wayland pixels compose
+//! above an NDL video window, which is the composition model Jellyfin needs.
 const std = @import("std");
 const linux = std.os.linux;
 const c = std.c;
@@ -175,6 +180,63 @@ fn nowNs() u64 {
 fn sleepMs(ms: u32) void {
     const ts = linux.timespec{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * std.time.ns_per_ms) };
     _ = linux.nanosleep(&ts, null);
+}
+
+// ------------------------------------------------------------- video overlay
+
+// The surface exported to NDL remains fullscreen. Pixels with alpha zero punch
+// through to the video plane; these premultiplied ARGB pixels are composited
+// above it. Keep this deliberately primitive: it tests the layer boundary
+// without involving the Jellyfin renderer or its GL dependencies.
+const OVERLAY_BG = 0xB20C1018; // alpha 0xb2, RGB premultiplied by it
+const OVERLAY_TRACK = 0x94454C57;
+const OVERLAY_PROGRESS = 0xFF38C9A1;
+const OVERLAY_BUTTON = 0xD1283444;
+const OVERLAY_GLYPH = 0xFFF2F5F7;
+
+fn fillRect(x: i32, y: i32, w: i32, h: i32, color: u32) void {
+    const x0: u32 = @intCast(@max(0, x));
+    const y0: u32 = @intCast(@max(0, y));
+    const x1: u32 = @intCast(@min(@as(i32, @intCast(wl.width)), x + w));
+    const y1: u32 = @intCast(@min(@as(i32, @intCast(wl.height)), y + h));
+    if (x0 >= x1 or y0 >= y1) return;
+    for (y0..y1) |row| @memset(wl.pixels[row * wl.width + x0 ..][0 .. x1 - x0], color);
+}
+
+/// Draw a simple control strip. `progress` loops from 0 through 1000 because
+/// an elementary stream has no duration; it is only a composition test.
+fn drawOverlay(progress: u32) void {
+    @memset(wl.pixels, 0x00000000);
+
+    const width: i32 = @intCast(wl.width);
+    const height: i32 = @intCast(wl.height);
+    const unit = @max(@as(i32, 1), @divTrunc(width, 1920));
+    const panel_h = 150 * unit;
+    const margin = 64 * unit;
+    const panel_y = height - panel_h;
+    fillRect(0, panel_y, width, panel_h, OVERLAY_BG);
+
+    const button = 64 * unit;
+    const track_x = margin + button + 28 * unit;
+    const track_w = width - track_x - margin - button - 28 * unit;
+    const track_y = panel_y + 47 * unit;
+    fillRect(track_x, track_y, track_w, 10 * unit, OVERLAY_TRACK);
+    fillRect(track_x, track_y, @intCast(@divTrunc(@as(i64, track_w) * progress, 1000)), 10 * unit, OVERLAY_PROGRESS);
+
+    // Pause glyph: two bars make the visible test independent of a font.
+    fillRect(margin, panel_y + 30 * unit, 16 * unit, 48 * unit, OVERLAY_GLYPH);
+    fillRect(margin + 30 * unit, panel_y + 30 * unit, 16 * unit, 48 * unit, OVERLAY_GLYPH);
+
+    const settings_x = width - margin - button;
+    fillRect(settings_x, panel_y + 20 * unit, button, button, OVERLAY_BUTTON);
+    // A compact cog-like glyph for the settings control.
+    fillRect(settings_x + 18 * unit, panel_y + 48 * unit, 28 * unit, 8 * unit, OVERLAY_GLYPH);
+    fillRect(settings_x + 28 * unit, panel_y + 38 * unit, 8 * unit, 28 * unit, OVERLAY_GLYPH);
+}
+
+fn presentOverlay(progress: u32) void {
+    drawOverlay(progress);
+    wl.present();
 }
 
 // Big enough for a 4K keyframe; the accumulator holds at most one access unit
@@ -347,8 +409,17 @@ pub fn main() !void {
     // Transparent where the video shows; NDL_BG=opaque paints it red instead,
     // which is how you tell "surface not composited" from "punch-through not
     // working".
-    @memset(wl.pixels, if (c.getenv("NDL_BG") != null) 0xFFFF0000 else 0x00000000);
-    wl.present();
+    const overlay_enabled = if (c.getenv("NDL_OVERLAY")) |value|
+        !std.mem.eql(u8, std.mem.sliceTo(value, 0), "0")
+    else
+        true;
+    if (overlay_enabled)
+        presentOverlay(0)
+    else {
+        // NDL_BG is useful for diagnosing punch-through without the overlay.
+        @memset(wl.pixels, if (c.getenv("NDL_BG") != null) 0xFFFF0000 else 0x00000000);
+        wl.present();
+    }
     const full = [4]i32{ 0, 0, @intCast(wl.width), @intCast(wl.height) };
     const window = try wl.exportVideoWindow(full, full);
 
@@ -377,11 +448,23 @@ pub fn main() !void {
     var frames: u64 = 0;
     var bytes: u64 = 0;
     const start = nowNs();
+    var next_overlay = start;
 
     // A live stream paces itself; only a file needs us to hold it back.
     const live = std.mem.startsWith(u8, src, "tcp://");
 
     feed: while (true) {
+        if (!wl.poll()) break :feed;
+        if (overlay_enabled) {
+            const now = nowNs();
+            if (now >= next_overlay) {
+                // The raw source carries no duration, so keep the indicator
+                // moving as an explicit redraw/composition test.
+                const progress: u32 = @intCast(((now - start) / std.time.ns_per_ms / 10) % 1001);
+                presentOverlay(progress);
+                next_overlay = now + 100 * std.time.ns_per_ms;
+            }
+        }
         try fill(fd);
         const cut = accessUnitEnd(geom.codec) orelse blk: {
             // No complete access unit yet. At end of stream the remainder is

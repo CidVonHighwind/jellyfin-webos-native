@@ -76,6 +76,23 @@ prints the same lines to the terminal. Findings on this device:
 To map a button: run `inputlog`, press it, read the code off the screen, and add
 it to `key_names` in `src/inputlog.zig`.
 
+## Back ownership
+
+The shell excludes Back from app input unless the surface claims it. The
+shared `wl.setBackHandled(bool)` sets `_WEBOS_ACCESS_POLICY_KEYS_BACK` on
+the retained shell surface, following the native
+[Kodi implementation](https://github.com/xbmc/xbmc/blob/master/xbmc/windowing/wayland/ShellSurfaceWebOSShell.cpp).
+It can be changed as navigation changes; it is a no-op on desktop Wayland.
+Single-screen apps leave Back with webOS. Jellyfin claims it except on the
+server picker and signed-in home; an active text editor also claims it so
+Back first dismisses editing. The UI demo uses the same policy, with its
+library as the signed-in root.
+
+The TV's `/usr/share/X11/xkb/keycodes/lg` maps `IR_KEY_BACK` to **420**.
+That is an XKB code: the raw `wl_keyboard.key` value is **412** (subtract 8),
+not Linux `KEY_BACK` (158). `wl.isBackKey` accepts Escape and 158 everywhere,
+plus 412 only on webOS, since desktop Linux calls 412 `KEY_PREVIOUS`.
+
 ## The shim
 
 `src/wl.zig` is the shared Wayland layer: connect, bind globals, create one

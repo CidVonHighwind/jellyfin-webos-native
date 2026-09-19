@@ -14,6 +14,13 @@ zig build play -Dapp=ndlplay -Dsrc=/media/developer/videos/demo_1920x1080p120.h2
 zig build stream -Dapp=ndlplay -Dgeom=1920x1080p60   # live from this machine
 ```
 
+`ndlplay` also verifies graphics-over-video composition. Its transparent ARGB
+surface draws a translucent bottom control strip, a moving progress indicator,
+and a settings glyph above the NDL video plane. This is enabled by default;
+set `NDL_OVERLAY=0` to return to the bare punch-through test. The raw stream
+has no duration, so the indicator loops deliberately: it verifies redraws,
+not playback position.
+
 Measured on device, all three decoding in real time:
 
 | clip | result |

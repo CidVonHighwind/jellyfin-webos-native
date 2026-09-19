@@ -28,7 +28,11 @@ pub const Item = struct {
     CollectionType: ?[]const u8 = null,
     Overview: ?[]const u8 = null,
     ProductionYear: ?u32 = null,
+    PremiereDate: ?[]const u8 = null,
+    EndDate: ?[]const u8 = null,
+    Status: ?[]const u8 = null,
     OfficialRating: ?[]const u8 = null,
+    CommunityRating: ?f64 = null,
     RunTimeTicks: ?u64 = null,
     IndexNumber: ?u32 = null,
     ParentIndexNumber: ?u32 = null,
@@ -41,17 +45,22 @@ pub const Item = struct {
     /// can name the artwork `posterId` falls back to without fetching the
     /// series first.
     SeriesPrimaryImageTag: ?[]const u8 = null,
+    BackdropImageTags: ?[][]const u8 = null,
+    ParentBackdropItemId: ?[]const u8 = null,
+    ParentBackdropImageTags: ?[][]const u8 = null,
 
     pub const Played = struct {
         PlayedPercentage: ?f64 = null,
         PlaybackPositionTicks: ?u64 = null,
         Played: bool = false,
+        UnplayedItemCount: ?u32 = null,
     };
     pub const Tags = struct { Primary: ?[]const u8 = null };
 
     pub fn hasPoster(self: Item) bool {
         const tags = self.ImageTags orelse return false;
-        return tags.Primary != null;
+        const tag = tags.Primary orelse return false;
+        return tag.len != 0;
     }
 
     /// The id whose Primary image represents this item on a portrait tile.
@@ -59,16 +68,21 @@ pub const Item = struct {
     /// into a poster and makes a "continue watching" row look like a different
     /// kind of list, so an episode always shows its series' poster.
     pub fn posterId(self: Item) []const u8 {
-        if (self.SeriesId) |series| return series;
+        if (self.usesSeriesPoster()) if (self.SeriesId) |series| return series;
         return self.Id;
     }
 
     /// The image tag for whatever `posterId` points at. Jellyfin's tags are
     /// content hashes, so this doubles as the cache key -- see store.zig.
     pub fn posterTag(self: Item) []const u8 {
-        if (self.SeriesId != null) return self.SeriesPrimaryImageTag orelse "";
+        if (self.usesSeriesPoster() and self.SeriesId != null) return self.SeriesPrimaryImageTag orelse "";
         const tags = self.ImageTags orelse return "";
         return tags.Primary orelse "";
+    }
+
+    fn usesSeriesPoster(self: Item) bool {
+        return std.mem.eql(u8, self.Type, "Episode") or
+            (std.mem.eql(u8, self.Type, "Season") and !self.hasPoster());
     }
 
     pub fn isFolder(self: Item) bool {
@@ -81,6 +95,14 @@ pub const Item = struct {
     pub fn minutes(self: Item) u32 {
         const ticks = self.RunTimeTicks orelse return 0;
         return @intCast(ticks / (10_000_000 * 60));
+    }
+
+    pub fn finished(self: Item) bool {
+        if (self.UserData) |data| {
+            if (data.Played) return true;
+            if (self.isFolder() and data.UnplayedItemCount == 0) return true;
+        }
+        return std.mem.eql(u8, self.Type, "Season") and self.ChildCount == 0;
     }
 
     /// 0..100, for the resume bar. The server only fills PlayedPercentage on
@@ -417,7 +439,7 @@ pub fn seasons(http: *std.http.Client, arena: std.mem.Allocator, session: *const
     var writer: std.Io.Writer = .fixed(&url_buffer);
     try writer.print("{s}/Shows/", .{base(session)});
     try escape(&writer, series);
-    try writer.print("/Seasons?userId={s}&fields=ChildCount", .{session.user_id.get()});
+    try writer.print("/Seasons?userId={s}&fields=ChildCount,Overview&enableImages=true&enableUserData=true", .{session.user_id.get()});
     return getList(http, arena, session, writer.buffered());
 }
 
@@ -428,7 +450,7 @@ pub fn episodes(http: *std.http.Client, arena: std.mem.Allocator, session: *cons
     try escape(&writer, series);
     try writer.print("/Episodes?userId={s}&seasonId=", .{session.user_id.get()});
     try escape(&writer, season);
-    try writer.writeAll("&fields=Overview");
+    try writer.writeAll("&fields=Overview&enableUserData=true");
     return getList(http, arena, session, writer.buffered());
 }
 
@@ -467,8 +489,26 @@ pub fn poster(
     width: u32,
     height: u32,
 ) !image_decoder.Image {
+    return artwork(http, io, arena, session, id, tag, width, height, .primary);
+}
+
+pub const ImageKind = enum { primary, backdrop };
+
+pub fn artwork(
+    http: *std.http.Client,
+    io: std.Io,
+    arena: std.mem.Allocator,
+    session: *const Session,
+    id: []const u8,
+    tag: []const u8,
+    width: u32,
+    height: u32,
+    kind: ImageKind,
+) !image_decoder.Image {
     var path_buffer: [640]u8 = undefined;
-    const cached = store.imagePath(&path_buffer, id, tag, width, height);
+    var key_buffer: [128]u8 = undefined;
+    const cache_id = if (kind == .primary) id else try std.fmt.bufPrint(&key_buffer, "{s}-backdrop", .{id});
+    const cached = store.imagePath(&path_buffer, cache_id, tag, width, height);
     if (cached) |path| {
         if (store.readImage(io, arena, path)) |bytes| return image_decoder.decode(arena, bytes);
     }
@@ -477,7 +517,7 @@ pub fn poster(
     var writer: std.Io.Writer = .fixed(&url_buffer);
     try writer.print("{s}/Items/", .{base(session)});
     try escape(&writer, id);
-    try writer.print("/Images/Primary?fillWidth={d}&fillHeight={d}&format=Png", .{ width, height });
+    try writer.print("/Images/{s}?fillWidth={d}&fillHeight={d}&format=Png", .{ if (kind == .primary) @as([]const u8, "Primary") else "Backdrop/0", width, height });
     // The tag makes the URL change when the image does, which is what lets any
     // cache in between -- ours, or a proxy -- treat it as immutable.
     if (tag.len != 0) {
@@ -536,6 +576,7 @@ pub const Job = enum {
     children,
     item,
     seasons,
+    season_status,
     episodes,
     poster,
 };
@@ -551,6 +592,7 @@ pub const Task = struct {
     b: Text(256) = .{},
     start: u32 = 0,
     limit: u32 = 0,
+    image_kind: ImageKind = .primary,
     /// Opaque to the fetcher: the UI uses it to match a result to the row,
     /// grid slot or poster tile that asked for it.
     tag: u32 = 0,
@@ -717,9 +759,9 @@ fn execute(http: *std.http.Client, io: std.Io, arena: std.mem.Allocator, session
         .next_up => task.list = try nextUp(http, arena, session),
         .children => task.list = try children(http, arena, session, task.a.get(), task.start, task.limit),
         .item => task.one = try item(http, arena, session, task.a.get()),
-        .seasons => task.list = try seasons(http, arena, session, task.a.get()),
+        .seasons, .season_status => task.list = try seasons(http, arena, session, task.a.get()),
         .episodes => task.list = try episodes(http, arena, session, task.a.get(), task.b.get()),
-        .poster => task.image = try poster(http, io, arena, session, task.a.get(), task.b.get(), task.start, task.limit),
+        .poster => task.image = try artwork(http, io, arena, session, task.a.get(), task.b.get(), task.start, task.limit, task.image_kind),
     }
 }
 

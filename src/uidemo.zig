@@ -243,8 +243,8 @@ fn focusMax() usize {
 }
 
 fn navigate(code: u32) void {
+    if (wl.isBackKey(code)) return goBack();
     switch (code) {
-        1, 158 => goBack(),
         103 => if (focus > 0) {
             focus -= 1;
             if (screen == .library) {
@@ -312,6 +312,7 @@ fn onKey(code: u32, pressed: bool) void {
         return;
     }
     if (!pressed) return;
+    if (wl.isBackKey(code)) return goBack();
     if (code == 88) { // F12
         capture_requested = true;
         setStatus("Capturing the OpenGL framebuffer", .{});
@@ -342,6 +343,7 @@ fn onTextKeysym(sym: u32, pressed: bool) void {
 }
 
 fn onEvent(event: wl.Event) void {
+    defer wl.setBackHandled(active_field != .none or (screen != .server and screen != .library));
     switch (event) {
         .key => |e| onKey(e.code, e.pressed),
         .text_commit => |text| appendText(text),
@@ -586,6 +588,7 @@ fn drawDetails(ctx: *loom.Context, width: f32, scale: f32) void {
 }
 
 fn buildUi(ctx: *loom.Context, renderer: *UiRenderer, dt: f32) void {
+    defer wl.setBackHandled(active_field != .none or (screen != .server and screen != .library));
     const width: f32 = @floatFromInt(gl.width);
     const height: f32 = @floatFromInt(gl.height);
     const scale = @min(width / 1920.0, height / 1080.0);
