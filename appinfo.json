@@ -1,10 +1,10 @@
 {
-  "id": "dev.hookedbehemoth.wlbox",
+  "id": "dev.hookedbehemoth.APP",
   "version": "0.0.1",
   "vendor": "webos-native",
   "type": "native",
-  "main": "wlbox",
-  "title": "wlbox",
+  "main": "APP",
+  "title": "APP",
   "icon": "icon.png",
   "bgColor": "#000000",
   "nativeLifeCycleInterfaceVersion": 2

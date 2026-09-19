@@ -227,17 +227,16 @@ var xdg_surf: Proxy = .{};
 var xdg_top: Proxy = .{};
 var buffer: Proxy = .{};
 var output: Proxy = .{};
+var foreign: Proxy = .{};
+var exported: Proxy = .{};
 var configured = false;
 var seat_count: u8 = 0;
 var seats: [4]Proxy = @splat(.{});
 
-/// How the window's pixels get there: a CPU-written shm buffer, or nothing at
-/// all because something else (EGL) will attach its own buffers.
-pub const Buffers = enum { shm, external };
-
-/// Connect, bind a shell and map a window. Pass 0 for `w`/`h` to take the
-/// output's own mode, which is what fullscreen on the TV gets anyway.
-pub fn open(app_id: [*:0]const u8, title: [*:0]const u8, w: u32, h: u32, buffers: Buffers) !void {
+/// Connect and bind globals, without creating a window. `open` calls this;
+/// call it directly to inspect the compositor (see glinfo/wlinfo).
+pub fn connect() !void {
+    if (display != null) return;
     libs[0] = c.dlopen("libwayland-client.so.0", .{ .NOW = true }) orelse return error.NoWaylandClient;
     libs[1] = c.dlopen("libwayland-webos-client.so.1", .{ .NOW = true }); // TV only
 
@@ -248,17 +247,49 @@ pub fn open(app_id: [*:0]const u8, title: [*:0]const u8, w: u32, h: u32, buffers
     roundtripFn = fnPtr(@TypeOf(roundtripFn), "wl_display_roundtrip");
     dispatchPendingFn = fnPtr(@TypeOf(dispatchPendingFn), "wl_display_dispatch_pending");
     flushFn = fnPtr(@TypeOf(flushFn), "wl_display_flush");
-    const connect = fnPtr(*const fn (?[*:0]const u8) callconv(.c) ?*anyopaque, "wl_display_connect");
+    const connectFn = fnPtr(*const fn (?[*:0]const u8) callconv(.c) ?*anyopaque, "wl_display_connect");
 
-    display = connect(null) orelse return error.NoDisplay;
+    display = connectFn(null) orelse return error.NoDisplay;
     const disp = Proxy{ .p = display, .i = iface("wl_display_interface") };
-
     registry = disp.new("get_registry", iface("wl_registry_interface"), .{});
     registry.listen(&registry_listener, null);
     _ = roundtripFn(display); // receive globals
     _ = roundtripFn(display); // settle the binds
     if (!compositor.ok() or !shm.ok()) return error.MissingGlobals;
+}
 
+/// Globals the compositor advertised, in the order they arrived.
+pub const Global = struct { name: u32, interface: [64]u8, len: u8, version: u32 };
+pub var globals: [64]Global = undefined;
+pub var global_count: usize = 0;
+
+/// The `wl_*_interface` symbol for a protocol object, if the loaded libraries
+/// carry one. Not every advertised global has a client-side interface.
+pub fn ifaceOpt(name: [*:0]const u8) ?*const Interface {
+    return @ptrCast(@alignCast(symOpt(name) orelse return null));
+}
+
+/// Print an interface's request and event tables. This is how the protocol gets
+/// discovered on a device whose XML nobody published.
+pub fn dumpInterface(i: *const Interface) void {
+    std.debug.print("{s} v{d}\n", .{ i.name, i.version });
+    if (i.methods) |m| for (0..@intCast(i.method_count)) |n| std.debug.print("  -> [{d}] {s}({s})\n", .{
+        n, std.mem.sliceTo(m[n].name, 0), std.mem.sliceTo(m[n].signature, 0),
+    });
+    if (i.events) |e| for (0..@intCast(i.event_count)) |n| std.debug.print("  <- [{d}] {s}({s})\n", .{
+        n, std.mem.sliceTo(e[n].name, 0), std.mem.sliceTo(e[n].signature, 0),
+    });
+}
+
+/// How the window's pixels get there: a CPU-written shm buffer, or nothing at
+/// all because something else (EGL) will attach its own buffers.
+pub const Buffers = enum { shm, external };
+
+/// Connect, bind a shell and map a window. Pass 0 for `w`/`h` to take the
+/// output's own mode, which is what fullscreen on the TV gets anyway.
+pub fn open(app_id: [*:0]const u8, title: [*:0]const u8, w: u32, h: u32, buffers: Buffers) !void {
+    try connect();
+    marshal_raw = sym("wl_proxy_marshal_flags");
     surface = compositor.new("create_surface", iface("wl_surface_interface"), .{});
     width = if (w != 0) w else output_width;
     height = if (h != 0) h else output_height;
@@ -350,8 +381,14 @@ fn bindGlobal(name: u32, i: *const Interface, version: u32) Proxy {
     return .{ .p = p, .i = i };
 }
 
-fn onGlobal(_: ?*anyopaque, _: ?*anyopaque, name: u32, i: [*:0]const u8, _: u32) callconv(.c) void {
+fn onGlobal(_: ?*anyopaque, _: ?*anyopaque, name: u32, i: [*:0]const u8, version: u32) callconv(.c) void {
     const s = std.mem.sliceTo(i, 0);
+    if (global_count < globals.len and s.len <= 64) {
+        const g = &globals[global_count];
+        g.* = .{ .name = name, .interface = undefined, .len = @intCast(s.len), .version = version };
+        @memcpy(g.interface[0..s.len], s);
+        global_count += 1;
+    }
     if (std.mem.eql(u8, s, "wl_compositor")) {
         compositor = bindGlobal(name, iface("wl_compositor_interface"), 1);
     } else if (std.mem.eql(u8, s, "wl_shm")) {
@@ -361,6 +398,9 @@ fn onGlobal(_: ?*anyopaque, _: ?*anyopaque, name: u32, i: [*:0]const u8, _: u32)
             webos_shell = bindGlobal(name, iface("wl_webos_shell_interface"), 1);
     } else if (std.mem.eql(u8, s, "xdg_wm_base")) {
         xdg_wm = bindGlobal(name, &xdg_wm_base_i, 1);
+    } else if (std.mem.eql(u8, s, "wl_webos_foreign")) {
+        if (symOpt("wl_webos_foreign_interface") != null)
+            foreign = bindGlobal(name, iface("wl_webos_foreign_interface"), 1);
     } else if (std.mem.eql(u8, s, "wl_output") and !output.ok()) {
         output = bindGlobal(name, iface("wl_output_interface"), 1);
         output.listen(&output_listener, null);
@@ -424,6 +464,54 @@ const output_listener = extern struct {
     .mode = onMode,
     .rest = @splat(nop),
 };
+
+// ------------------------------------------------------- video punch-through
+
+/// wl_webos_foreign's exported-element types. The `window_id_assigned` event
+/// echoes the type back, so a wrong guess here is visible rather than silent.
+pub const ExportedType = enum(u32) { video = 0, subtitle = 1, transparent = 2, opaque_object = 3 };
+
+var window_id: [128]u8 = @splat(0);
+var window_id_len: usize = 0;
+
+fn onWindowId(_: ?*anyopaque, _: ?*anyopaque, id: [*:0]const u8, kind: u32) callconv(.c) void {
+    const s = std.mem.sliceTo(id, 0);
+    window_id_len = @min(s.len, window_id.len - 1);
+    @memcpy(window_id[0..window_id_len], s[0..window_id_len]);
+    std.debug.print("exported window id '{s}' type {d}\n", .{ window_id[0..window_id_len], kind });
+}
+const exported_listener = extern struct { window_id_assigned: @TypeOf(&onWindowId) }{ .window_id_assigned = onWindowId };
+
+fn region(x: i32, y: i32, w: i32, h: i32) Proxy {
+    const r = compositor.new("create_region", iface("wl_region_interface"), .{});
+    r.call("add", .{ x, y, w, h });
+    return r;
+}
+
+/// Export this window as a video element and return the id the compositor
+/// assigns it, NUL-terminated so it can be handed straight to a C API.
+///
+/// The hardware decoder writes to a video plane; the compositor punches that
+/// plane through wherever this surface's destination region is. The surface
+/// must already have content committed, and must be transparent where the
+/// video should show.
+pub fn exportVideoWindow(src: [4]i32, dst: [4]i32) ![*:0]const u8 {
+    if (!foreign.ok()) return error.NoWebosForeign;
+    exported = foreign.new("export_element", iface("wl_webos_exported_interface"), .{
+        surface.p, @intFromEnum(ExportedType.video),
+    });
+    exported.listen(&exported_listener, null);
+    exported.call("set_exported_window", .{
+        region(src[0], src[1], src[2], src[3]).p,
+        region(dst[0], dst[1], dst[2], dst[3]).p,
+    });
+    surface.call("commit", .{});
+    for (0..20) |_| {
+        _ = roundtripFn(display);
+        if (window_id_len != 0) return @ptrCast(window_id[0..window_id_len :0].ptr);
+    }
+    return error.NoWindowId;
+}
 
 // -------------------------------------------------------------------- input
 //

@@ -31,6 +31,7 @@ const apps = [_]App{
     .{ .name = "inputlog", .src = "src/inputlog.zig", .libc = true },
     .{ .name = "glinfo", .src = "src/glinfo.zig", .libc = true },
     .{ .name = "gltri", .src = "src/gltri.zig", .libc = true, .shaders = true },
+    .{ .name = "ndlplay", .src = "src/ndlplay.zig", .libc = true },
 };
 
 /// Sourced by every remote step. Defaults keep a fresh clone working.
@@ -149,10 +150,18 @@ pub fn build(b: *std.Build) void {
 
     // ---- launch: start the installed app through SAM ----
     const launch = sh(b, env_preamble ++
-        \\id=$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1")
+        \\app="$1"
+        \\id=$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$2" | sed "s/APP/$app/")
         \\ssh "$T" "luna-send -n 1 -f luna://com.webos.applicationManager/launch '{\"id\":\"$id\"}'"
-    , &.{b.pathFromRoot("appinfo.json")});
+    , &.{ selected, b.pathFromRoot("appinfo.json") });
     b.step("launch", "Launch the installed app on the TV").dependOn(&launch.step);
+
+    // ---- videos: demo elementary streams, generated and pushed ----
+    // Raw Annex-B, not a container: NDL DirectMedia takes elementary streams,
+    // and the name carries the geometry the stream itself cannot.
+    const videos = sh(b, env_preamble ++ videos_script, &.{b.pathFromRoot("zig-out/videos")});
+    videos.stdio = .inherit;
+    b.step("videos", "Generate demo videos with ffmpeg and push them to the TV").dependOn(&videos.step);
 
     // ---- shot: a PNG of whatever is on the TV right now ----
     // There is no screenshot service a native app can reach, but the TV runs a
@@ -169,6 +178,28 @@ pub fn build(b: *std.Build) void {
     const inst = sh(b, env_preamble ++ install_script, &.{b.pathFromRoot("zig-out")});
     inst.step.dependOn(pkg_step);
     b.step("install-app", "Package, push and install -Dapp on the TV").dependOn(&inst.step);
+
+    // ---- play: install ndlplay, point it at a source, run it ----
+    // Run from the INSTALLED path on purpose: the Luna role file generated at
+    // install time is keyed on the binary's exact path, and NDL will not
+    // register on the bus without it. SSH keeps stderr where we can see it.
+    const play_src = b.option([]const u8, "src", "File on the TV or tcp://host:port for `zig build play`") orelse
+        "/media/developer/videos/demo_1920x1080p60.h264";
+    const play = sh(b, env_preamble ++
+        \\app="$1"; src="$2"
+        \\id="dev.hookedbehemoth.$app"
+        \\ssh "$T" "mkdir -p /media/developer/videos; printf '%s\n' '$src' > /media/developer/videos/PLAY"
+        \\exec ssh "$T" "cd $APPDIR/$id && XDG_RUNTIME_DIR=/tmp/xdg WAYLAND_DISPLAY=wayland-0 ./$app"
+    , &.{ selected, play_src });
+    play.stdio = .inherit;
+    play.step.dependOn(&inst.step);
+    b.step("play", "Install -Dapp and run it on the TV against -Dsrc").dependOn(&play.step);
+
+    // ---- stream: publish a live stream from this PC and play it on the TV ----
+    const stream = sh(b, env_preamble ++ stream_script, &.{ selected, b.option([]const u8, "geom", "Stream geometry for `zig build stream`, e.g. 1920x1080p60") orelse "1920x1080p60" });
+    stream.stdio = .inherit;
+    stream.step.dependOn(&inst.step);
+    b.step("stream", "Publish a live stream from this PC and play it on the TV").dependOn(&stream.step);
 }
 
 /// Every app gets the font and the compiled shaders as embeddable modules.
@@ -239,16 +270,59 @@ fn sh(b: *std.Build, script: []const u8, args: []const []const u8) *std.Build.St
 ///      archive is written by hand rather than with `ar`.
 ///   2. tar paths must be "usr/palm/..." with no leading "./".
 ///   3. the control tarball holds "control", not "./control".
+/// Demo streams: one per interesting capability. H.265 at 120 fps is the only
+/// 120 in the device's codec table, so that clip is the point of the exercise.
+const videos_script =
+    \\set -e
+    \\out="$1"; mkdir -p "$out"
+    \\command -v ffmpeg >/dev/null || { echo "ffmpeg not found" >&2; exit 1; }
+    \\gen() { # name codec size rate extra...
+    \\  f="$out/demo_$3p$4.$1"
+    \\  [ -s "$f" ] && { echo "have $f"; return; }
+    \\  echo "encoding $f"
+    \\  ffmpeg -hide_banner -loglevel error -f lavfi -i "testsrc2=size=$3:rate=$4:duration=8" \
+    \\    -c:v "$2" -preset ultrafast -pix_fmt yuv420p -b:v "$5" -f "$6" -y "$f"
+    \\}
+    \\gen h264 libx264 1920x1080 60  8M  h264
+    \\gen h265 libx265 1920x1080 120 10M hevc
+    \\gen h265 libx265 3840x2160 30  20M hevc
+    \\ssh "$T" "mkdir -p /media/developer/videos"
+    \\scp -q "$out"/demo_* "$T:/media/developer/videos/"
+    \\ssh "$T" "ls -la /media/developer/videos"
+;
+
+/// ffmpeg listens, the TV connects. The other direction would need the app to
+/// accept() and the TV's address to be reachable from here anyway, so this is
+/// the shorter path -- and it is exactly how a Moonlight-style client works:
+/// compressed frames straight into the hardware decoder.
+const stream_script =
+    \\set -e
+    \\app="$1"; geom="$2"; port=${WEBOS_STREAM_PORT:-9000}
+    \\size=${geom%p*}; rate=${geom#*p}
+    \\me=$(ip route get "$HOST" | sed -n 's/.*src \([0-9.]*\).*/\1/p' | head -1)
+    \\[ -n "$me" ] || { echo "cannot work out this machine's address toward $HOST" >&2; exit 1; }
+    \\echo "publishing ${size}p${rate} h264 on tcp://$me:$port"
+    \\ffmpeg -hide_banner -loglevel warning -re -f lavfi -i "testsrc2=size=$size:rate=$rate" \
+    \\  -c:v libx264 -preset ultrafast -tune zerolatency -g "$rate" -pix_fmt yuv420p -b:v 8M \
+    \\  -f h264 "tcp://0.0.0.0:$port?listen=1" &
+    \\ff=$!
+    \\trap 'kill $ff 2>/dev/null' EXIT
+    \\sleep 1
+    \\ssh "$T" "cd $APPDIR/dev.hookedbehemoth.$app && XDG_RUNTIME_DIR=/tmp/xdg WAYLAND_DISPLAY=wayland-0 \
+    \\  APPID=dev.hookedbehemoth.$app NDL_SRC=tcp://$me:$port NDL_GEOM=$geom NDL_CODEC=h264 ./$app"
+;
+
 const ipk_script =
     \\set -e
     \\app="$1"; bin="$2"; appinfo="$3"; out="$4"
-    \\id=$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$appinfo")
     \\ver=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$appinfo")
-    \\[ -n "$id" ] && [ -n "$ver" ] || { echo "appinfo.json: missing id/version" >&2; exit 1; }
+    \\[ -n "$ver" ] || { echo "appinfo.json: missing version" >&2; exit 1; }
+    \\# One id per app: NDL (and anything else on the Luna bus) refuses to
+    \\# register unless the running binary's app id matches an installed app.
+    \\id=$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$appinfo" | sed "s/APP/$app/")
     \\work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
     \\mkdir -p "$work/data/usr/palm/applications/$id" "$work/control"
-    \\sed "s/\"main\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"main\": \"$app\"/" "$appinfo" \
-    \\  > "$work/data/usr/palm/applications/$id/appinfo.json"
+    \\sed "s/APP/$app/g" "$appinfo" > "$work/data/usr/palm/applications/$id/appinfo.json"
     \\install -m 755 "$bin" "$work/data/usr/palm/applications/$id/$app"
     \\for extra in icon.png largeIcon.png splash.png; do
     \\  [ -f "assets/$extra" ] && cp "assets/$extra" "$work/data/usr/palm/applications/$id/" || true
@@ -291,6 +365,8 @@ const install_script =
     \\[ -n "$ipk" ] || { echo "no .ipk in $out; run: zig build package" >&2; exit 1; }
     \\base=$(basename "$ipk"); id=$(echo "$base" | sed 's/_[^_]*_arm\.ipk$//')
     \\scp -q "$ipk" "$T:$TMP/$base"
-    \\ssh "$T" "timeout 60 luna-send -i -f luna://com.webos.appInstallService/dev/install '{\"id\":\"$id\",\"ipkUrl\":\"$TMP/$base\",\"subscribe\":true}' 2>&1 | grep -oE '\"(state|reason)\": \"[^\"]*\"' | tail -4; echo '--- installed files:'; ls -la $APPDIR/$id 2>&1 | head"
+    \\# luna-send -i never exits on a subscription, and killing it through a
+    \\# pipe loses the buffered reply -- so let it write to a file and read that.
+    \\ssh "$T" "luna-send -i -f luna://com.webos.appInstallService/dev/install '{\"id\":\"$id\",\"ipkUrl\":\"$TMP/$base\",\"subscribe\":true}' >$TMP/install.log 2>&1 & sleep 25; kill %1 2>/dev/null; grep -oE '\"(state|reason|errorText)\" *: *\"[^\"]*\"' $TMP/install.log | tail -4; echo '--- installed files:'; ls -la $APPDIR/$id 2>&1 | head"
     \\echo "installed $id (from $base)"
 ;
