@@ -213,16 +213,58 @@ and your eyes.
 
 ## Events
 
-`NDL_DirectMediaLoad`'s callback is `void (*)(int type, long long value, const
-char *text)`. Observed during a normal file playback:
+The load callback is `void (*)(int type, long long value, const char *text)`,
+and the types are `PF_EVENT_T` from webos-userland's `StarfishMediaAPIs.h`.
+The ones a Jellyfin session actually produces, in the order they arrive:
 
-| type | when |
-|---|---|
-| 22 | shortly after a successful `Load` |
-| 26 | immediately after 22 |
-| 23 | after the last frame is fed (end of stream) |
+| type | name | carries |
+|---|---|---|
+| 13 | `INT_NUM_PROGRAM` | program count |
+| 14 / 15 | `INT_NUM_VIDEO_TRACK` / `_AUDIO_TRACK` | track counts |
+| 5 / 8 | `STR_VIDEO_TRACK_INFO` / `STR_AUDIO_TRACK_INFO` | caps, as text |
+| 17 | `STR_RESOURCE_INFO` | `{"context":…,"resourceList":[VDEC,PCMMC]}` |
+| 22 | `STATE_UPDATE__LOADCOMPLETED` | `"true"` |
+| 7 | `STR_AUDIO_INFO` | `{"track":1,"immersive":"none"}` |
+| 4 | `STR_VIDEO_INFO` | frame rate, scan type, HDR, SEI, VUI |
+| 26 | `STATE_UPDATE__PLAYING` | `"true"` |
+| 44 / 46 | `INT_BUFFERLOW` / `STR_BUFFERLOW` | backpressure, downward |
+| 45 | `STR_BUFFERFULL` | backpressure, upward |
+| 25 | `STATE_UPDATE__SEEKDONE` | a seek landed |
+| 23 | `STATE_UPDATE__UNLOADCOMPLETED` | `"true"` — **not** end of stream |
 
-The numeric meanings are not published; these are what the device sends.
+**There is no pull side.** `INT_NEED_DATA` (38) and `INT_ENOUGH_DATA` (39) are
+in the enum, but `onEnoughData` is wired only in `mediapipeline::DvrPipeline`
+and there is no `onNeedData` symbol in `libpf` at all. Load a stream and feed
+it nothing and the pipeline says nothing after 22/7: it never asks. The
+application pushes, and the only flow control is reactive — `Feed`'s own
+`BufferFull` reply plus 44/45/46.
+
+## Seeking
+
+`StarfishMediaAPIs::flush(const char *)` parses exactly two keys — `audioFlush`
+(bool) and `offset` (int64) — and hands them to `player->flush(int, long long)`
+at vtable +0xa8, which is `CustomPipeline::flush(int, long long)`. **That
+overload pushes a real FLUSH_START/FLUSH_STOP pair to both appsrcs**; the
+no-argument `flush()` is a degenerate `gst_element_seek` to
+`GST_CLOCK_TIME_NONE` that sends neither, so the sink stays anchored to the
+pre-seek segment and eventually stops draining. Anyone who concluded that
+in-place seek is impossible here was calling the wrong overload.
+
+```
+Pause()
+flush({"audioFlush":true,"offset":<pos>})
+setTimeToDecode({"position":<pos>})     -- refused unless paused
+av_seek_frame + refeed from the keyframe
+Play()                                  -- event 25 confirms
+```
+
+Units are assumed to be milliseconds, matching `Seek(const char *millis)`.
+Nothing in `flush` says so; the unit is decided downstream in
+`CustomPipeline::flush`.
+
+The disassembly also confirms the header's layout: `flush` reaches the player
+through `[this, #0x4c]`, which is `char unknown[76]` followed by the public
+`boost::shared_ptr<mediapipeline::Player> player`. No private offsets needed.
 
 ## What else is reachable
 

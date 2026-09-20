@@ -457,7 +457,10 @@ pub fn episodes(http: *std.http.Client, arena: std.mem.Allocator, session: *cons
 /// MPEG-TS lets Jellyfin remux compatible H.264/H.265/AV1 video instead of
 /// re-encoding it. The DirectMedia player demuxes its packets locally.
 pub fn streamUrl(session: *const Session, id: []const u8, buffer: []u8) []const u8 {
-    return std.fmt.bufPrint(buffer, "{s}/Videos/{s}/stream?container=ts&audioCodec=mp3&api_key={s}", .{
+    // static=true is the original file, byte ranges and all, which is what
+    // makes seeking work: a server-side remux is a live stream with no
+    // Content-Length, so neither av_seek_frame nor startTimeTicks moves it.
+    return std.fmt.bufPrint(buffer, "{s}/Videos/{s}/stream?static=true&api_key={s}", .{
         base(session), id, session.token.get(),
     }) catch "";
 }

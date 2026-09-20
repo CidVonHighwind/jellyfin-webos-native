@@ -10,13 +10,18 @@
 struct jf_demux {
     AVFormatContext *format;
     AVPacket *packet;
-    // Audio is decoded here: NDL DirectMedia only takes PCM, MP3 or Opus, and
-    // its MP3 path never builds an audio pipeline on this TV.
+    // Audio is decoded here: the pipeline only builds an audio sink for PCM.
     AVCodecContext *audio;
     AVFrame *frame;
     struct SwrContext *swr;
     uint8_t *pcm;
     int pcm_cap, pcm_size;
+    // A file container stores H.264/H.265 length-prefixed with the parameter
+    // sets off in extradata. The hardware decoder wants Annex-B start codes --
+    // without them it reports "Sequence Init Fail" and never starts.
+    AVBSFContext *bsf;
+    AVPacket *filtered;
+    int video_index;
 };
 static void *format_lib, *codec_lib, *util_lib, *swr_lib;
 static int (*p_open)(AVFormatContext **, const char *, AVInputFormat *, AVDictionary **);
@@ -41,6 +46,16 @@ static int (*p_swr_init)(struct SwrContext *);
 static int (*p_swr_convert)(struct SwrContext *, uint8_t **, int, const uint8_t **, int);
 static void (*p_swr_free)(struct SwrContext **);
 static void (*p_log_set_level)(int);
+static int (*p_seek)(AVFormatContext *, int, int64_t, int);
+static void (*p_flush_buffers)(AVCodecContext *);
+static const AVBitStreamFilter *(*p_bsf_by_name)(const char *);
+static int (*p_bsf_alloc)(const AVBitStreamFilter *, AVBSFContext **);
+static int (*p_bsf_init)(AVBSFContext *);
+static int (*p_bsf_send)(AVBSFContext *, AVPacket *);
+static int (*p_bsf_receive)(AVBSFContext *, AVPacket *);
+static void (*p_bsf_free)(AVBSFContext **);
+static void (*p_bsf_flush)(AVBSFContext *);
+static int (*p_parameters_copy)(AVCodecParameters *, const AVCodecParameters *);
 
 static int load(void) {
     if (p_open) return 1;
@@ -68,6 +83,16 @@ static int load(void) {
     *(void **)(&p_free_context) = dlsym(codec_lib, "avcodec_free_context");
     *(void **)(&p_frame_alloc) = dlsym(util_lib, "av_frame_alloc");
     *(void **)(&p_frame_free) = dlsym(util_lib, "av_frame_free");
+    *(void **)(&p_seek) = dlsym(format_lib, "av_seek_frame");
+    *(void **)(&p_flush_buffers) = dlsym(codec_lib, "avcodec_flush_buffers");
+    *(void **)(&p_bsf_by_name) = dlsym(codec_lib, "av_bsf_get_by_name");
+    *(void **)(&p_bsf_alloc) = dlsym(codec_lib, "av_bsf_alloc");
+    *(void **)(&p_bsf_init) = dlsym(codec_lib, "av_bsf_init");
+    *(void **)(&p_bsf_send) = dlsym(codec_lib, "av_bsf_send_packet");
+    *(void **)(&p_bsf_receive) = dlsym(codec_lib, "av_bsf_receive_packet");
+    *(void **)(&p_bsf_free) = dlsym(codec_lib, "av_bsf_free");
+    *(void **)(&p_bsf_flush) = dlsym(codec_lib, "av_bsf_flush");
+    *(void **)(&p_parameters_copy) = dlsym(codec_lib, "avcodec_parameters_copy");
     *(void **)(&p_swr_alloc_set_opts) = dlsym(swr_lib, "swr_alloc_set_opts");
     *(void **)(&p_swr_init) = dlsym(swr_lib, "swr_init");
     *(void **)(&p_swr_convert) = dlsym(swr_lib, "swr_convert");
@@ -80,7 +105,7 @@ static int load(void) {
 }
 
 /// Open the decoder for one audio stream. Output is always S16LE stereo at the
-/// stream's own rate; NDL takes nothing else. 1 on success.
+/// stream's own rate; the pipeline takes nothing else. 1 on success.
 int jf_demux_audio_open(void *opaque, int index, int *rate) {
     struct jf_demux *d = opaque;
     if (!p_find_decoder || !p_frame_alloc || !p_swr_alloc_set_opts) return 0;
@@ -135,6 +160,8 @@ void *jf_demux_open(const char *url) {
 
 void jf_demux_close(void *opaque) {
     struct jf_demux *d = opaque; if (!d) return;
+    if (d->bsf) p_bsf_free(&d->bsf);
+    if (d->filtered) p_packet_free(&d->filtered);
     if (d->swr) p_swr_free(&d->swr);
     if (d->frame) p_frame_free(&d->frame);
     if (d->audio) p_free_context(&d->audio);
@@ -163,14 +190,78 @@ int jf_demux_stream(void *opaque, int index, int *kind, int *codec, int *width, 
     *kind = p->codec_type; *codec = p->codec_id; *width = p->width; *height = p->height;
     return 1;
 }
-int jf_demux_next(void *opaque, uint8_t **data, int *size, int *stream, int64_t *pts) {
-    struct jf_demux *d = opaque; p_packet_unref(d->packet);
-    if (p_read(d->format, d->packet) < 0) return 0;
-    *data = d->packet->data; *size = d->packet->size; *stream = d->packet->stream_index;
-    if (d->packet->pts == AV_NOPTS_VALUE) *pts = 0;
-    else {
-        AVRational time_base = d->format->streams[*stream]->time_base;
-        *pts = d->packet->pts * (int64_t)time_base.num * 1000000000LL / time_base.den;
+/// Route this video stream through a bitstream filter when the container
+/// stores it length-prefixed (an AVCC/HVCC extradata block starts with 1).
+/// Elementary-stream containers already carry start codes and need none.
+int jf_demux_video_open(void *opaque, int index) {
+    struct jf_demux *d = opaque;
+    d->video_index = index;
+    if (d->bsf) p_bsf_free(&d->bsf);
+    if (!p_bsf_by_name || index < 0 || index >= (int)d->format->nb_streams) return 0;
+    AVCodecParameters *par = d->format->streams[index]->codecpar;
+    if (par->extradata_size < 1 || par->extradata[0] != 1) return 0;
+    const char *name = par->codec_id == AV_CODEC_ID_H264   ? "h264_mp4toannexb"
+                       : par->codec_id == AV_CODEC_ID_HEVC ? "hevc_mp4toannexb"
+                                                           : 0;
+    const AVBitStreamFilter *filter = name ? p_bsf_by_name(name) : 0;
+    if (!filter || p_bsf_alloc(filter, &d->bsf) < 0) return 0;
+    if (!d->filtered) d->filtered = p_packet_alloc();
+    if (!d->filtered || p_parameters_copy(d->bsf->par_in, par) < 0 || p_bsf_init(d->bsf) < 0) {
+        p_bsf_free(&d->bsf);
+        return 0;
     }
     return 1;
+}
+
+/// Point the handle at a different URL, keeping the handle itself. A server
+/// that transcodes on the fly serves no byte ranges, so seeking such a stream
+/// means asking the server for it again from a different offset.
+int jf_demux_reopen(void *opaque, const char *url) {
+    struct jf_demux *d = opaque;
+    // Before the context goes: the packet still references buffers it owns.
+    p_packet_unref(d->packet);
+    if (d->bsf) p_bsf_free(&d->bsf);
+    if (d->swr) p_swr_free(&d->swr);
+    if (d->frame) p_frame_free(&d->frame);
+    if (d->audio) p_free_context(&d->audio);
+    d->pcm_size = 0;
+    p_close(&d->format);
+    if (p_open(&d->format, url, 0, 0) < 0) return 0;
+    return p_info(d->format, 0) >= 0;
+}
+
+/// Move the source to the keyframe at or before position_ns. Stream index -1
+/// means the timestamp is in AV_TIME_BASE units, i.e. microseconds.
+int jf_demux_seek(void *opaque, int64_t position_ns) {
+    struct jf_demux *d = opaque;
+    if (!p_seek) return 0;
+    if (p_seek(d->format, -1, position_ns / 1000, AVSEEK_FLAG_BACKWARD) < 0) return 0;
+    if (d->audio && p_flush_buffers) p_flush_buffers(d->audio);
+    if (d->bsf && p_bsf_flush) p_bsf_flush(d->bsf);
+    d->pcm_size = 0;
+    return 1;
+}
+
+int jf_demux_next(void *opaque, uint8_t **data, int *size, int *stream, int64_t *pts) {
+    struct jf_demux *d = opaque;
+    for (;;) {
+        p_packet_unref(d->packet);
+        if (p_read(d->format, d->packet) < 0) return 0;
+        AVPacket *out = d->packet;
+        if (d->bsf && d->packet->stream_index == d->video_index) {
+            // send_packet takes the input; receive can want another one first.
+            if (p_bsf_send(d->bsf, d->packet) < 0) continue;
+            p_packet_unref(d->filtered);
+            if (p_bsf_receive(d->bsf, d->filtered) < 0) continue;
+            d->filtered->stream_index = d->video_index;
+            out = d->filtered;
+        }
+        *data = out->data; *size = out->size; *stream = out->stream_index;
+        if (out->pts == AV_NOPTS_VALUE) *pts = 0;
+        else {
+            AVRational time_base = d->format->streams[*stream]->time_base;
+            *pts = out->pts * (int64_t)time_base.num * 1000000000LL / time_base.den;
+        }
+        return 1;
+    }
 }

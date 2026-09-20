@@ -1057,7 +1057,10 @@ fn activate() void {
         .season => if (episode_selected < episodes_row.count) {
             startPlayback(episodes_row.cards[episode_selected].id.get(), episodes_row.cards[episode_selected].episode_title.get());
         },
-        .playback => togglePlayback(),
+        .playback => switch (playback_buttons[@min(focus, playback_buttons.len - 1)].delta) {
+            0 => togglePlayback(),
+            else => |delta| player.seek(delta),
+        },
     }
 }
 
@@ -1097,6 +1100,7 @@ fn startPlayback(id: []const u8, title: []const u8) void {
     };
     playback_title.set(title);
     playback_paused = false;
+    focus = play_pause_index;
     screen = .playback;
     setStatus("Playing", .{});
 }
@@ -1120,6 +1124,7 @@ fn focusCount() usize {
         .server => discovered_count + 3,
         .auth => 4,
         .quick => 1,
+        .playback => playback_buttons.len,
         .details => if (detail.is("Series")) @max(1, seasons_row.count) else 1,
         else => 1,
     };
@@ -1162,7 +1167,11 @@ fn move(direction: Direction) void {
             .right => focus = @min(focus + 1, focusCount() - 1),
             else => {},
         },
-        .playback => {},
+        .playback => switch (direction) {
+            .left => focus -|= 1,
+            .right => focus = @min(focus + 1, focusCount() - 1),
+            else => {},
+        },
         else => switch (direction) {
             .up => focus -|= 1,
             .down => focus = @min(focus + 1, focusCount() - 1),
@@ -1736,6 +1745,17 @@ fn drawSeason(ctx: *loom.Context, width: f32, height: f32, scale: f32) void {
     }
 }
 
+/// The transport row. A zero delta is the play/pause button; the rest seek by
+/// their own number of seconds.
+const playback_buttons = [_]struct { label: []const u8, delta: i32 }{
+    .{ .label = "-30", .delta = -30 },
+    .{ .label = "-10", .delta = -10 },
+    .{ .label = "Play/Pause", .delta = 0 },
+    .{ .label = "+10", .delta = 10 },
+    .{ .label = "+30", .delta = 30 },
+};
+const play_pause_index = 2;
+
 fn drawPlayback(ctx: *loom.Context, width: f32, height: f32, scale: f32) void {
     // The video itself is a separate NDL plane. This graphics-plane strip is
     // intentionally the same kind of content exercised by ndlplay's overlay.
@@ -1748,8 +1768,21 @@ fn drawPlayback(ctx: *loom.Context, width: f32, height: f32, scale: f32) void {
         .failed => player.lastError(),
         .idle => "Stopped",
     };
-    ctx.label(.{ .x = 64 * scale, .y = panel.y + 83 * scale, .w = width - 128 * scale, .h = 32 * scale }, panel, message, if (player.state() == .failed) RED else DIM, 22 * scale);
-    ctx.fill(.{ .x = 64 * scale, .y = panel.y + 128 * scale, .w = width - 128 * scale, .h = 6 * scale }, panel, .{ 72, 81, 94, 230 }, 3 * scale);
+    ctx.label(.{ .x = 64 * scale, .y = panel.y + 83 * scale, .w = 560 * scale, .h = 32 * scale }, panel, message, if (player.state() == .failed) RED else DIM, 22 * scale);
+    var x = width - 64 * scale;
+    var index = playback_buttons.len;
+    while (index > 0) {
+        index -= 1;
+        const button_width: f32 = if (playback_buttons[index].delta == 0) 210 else 110;
+        const button = loom.Rect{
+            .x = x - button_width * scale,
+            .y = panel.y + 74 * scale,
+            .w = button_width * scale,
+            .h = 56 * scale,
+        };
+        drawButton(ctx, button, playback_buttons[index].label, index, scale);
+        x = button.x - 12 * scale;
+    }
 }
 
 /// Greedy word wrap against the real glyph advances. The renderer clips a

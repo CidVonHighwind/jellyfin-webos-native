@@ -1,11 +1,6 @@
-//! Playback straight against LG's Starfish media pipeline (`libplayerAPIs`),
-//! the layer `libNDL_directmedia` wraps.
-//!
-//! NDL is skipped because it cannot pause or seek: `DMPlayer::Play()` exists
-//! in that library, calls `StarfishMediaAPIs::Play()`, and nothing ever calls
-//! it — there is no such entry point in the public API. Talking to SMP
-//! directly also means we write the load payload instead of accepting the one
-//! NDL hardcodes.
+//! Playback straight against LG's Starfish media pipeline (`libplayerAPIs`).
+//! It is the layer `libNDL_directmedia` wraps, and the only one of the two
+//! that exposes pause, seek and a load payload we write ourselves.
 //!
 //! Signatures follow webosbrew/webos-userland
 //! `include/starfish-media-pipeline/StarfishMediaAPIs.h`. Everything is a C++
@@ -52,8 +47,8 @@ pub const Video = struct {
     codec: []const u8,
     /// Frame rate as value/scale, the pipeline's own convention
     /// (PF_EXT_ES_VIDEO_FRAMERATE_VALUE / _SCALE). Zero leaves the pair out,
-    /// which is what NDL does -- the pipeline then believes adaptiveStreaming's
-    /// maxFrameRate, which is not the content's rate.
+    /// and the pipeline then believes adaptiveStreaming's maxFrameRate, which
+    /// is not the content's rate.
     fps_num: i32 = 0,
     fps_den: i32 = 0,
 };
@@ -77,10 +72,9 @@ const StdString = extern struct {
 
 var lib: ?*anyopaque = null;
 var pipeline: ?*anyopaque = null;
-/// NDL allocates 0xd0 bytes for the shared_ptr block, 16 of which are the
-/// control header, so the object is about 192 bytes. The published header
-/// declares a 4 KiB tail of padding after its one known member, so match that
-/// rather than the observed size.
+/// The object is about 192 bytes in practice, but the published header
+/// declares a 4 KiB tail of padding after its one known member, so match the
+/// header rather than the observed size.
 var instance: [8192]u8 align(16) = @splat(0);
 var error_text: [160]u8 = @splat(0);
 var loaded = false;
@@ -94,6 +88,8 @@ var smp_pause: *const fn (*anyopaque) callconv(.c) bool = undefined;
 var smp_unload: *const fn (*anyopaque) callconv(.c) bool = undefined;
 var smp_eos: *const fn (*anyopaque) callconv(.c) bool = undefined;
 var smp_seek: *const fn (*anyopaque, [*:0]const u8) callconv(.c) bool = undefined;
+var smp_flush: *const fn (*anyopaque, [*:0]const u8) callconv(.c) bool = undefined;
+var smp_time_to_decode: *const fn (*anyopaque, [*:0]const u8) callconv(.c) bool = undefined;
 var smp_foreground: *const fn (*anyopaque) callconv(.c) bool = undefined;
 var smp_queue_length: *const fn (*anyopaque, *c_int) callconv(.c) bool = undefined;
 var smp_playtime: *const fn (*anyopaque) callconv(.c) i64 = undefined;
@@ -117,7 +113,7 @@ pub fn lastError() []const u8 {
 /// Load/Unload: its uMediaServer context is fixed at construction (every load
 /// reports the same `context` id), and a second Load on it comes up with its
 /// resources granted but its sinks never registered -- no sourceInfo, no
-/// picture. NDL constructs a fresh StarfishMediaAPIs per load too.
+/// picture.
 pub fn init(app_id: []const u8) !void {
     if (pipeline != null) return;
     if (symbols_loaded) {
@@ -137,11 +133,12 @@ pub fn init(app_id: []const u8) !void {
     smp_unload = try sym(lib, @TypeOf(smp_unload), "_ZN17StarfishMediaAPIs6UnloadEv");
     smp_eos = try sym(lib, @TypeOf(smp_eos), "_ZN17StarfishMediaAPIs7pushEOSEv");
     smp_seek = try sym(lib, @TypeOf(smp_seek), "_ZN17StarfishMediaAPIs4SeekEPKc");
+    smp_flush = try sym(lib, @TypeOf(smp_flush), "_ZN17StarfishMediaAPIs5flushEPKc");
+    smp_time_to_decode = try sym(lib, @TypeOf(smp_time_to_decode), "_ZN17StarfishMediaAPIs15setTimeToDecodeEPKc");
     smp_foreground = try sym(lib, @TypeOf(smp_foreground), "_ZN17StarfishMediaAPIs16notifyForegroundEv");
     smp_queue_length = try sym(lib, @TypeOf(smp_queue_length), "_ZN17StarfishMediaAPIs25getVideoRenderQueueLengthERi");
     smp_playtime = try sym(lib, @TypeOf(smp_playtime), "_ZN17StarfishMediaAPIs18getCurrentPlaytimeEv");
-    // NDL passes null here and the pipeline takes its identity from the load
-    // payload's appId instead.
+    // Null: the pipeline takes its identity from the load payload's appId.
     symbols_loaded = true;
     smp_ctor(&instance, null);
     pipeline = &instance;
@@ -151,10 +148,7 @@ var symbols_loaded = false;
 
 var json_buf: [2048]u8 = undefined;
 
-/// The payload is NDL's, captured off the wire and kept key for key. The two
-/// latency switches stay as NDL sets them: turning them off was tried against
-/// the real pipeline and changed nothing, so this keeps the configuration the
-/// TV is known to accept.
+/// Every key here is one libpf-1.0.so.1 parses on this firmware.
 fn buildPayload(buf: []u8, app_id: []const u8, window_id: []const u8, video: Video, audio: ?Audio) ![:0]u8 {
     var pcm_scratch: [192]u8 = undefined;
     const pcm = if (audio) |a| try std.fmt.bufPrint(
@@ -178,7 +172,7 @@ fn buildPayload(buf: []u8, app_id: []const u8, window_id: []const u8, video: Vid
         "\"contents\":{{\"provider\":\"jellyfin\",\"codec\":{{\"video\":\"{s}\"{s}}}," ++
         // pauseAtDecodeTime is false on purpose: with true and no
         // setTimeToDecode trigger, "decode until pts 0, then pause" is what
-        // the pipeline is being asked for. NDL sends true regardless.
+        // the pipeline is being asked for.
         "\"esInfo\":{{\"videoHeight\":{d},\"videoWidth\":{d},\"pauseAtDecodeTime\":false,\"ptsToDecode\":0{s}}}{s}}}," ++
         "\"bufferingCtrInfo\":{{\"preBufferByte\":0,\"qBufferLevelAudio\":0,\"qBufferLevelVideo\":0," ++
         "\"srcBufferLevelAudio\":{{\"minimum\":1,\"maximum\":1048576}}," ++
@@ -204,9 +198,8 @@ test "payload carries the keys libpf parses on this firmware" {
         .fps_num = 24000,
         .fps_den = 1001,
     }, .{ .sample_rate = .hz_48000, .channels = 2 });
-    // Every key here was checked against libpf-1.0.so.1's string table; the
-    // ones plx-native sends that this firmware does not know (needAudio,
-    // seperatedPTS, bufferMaxLevel) are deliberately absent.
+    // Checked against libpf-1.0.so.1's string table. needAudio, seperatedPTS
+    // and bufferMaxLevel are absent because this firmware does not parse them.
     for ([_][]const u8{
         "\"mediaTransportType\":\"BUFFERSTREAM\"",
         "\"audioSync\":true",
@@ -309,6 +302,31 @@ pub fn pause() bool {
 pub fn endOfStream() void {
     if (pipeline) |self| _ = smp_eos(self);
 }
+/// Drop what the pipeline has buffered and re-anchor it at `position`.
+///
+/// `audioFlush` (bool) and `offset` (int64) are the only keys
+/// `StarfishMediaAPIs::flush(const char *)` parses. It hands them to
+/// `CustomPipeline::flush(int, long long)`, which pushes a real
+/// FLUSH_START/FLUSH_STOP pair to both appsrcs -- the no-argument `flush()`
+/// sends neither and leaves the sink on the pre-seek segment.
+///
+/// Units are milliseconds, matching `Seek`.
+pub fn flush(position: i64) bool {
+    const self = pipeline orelse return false;
+    var text: [64]u8 = undefined;
+    const arg = std.fmt.bufPrintZ(&text, "{{\"audioFlush\":true,\"offset\":{d}}}", .{position}) catch return false;
+    return smp_flush(self, arg.ptr);
+}
+
+/// Tell the decoder where the buffers that follow begin. Wants the pipeline
+/// paused: libpf logs "Failed to setTimeToDecode current state: %s" otherwise.
+pub fn setTimeToDecode(position: i64) bool {
+    const self = pipeline orelse return false;
+    var text: [48]u8 = undefined;
+    const arg = std.fmt.bufPrintZ(&text, "{{\"position\":{d}}}", .{position}) catch return false;
+    return smp_time_to_decode(self, arg.ptr);
+}
+
 /// Seek takes **milliseconds** -- `Seek(const char *millis)` in the header.
 pub fn seek(position_ms: i64) bool {
     const self = pipeline orelse return false;
