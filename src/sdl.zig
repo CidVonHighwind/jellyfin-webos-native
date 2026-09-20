@@ -162,6 +162,7 @@ var SDL_GetWindowSize: *const fn (*Window, *c_int, *c_int) callconv(.c) void = u
 var SDL_RaiseWindow: *const fn (*Window) callconv(.c) void = undefined;
 var SDL_GL_GetDrawableSize: *const fn (*Window, *c_int, *c_int) callconv(.c) void = undefined;
 var SDL_webOSGetPanelResolution: ?*const fn (*c_int, *c_int) callconv(.c) c_int = null;
+var SDL_webOSCursorVisibility: ?*const fn (c_int) callconv(.c) c_int = null;
 var SDL_GetCurrentDisplayMode: *const fn (c_int, *DisplayMode) callconv(.c) c_int = undefined;
 var SDL_GL_SetAttribute: *const fn (c_int, c_int) callconv(.c) c_int = undefined;
 var SDL_GL_CreateContext: *const fn (*Window) callconv(.c) ?*GLContext = undefined;
@@ -277,6 +278,7 @@ pub fn init(app_id: [*:0]const u8, title: [*:0]const u8, w: u32, h: u32) !void {
     SDL_StopTextInput = try bind(@TypeOf(SDL_StopTextInput), "SDL_StopTextInput");
     SDL_SetTextInputRect = try bind(@TypeOf(SDL_SetTextInputRect), "SDL_SetTextInputRect");
     SDL_webOSGetPanelResolution = bindOpt(@TypeOf(SDL_webOSGetPanelResolution.?), "SDL_webOSGetPanelResolution");
+    SDL_webOSCursorVisibility = bindOpt(@TypeOf(SDL_webOSCursorVisibility.?), "SDL_webOSCursorVisibility");
     SDL_webOSCreateExportedWindow = bindOpt(@TypeOf(SDL_webOSCreateExportedWindow.?), "SDL_webOSCreateExportedWindow");
     SDL_webOSSetExportedWindow = bindOpt(@TypeOf(SDL_webOSSetExportedWindow.?), "SDL_webOSSetExportedWindow");
 
@@ -290,6 +292,10 @@ pub fn init(app_id: [*:0]const u8, title: [*:0]const u8, w: u32, h: u32) !void {
     _ = SDL_SetHint("SDL_WEBOS_REGISTER_APP", "true");
     // No exit dialog
     _ = SDL_SetHint("SDL_WEBOS_ACCESS_POLICY_KEYS_BACK", "true");
+    // How long the magic-remote pointer stays on screen once it stops moving.
+    // SAM starts an app with SDL_MRCU_TIMER=300000 in its environment -- five
+    // minutes, which is never -- and this hint is what sets that timer.
+    _ = SDL_SetHint("SDL_WEBOS_CURSOR_SLEEP_TIME", "1000");
     // This SDL reports its backend as `wayland` on the TV as well -- the webOS
     // support lives inside that backend rather than in a separate one, and
     // asking for a "webOS" driver by name only gets "webOS not available".
@@ -435,6 +441,14 @@ const keymap = [_]KeyMap{
 const scancode_cursor_show = 484;
 const scancode_cursor_hide = 485;
 
+var cursor_visible = true;
+fn hideCursor() void {
+    if (!cursor_visible) return;
+    const set_visible = SDL_webOSCursorVisibility orelse return;
+    _ = set_visible(0);
+    cursor_visible = false;
+}
+
 fn evdevFor(scancode: c_int) ?u32 {
     for (keymap) |entry| if (entry.scancode == scancode) return entry.evdev;
     return null;
@@ -513,8 +527,11 @@ fn translate(event: *const Event) void {
             const key = readKey(event, event.kind == ev_keydown);
             // Auto-repeat drives held-down navigation, so it is not filtered.
             switch (key.scancode) {
-                scancode_cursor_hide => on_event(.{ .pointer_leave = .{ .seat = 0 } }),
-                scancode_cursor_show => {},
+                scancode_cursor_hide => {
+                    cursor_visible = false;
+                    on_event(.{ .pointer_leave = .{ .seat = 0 } });
+                },
+                scancode_cursor_show => cursor_visible = true,
                 else => {
                     // JF_KEYLOG=1 shows every key SDL reports, which is the
                     // only way to learn what a TV remote actually sends.
@@ -522,8 +539,10 @@ fn translate(event: *const Event) void {
                         std.debug.print("sdl: key scancode={d} sym=0x{x} down={} repeat={d}\n", .{
                             key.scancode, key.sym, event.kind == ev_keydown, key.repeat,
                         });
-                    if (evdevFor(key.scancode)) |code|
+                    if (evdevFor(key.scancode)) |code| {
+                        if (event.kind == ev_keydown) hideCursor();
                         on_event(.{ .key = .{ .seat = 0, .code = code, .pressed = event.kind == ev_keydown } });
+                    }
                 },
             }
         },
@@ -535,6 +554,7 @@ fn translate(event: *const Event) void {
         },
         ev_mousemotion => {
             const motion: *const MouseMotionEvent = @ptrCast(event);
+            cursor_visible = true;
             on_event(.{ .pointer_motion = .{ .seat = 0, .x = pointerX(motion.x), .y = pointerY(motion.y) } });
         },
         ev_mousebuttondown, ev_mousebuttonup => {
