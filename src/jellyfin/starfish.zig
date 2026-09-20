@@ -46,7 +46,17 @@ pub const SampleRate = enum(u8) {
     }
 };
 
-pub const Video = struct { width: i32, height: i32, codec: []const u8 };
+pub const Video = struct {
+    width: i32,
+    height: i32,
+    codec: []const u8,
+    /// Frame rate as value/scale, the pipeline's own convention
+    /// (PF_EXT_ES_VIDEO_FRAMERATE_VALUE / _SCALE). Zero leaves the pair out,
+    /// which is what NDL does -- the pipeline then believes adaptiveStreaming's
+    /// maxFrameRate, which is not the content's rate.
+    fps_num: i32 = 0,
+    fps_den: i32 = 0,
+};
 pub const Audio = struct { sample_rate: SampleRate, channels: u8 };
 pub const Status = enum { ok, buffer_full, failed };
 
@@ -73,6 +83,7 @@ var pipeline: ?*anyopaque = null;
 /// rather than the observed size.
 var instance: [8192]u8 align(16) = @splat(0);
 var error_text: [160]u8 = @splat(0);
+var loaded = false;
 
 var smp_ctor: *const fn (*anyopaque, ?[*:0]const u8) callconv(.c) void = undefined;
 var smp_dtor: *const fn (*anyopaque) callconv(.c) void = undefined;
@@ -84,8 +95,8 @@ var smp_unload: *const fn (*anyopaque) callconv(.c) bool = undefined;
 var smp_eos: *const fn (*anyopaque) callconv(.c) bool = undefined;
 var smp_seek: *const fn (*anyopaque, [*:0]const u8) callconv(.c) bool = undefined;
 var smp_foreground: *const fn (*anyopaque) callconv(.c) bool = undefined;
-var smp_audio_buffer: *const fn (*anyopaque, *c_int, *c_int) callconv(.c) bool = undefined;
 var smp_queue_length: *const fn (*anyopaque, *c_int) callconv(.c) bool = undefined;
+var smp_playtime: *const fn (*anyopaque) callconv(.c) i64 = undefined;
 var cpp_delete: *const fn (*anyopaque) callconv(.c) void = undefined;
 
 fn sym(handle: ?*anyopaque, comptime T: type, name: [*:0]const u8) !T {
@@ -102,8 +113,18 @@ pub fn lastError() []const u8 {
     return std.mem.sliceTo(&error_text, 0);
 }
 
+/// One session's worth of pipeline. The object is **not** reusable across
+/// Load/Unload: its uMediaServer context is fixed at construction (every load
+/// reports the same `context` id), and a second Load on it comes up with its
+/// resources granted but its sinks never registered -- no sourceInfo, no
+/// picture. NDL constructs a fresh StarfishMediaAPIs per load too.
 pub fn init(app_id: []const u8) !void {
     if (pipeline != null) return;
+    if (symbols_loaded) {
+        smp_ctor(&instance, null);
+        pipeline = &instance;
+        return;
+    }
     lib = c.dlopen("libplayerAPIs.so.1", .{ .NOW = true }) orelse return error.NoPlayerApis;
     const stdcpp = c.dlopen("libstdc++.so.6", .{ .NOW = true }) orelse return error.NoStdCpp;
     cpp_delete = try sym(stdcpp, @TypeOf(cpp_delete), "_ZdlPv");
@@ -117,16 +138,18 @@ pub fn init(app_id: []const u8) !void {
     smp_eos = try sym(lib, @TypeOf(smp_eos), "_ZN17StarfishMediaAPIs7pushEOSEv");
     smp_seek = try sym(lib, @TypeOf(smp_seek), "_ZN17StarfishMediaAPIs4SeekEPKc");
     smp_foreground = try sym(lib, @TypeOf(smp_foreground), "_ZN17StarfishMediaAPIs16notifyForegroundEv");
-    smp_audio_buffer = try sym(lib, @TypeOf(smp_audio_buffer), "_ZN17StarfishMediaAPIs18getAudioBufferSizeERiS0_");
     smp_queue_length = try sym(lib, @TypeOf(smp_queue_length), "_ZN17StarfishMediaAPIs25getVideoRenderQueueLengthERi");
+    smp_playtime = try sym(lib, @TypeOf(smp_playtime), "_ZN17StarfishMediaAPIs18getCurrentPlaytimeEv");
     // NDL passes null here and the pipeline takes its identity from the load
     // payload's appId instead.
+    symbols_loaded = true;
     smp_ctor(&instance, null);
     pipeline = &instance;
     _ = app_id;
 }
+var symbols_loaded = false;
 
-var json_buf: [1024]u8 = undefined;
+var json_buf: [2048]u8 = undefined;
 
 /// The payload is NDL's, captured off the wire and kept key for key. The two
 /// latency switches stay as NDL sets them: turning them off was tried against
@@ -136,37 +159,93 @@ fn buildPayload(buf: []u8, app_id: []const u8, window_id: []const u8, video: Vid
     var pcm_scratch: [192]u8 = undefined;
     const pcm = if (audio) |a| try std.fmt.bufPrint(
         &pcm_scratch,
-        ",\"pcmInfo\":{{\"sampleRate\":{d},\"channelMode\":\"{s}\",\"format\":\"S16LE\",\"layout\":\"interleaved\"}}",
+        ",\"pcmInfo\":{{\"sampleRate\":{d},\"channelMode\":\"{s}\",\"format\":\"S16LE\",\"layout\":\"interleaved\",\"bitsPerSample\":16}}",
         .{ @intFromEnum(a.sample_rate), if (a.channels == 1) "mono" else "stereo" },
     ) else "";
-    return std.fmt.bufPrintZ(buf, "{{\"args\":[{{\"mediaTransportType\":\"DIRECTMEDIA-ES-PLAYER\",\"option\":{{" ++
-        "\"appId\":\"{s}\",\"lowDelayMode\":true," ++
-        "\"externalStreamingInfo\":{{\"contents\":{{" ++
-        "\"codec\":{{\"video\":\"{s}\"{s}}}," ++
-        "\"esInfo\":{{\"videoHeight\":{d},\"videoWidth\":{d},\"pauseAtDecodeTime\":true,\"ptsToDecode\":0}}{s}}}}}," ++
+    var fps_scratch: [64]u8 = undefined;
+    const fps = if (video.fps_num > 0 and video.fps_den > 0) try std.fmt.bufPrint(
+        &fps_scratch,
+        ",\"videoFpsValue\":{d},\"videoFpsScale\":{d}",
+        .{ video.fps_num, video.fps_den },
+    ) else "";
+    return std.fmt.bufPrintZ(buf, "{{\"args\":[{{\"mediaTransportType\":\"BUFFERSTREAM\",\"option\":{{" ++
+        "\"appId\":\"{s}\",\"lowDelayMode\":false,\"queryPosition\":true,\"restartStreaming\":false," ++
+        "\"externalStreamingInfo\":{{" ++
+        // audioSync makes the audio sink the master clock, which is what a
+        // player wants; the two streamQuality keys turn on the pipeline's own
+        // dropped/presented frame counters (callback types 46 and 47).
+        "\"audioSync\":{s},\"streamQualityInfo\":true,\"streamQualityInfoNonFlushable\":true," ++
+        "\"contents\":{{\"provider\":\"jellyfin\",\"codec\":{{\"video\":\"{s}\"{s}}}," ++
+        // pauseAtDecodeTime is false on purpose: with true and no
+        // setTimeToDecode trigger, "decode until pts 0, then pause" is what
+        // the pipeline is being asked for. NDL sends true regardless.
+        "\"esInfo\":{{\"videoHeight\":{d},\"videoWidth\":{d},\"pauseAtDecodeTime\":false,\"ptsToDecode\":0{s}}}{s}}}," ++
+        "\"bufferingCtrInfo\":{{\"preBufferByte\":0,\"qBufferLevelAudio\":0,\"qBufferLevelVideo\":0," ++
+        "\"srcBufferLevelAudio\":{{\"minimum\":1,\"maximum\":1048576}}," ++
+        "\"srcBufferLevelVideo\":{{\"minimum\":1,\"maximum\":8388608}}}}}}," ++
+        "\"transmission\":{{\"contentsType\":\"LIVE\"}}," ++
         "\"adaptiveStreaming\":{{\"maxHeight\":{d},\"maxFrameRate\":120,\"maxWidth\":{d}}}," ++
-        "\"windowId\":\"{s}\",\"videoInfo\":{{\"isGameMode\":true}}}}}}]}}", .{
-        app_id,       video.codec, if (audio != null) ",\"audio\":\"PCM\"" else "",
-        video.height, video.width, pcm,
-        video.height, video.width, window_id,
+        "\"windowId\":\"{s}\",\"videoInfo\":{{\"isGameMode\":false}}}}}}]}}", .{
+        app_id,       if (audio != null) "true" else "false",
+        video.codec,  if (audio != null) ",\"audio\":\"PCM\"" else "",
+        video.height, video.width,
+        fps,          pcm,
+        video.height, video.width,
+        window_id,
     });
 }
 
-test "payload matches what NDL sends" {
-    var buf: [1024]u8 = undefined;
-    const captured =
-        "{\"args\":[{\"mediaTransportType\":\"DIRECTMEDIA-ES-PLAYER\",\"option\":{\"appId\":\"dev.hookedbehemoth.jellyfin\"," ++
-        "\"lowDelayMode\":true,\"externalStreamingInfo\":{\"contents\":{\"codec\":{\"video\":\"H265\",\"audio\":\"PCM\"}," ++
-        "\"esInfo\":{\"videoHeight\":1080,\"videoWidth\":1920,\"pauseAtDecodeTime\":true,\"ptsToDecode\":0}," ++
-        "\"pcmInfo\":{\"sampleRate\":1,\"channelMode\":\"stereo\",\"format\":\"S16LE\",\"layout\":\"interleaved\"}}}," ++
-        "\"adaptiveStreaming\":{\"maxHeight\":1080,\"maxFrameRate\":120,\"maxWidth\":1920}," ++
-        "\"windowId\":\"_Window_Id_66\",\"videoInfo\":{\"isGameMode\":true}}}]}";
+test "payload carries the keys libpf parses on this firmware" {
+    var buf: [2048]u8 = undefined;
     const built = try buildPayload(&buf, "dev.hookedbehemoth.jellyfin", "_Window_Id_66", .{
         .width = 1920,
         .height = 1080,
         .codec = "H265",
+        .fps_num = 24000,
+        .fps_den = 1001,
     }, .{ .sample_rate = .hz_48000, .channels = 2 });
-    try std.testing.expectEqualStrings(captured, built);
+    // Every key here was checked against libpf-1.0.so.1's string table; the
+    // ones plx-native sends that this firmware does not know (needAudio,
+    // seperatedPTS, bufferMaxLevel) are deliberately absent.
+    for ([_][]const u8{
+        "\"mediaTransportType\":\"BUFFERSTREAM\"",
+        "\"audioSync\":true",
+        "\"streamQualityInfo\":true",
+        "\"streamQualityInfoNonFlushable\":true",
+        "\"videoFpsValue\":24000,\"videoFpsScale\":1001",
+        "\"pauseAtDecodeTime\":false",
+        "\"bitsPerSample\":16",
+        "\"srcBufferLevelVideo\":{\"minimum\":1,\"maximum\":8388608}",
+        "\"queryPosition\":true",
+        "\"windowId\":\"_Window_Id_66\"",
+    }) |needle| {
+        std.testing.expect(std.mem.indexOf(u8, built, needle) != null) catch |err| {
+            std.debug.print("missing {s}\nin {s}\n", .{ needle, built });
+            return err;
+        };
+    }
+    for ([_][]const u8{ "needAudio", "seperatedPTS", "bufferMaxLevel" }) |absent|
+        try std.testing.expect(std.mem.indexOf(u8, built, absent) == null);
+}
+
+test "payload is valid JSON" {
+    var buf: [2048]u8 = undefined;
+    const built = try buildPayload(&buf, "dev.hookedbehemoth.jellyfin", "_Window_Id_89", .{
+        .width = 1920,
+        .height = 1080,
+        .codec = "H265",
+        .fps_num = 24000,
+        .fps_den = 1001,
+    }, .{ .sample_rate = .hz_48000, .channels = 2 });
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, built, .{});
+    defer parsed.deinit();
+}
+
+test "no audio means no audio block" {
+    var buf: [2048]u8 = undefined;
+    const built = try buildPayload(&buf, "app", "_Window_Id_1", .{ .width = 1280, .height = 720, .codec = "H264" }, null);
+    try std.testing.expect(std.mem.indexOf(u8, built, "pcmInfo") == null);
+    try std.testing.expect(std.mem.indexOf(u8, built, "\"audioSync\":false") != null);
 }
 
 pub fn load(app_id: []const u8, window_id: []const u8, video: Video, audio: ?Audio, on_event: LoadCallback) !void {
@@ -176,6 +255,7 @@ pub fn load(app_id: []const u8, window_id: []const u8, video: Video, audio: ?Aud
         setError("Starfish rejected the load payload");
         return error.LoadFailed;
     }
+    loaded = true;
     _ = smp_foreground(self);
 }
 
@@ -204,20 +284,18 @@ pub fn feedAudio(bytes: []const u8, pts: i64) Status {
     return feed(2, bytes, pts);
 }
 
-/// Bytes the audio sink can still take, as NDL computes it: total minus used.
-pub fn audioRoom() ?c_int {
-    const self = pipeline orelse return null;
-    var total: c_int = 0;
-    var used: c_int = 0;
-    if (!smp_audio_buffer(self, &total, &used)) return null;
-    return total - used;
-}
-
 pub fn renderQueueLength() ?c_int {
     const self = pipeline orelse return null;
     var frames: c_int = 0;
     if (!smp_queue_length(self, &frames)) return null;
     return frames;
+}
+
+/// Where the pipeline says playback actually is. Units are not documented;
+/// the first run prints it next to a known feed timestamp.
+pub fn playtime() i64 {
+    const self = pipeline orelse return 0;
+    return smp_playtime(self);
 }
 
 pub fn play() bool {
@@ -239,12 +317,19 @@ pub fn seek(position_ms: i64) bool {
     return smp_seek(self, arg.ptr);
 }
 pub fn unload() void {
-    if (pipeline) |self| _ = smp_unload(self);
+    if (!loaded) return;
+    loaded = false;
+    if (pipeline) |self| {
+        if (!smp_unload(self)) std.debug.print("SMP Unload failed\n", .{});
+    }
 }
+/// Tear the session down completely: Unload, then destroy the object, so the
+/// next init() builds a pipeline with a context of its own.
 pub fn deinit() void {
     if (pipeline) |self| {
-        _ = smp_unload(self);
+        unload();
         smp_dtor(self);
         pipeline = null;
+        instance = @splat(0);
     }
 }

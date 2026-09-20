@@ -143,6 +143,19 @@ void jf_demux_close(void *opaque) {
 }
 
 int jf_demux_stream_count(void *opaque) { return ((struct jf_demux *)opaque)->format->nb_streams; }
+
+/// Frame rate of a video stream as a rational. The pipeline wants to be told
+/// this; left out, it assumes whatever the load payload's maxFrameRate says.
+int jf_demux_video_fps(void *opaque, int index, int *num, int *den) {
+    struct jf_demux *d = opaque;
+    if (index < 0 || index >= (int)d->format->nb_streams) return 0;
+    AVStream *st = d->format->streams[index];
+    AVRational fps = st->avg_frame_rate.num ? st->avg_frame_rate : st->r_frame_rate;
+    if (fps.num <= 0 || fps.den <= 0) return 0;
+    *num = fps.num;
+    *den = fps.den;
+    return 1;
+}
 int jf_demux_stream(void *opaque, int index, int *kind, int *codec, int *width, int *height) {
     struct jf_demux *d = opaque;
     if (index < 0 || index >= (int)d->format->nb_streams) return 0;

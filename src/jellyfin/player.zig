@@ -11,6 +11,7 @@ extern fn jf_demux_close(demux: *anyopaque) void;
 extern fn jf_demux_stream_count(demux: *anyopaque) c_int;
 extern fn jf_demux_stream(demux: *anyopaque, index: c_int, kind: *c_int, codec: *c_int, width: *c_int, height: *c_int) c_int;
 extern fn jf_demux_next(demux: *anyopaque, data: *?[*]u8, size: *c_int, stream: *c_int, pts: *i64) c_int;
+extern fn jf_demux_video_fps(demux: *anyopaque, index: c_int, num: *c_int, den: *c_int) c_int;
 extern fn jf_demux_audio_open(demux: *anyopaque, index: c_int, rate: *c_int) c_int;
 extern fn jf_demux_audio_decode(demux: *anyopaque, out: *?[*]u8, size: *c_int) c_int;
 
@@ -115,19 +116,25 @@ fn feed() void {
     }
     read_video = video_stream;
     read_audio = audio_stream;
+    var fps_num: c_int = 0;
+    var fps_den: c_int = 0;
+    _ = jf_demux_video_fps(demux, video_stream, &fps_num, &fps_den);
     smp.load(app_id, std.mem.sliceTo(window_id, 0), .{
         .width = width,
         .height = height,
         .codec = codecName(videoType(codec).?),
+        .fps_num = fps_num,
+        .fps_den = fps_den,
     }, audio, onLoad) catch {
         setError(smp.lastError());
         running.store(false, .release);
         return;
     };
-    defer smp.unload();
-    // Nothing else starts the pipeline: NDL never called Play either, which is
-    // why it could not pause or resume.
-    _ = smp.play();
+    defer smp.deinit(); // not just Unload: the object does not survive a reload
+    // Play before feeding: a re-loaded pipeline does not necessarily accept
+    // buffers while it is merely loaded. The cushion comes from priming (feed
+    // flat out until prime_ns is in), not from withholding this.
+    if (!smp.play()) std.debug.print("SMP Play failed: {s}\n", .{smp.lastError()});
     playback_state.store(@intFromEnum(State.playing), .release);
     // The pipeline presents what it is given as it arrives, so we hold the
     // clock. Reading ahead happens on its own thread: a stall in av_read_frame
@@ -151,10 +158,16 @@ fn feed() void {
     while (video_queue.pop()) |chunk| {
         defer std.heap.c_allocator.free(chunk.bytes);
         const pts = pace(chunk.pts);
-        if (smp.feedVideo(chunk.bytes, pts) == .failed) {
+        if (!feedRetrying(.video, chunk.bytes, pts)) {
             setError(smp.lastError());
             playback_state.store(@intFromEnum(State.failed), .release);
             break;
+        }
+        // A second of video is in: start the clock, and from here the pacing
+        // keeps that same second as the cushion.
+        if (!primed.load(.acquire) and pts >= prime_ns) {
+            clock_ns = nowNs();
+            primed.store(true, .release);
         }
     }
     running.store(false, .release);
@@ -166,11 +179,9 @@ fn feedAudio() void {
     while (audio_queue.pop()) |chunk| {
         defer std.heap.c_allocator.free(chunk.bytes);
         const pts = pace(chunk.pts);
-        // PCM is ~176 KB/s, so the audio sink does fill up. A rejected chunk
-        // costs a gap in the sound, not the whole playback.
-        waitForAudioRoom(@intCast(chunk.bytes.len));
-        if (smp.feedAudio(chunk.bytes, pts) == .failed)
-            std.log.debug("audio dropped: {s}", .{smp.lastError()});
+        // A chunk the sink will not take costs a gap in the sound, not the
+        // whole playback, so a lost race here is not fatal.
+        _ = feedRetrying(.audio, chunk.bytes, pts);
     }
 }
 
@@ -190,6 +201,16 @@ fn read(demux: *anyopaque) void {
             if (jf_demux_audio_decode(demux, &pcm, &pcm_size) == 0) continue;
             bytes = (pcm orelse continue)[0..@intCast(pcm_size)];
         }
+        // The clock origin is taken here, not in the feed threads: the reader
+        // sees packets in container order, so the first one is genuinely the
+        // earliest. Racing two feed threads for it let the loser go negative,
+        // and a negative pts reaches libpf as an enormous unsigned one -- with
+        // audioSync the audio sink is the master clock, so that wedges the
+        // whole pipeline with every buffer still reported accepted.
+        if (!clock_ready.load(.acquire)) {
+            clock_pts = pts;
+            clock_ready.store(true, .release);
+        }
         // Both buffers belong to the demuxer and die on the next read.
         const copy = std.heap.c_allocator.dupe(u8, bytes) catch break;
         const target = if (audio) &audio_queue else &video_queue;
@@ -200,34 +221,33 @@ fn read(demux: *anyopaque) void {
 }
 
 // One clock for both feed threads. Plain values, published by whichever
-// stream is fed first: 64-bit atomics do not exist on this target, and the
-// ready flag orders the handoff.
+// stream is fed first: 64-bit atomics do not exist on this target, so a flag
+// with release/acquire ordering hands them over instead.
 var clock_pts: i64 = 0;
 var clock_ns: u64 = 0;
-var clock_claimed = std.atomic.Value(bool).init(false);
 var clock_ready = std.atomic.Value(bool).init(false);
+/// False until the pipeline has a cushion and Play() has been called. Until
+/// then both lanes feed flat out: starting an empty pipeline gives you one
+/// frame and then a stall, which is what the first stream after launch did.
+var primed = std.atomic.Value(bool).init(false);
 
 /// Sleep until this packet is due, and return its stream-relative timestamp.
 fn pace(packet_pts: i64) i64 {
-    if (clock_claimed.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
-        clock_pts = packet_pts;
-        clock_ns = nowNs();
-        clock_ready.store(true, .release);
-    }
-    while (!clock_ready.load(.acquire) and running.load(.acquire)) sleepNs(std.time.ns_per_ms);
     // Stream-relative, not container-absolute: we call Play(), so the pipeline
-    // has a base time and TS timestamps start wherever they like.
-    const pts = packet_pts - clock_pts;
-    const due = clock_ns + @as(u64, @intCast(@max(0, pts)));
-    const now = nowNs() + feed_lead_ns;
+    // has a base time and TS timestamps start wherever they like. Clamped
+    // because a stream can still hand us a packet older than its first one.
+    const pts = @max(0, packet_pts - clock_pts);
+    if (!primed.load(.acquire)) return pts; // priming: as fast as it will take
+    const due = clock_ns + @as(u64, @intCast(pts));
+    const now = nowNs() + prime_ns;
     // JF_NOPACE=1 feeds flat out: correct speed then means the pipeline is
     // clocking on the PTS itself, and this pacing can go.
-    if (due > now and c.getenv("JF_NOPACE") == null) sleepNs(due - now);
+    if (due > now and c.getenv("JF_NOPACE") == null) sleepPaced(due - now);
     return pts;
 }
 
-/// How far ahead of the clock a packet is handed to the pipeline.
-const feed_lead_ns = 60 * std.time.ns_per_ms;
+/// Content buffered before Play(), and the cushion kept afterwards.
+const prime_ns = 1000 * std.time.ns_per_ms;
 
 /// Demuxed-and-ready data waiting for its presentation time. One producer
 /// (the reader thread), one consumer (the feed loop), so plain atomics do;
@@ -298,14 +318,42 @@ fn nowNs() u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
-/// Block until the audio sink can take this many bytes. Bounded, so a stalled
-/// pipeline cannot pin the feed thread.
-fn waitForAudioRoom(need: c_int) void {
-    var spins: u32 = 0;
-    while (running.load(.acquire) and spins < 400) : (spins += 1) {
-        const room = smp.audioRoom() orelse return; // no reading: feed anyway
-        if (room >= need) return;
-        sleepNs(5 * std.time.ns_per_ms);
+/// Feed one chunk, waiting out backpressure. A full pipeline answers
+/// BufferFull and keeps nothing: the chunk has to be offered again, which is
+/// the backpressure path, not a reason to drop the frame.
+fn feedRetrying(lane: Lane, bytes: []const u8, pts: i64) bool {
+    var tries: u32 = 0;
+    while (running.load(.acquire)) : (tries += 1) {
+        const status = switch (lane) {
+            .video => smp.feedVideo(bytes, pts),
+            .audio => smp.feedAudio(bytes, pts),
+        };
+        switch (status) {
+            .ok => return true,
+            .failed => {
+                std.debug.print("{s} feed rejected at pts={d}ms: {s}\n", .{
+                    @tagName(lane), @divTrunc(pts, std.time.ns_per_ms), smp.lastError(),
+                });
+                return false;
+            },
+            .buffer_full => {
+                if (tries > 600) return false; // 3s: something is wedged
+                sleepNs(5 * std.time.ns_per_ms);
+            },
+        }
+    }
+    return false;
+}
+const Lane = enum(u8) { video, audio };
+
+/// A pacing sleep that a stop can cut short: the session teardown joins these
+/// threads, and a whole second of cushion is a whole second of waiting.
+fn sleepPaced(ns: u64) void {
+    var left = ns;
+    while (left > 0 and running.load(.acquire)) {
+        const slice = @min(left, 20 * std.time.ns_per_ms);
+        sleepNs(slice);
+        left -= slice;
     }
 }
 
@@ -314,8 +362,17 @@ fn sleepNs(ns: u64) void {
     _ = linux.nanosleep(&ts, null);
 }
 
+var session: ?std.Thread = null;
+
 pub fn play(stream_uri: []const u8, width: u32, height: u32) !void {
     if (running.load(.acquire)) return error.AlreadyPlaying;
+    // The previous session unloads the pipeline on its way out. Detaching it
+    // meant that Unload could land after the next Load and take the new stream
+    // down with it, so wait for it here.
+    if (session) |t| {
+        t.join();
+        session = null;
+    }
     @memset(&error_text, 0);
     playback_state.store(@intFromEnum(State.loading), .release);
     const rect = [4]i32{ 0, 0, @intCast(width), @intCast(height) };
@@ -326,11 +383,10 @@ pub fn play(stream_uri: []const u8, width: u32, height: u32) !void {
     uri[stream_uri.len] = 0;
     video_queue.reset();
     audio_queue.reset();
-    clock_claimed.store(false, .release);
     clock_ready.store(false, .release);
+    primed.store(false, .release);
     running.store(true, .release);
-    const thread = try std.Thread.spawn(.{}, feed, .{});
-    thread.detach();
+    session = try std.Thread.spawn(.{}, feed, .{});
 }
 pub fn pause() void {
     _ = smp.pause();
@@ -344,5 +400,9 @@ pub fn stop() void {
 }
 pub fn deinit() void {
     stop();
+    if (session) |t| {
+        t.join();
+        session = null;
+    }
     smp.deinit();
 }

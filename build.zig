@@ -160,6 +160,10 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
+    ui_tests.root_module.addCSourceFile(.{
+        .file = b.path("src/jellyfin/demux.c"),
+        .flags = &.{"-I/usr/include/ffmpeg4.4"},
+    });
     for (apps) |app| if (std.mem.eql(u8, app.name, "jellyfin")) addAssets(b, ui_tests, app);
     addUiDeps(b, ui_tests.root_module, b.resolveTargetQuery(.{}), optimize);
     b.step("test", "Run Jellyfin navigation, artwork and shared geometry tests on the host").dependOn(&b.addRunArtifact(ui_tests).step);
