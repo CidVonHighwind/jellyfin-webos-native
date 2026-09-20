@@ -158,6 +158,7 @@ var SDL_GL_GetProcAddress: *const fn ([*:0]const u8) callconv(.c) ?*anyopaque = 
 var SDL_GL_SwapWindow: *const fn (*Window) callconv(.c) void = undefined;
 var SDL_GL_SetSwapInterval: *const fn (c_int) callconv(.c) c_int = undefined;
 var SDL_PollEvent: *const fn (*Event) callconv(.c) c_int = undefined;
+var SDL_PushEvent: *const fn (*Event) callconv(.c) c_int = undefined;
 var SDL_StartTextInput: *const fn () callconv(.c) void = undefined;
 var SDL_StopTextInput: *const fn () callconv(.c) void = undefined;
 var SDL_SetTextInputRect: *const fn (*Rect) callconv(.c) void = undefined;
@@ -246,6 +247,7 @@ pub fn init(app_id: [*:0]const u8, title: [*:0]const u8, w: u32, h: u32) !void {
     SDL_GL_SwapWindow = try bind(@TypeOf(SDL_GL_SwapWindow), "SDL_GL_SwapWindow");
     SDL_GL_SetSwapInterval = try bind(@TypeOf(SDL_GL_SetSwapInterval), "SDL_GL_SetSwapInterval");
     SDL_PollEvent = try bind(@TypeOf(SDL_PollEvent), "SDL_PollEvent");
+    SDL_PushEvent = try bind(@TypeOf(SDL_PushEvent), "SDL_PushEvent");
     SDL_StartTextInput = try bind(@TypeOf(SDL_StartTextInput), "SDL_StartTextInput");
     SDL_StopTextInput = try bind(@TypeOf(SDL_StopTextInput), "SDL_StopTextInput");
     SDL_SetTextInputRect = try bind(@TypeOf(SDL_SetTextInputRect), "SDL_SetTextInputRect");
@@ -261,15 +263,8 @@ pub fn init(app_id: [*:0]const u8, title: [*:0]const u8, w: u32, h: u32) !void {
     // arrives as scancode 1. Whatever SAM set wins.
     _ = setenv("APPID", app_id, 0);
     _ = SDL_SetHint("SDL_WEBOS_REGISTER_APP", "true");
-    // SDL installs SIGINT/SIGTERM handlers that turn the signal into SDL_QUIT.
-    // SAM sends a native app SIGTERM when it does not complete the webOS
-    // lifecycle handshake, so with those handlers in place the app shuts
-    // itself down a second or two after the window appears.
-    _ = SDL_SetHint("SDL_NO_SIGNAL_HANDLERS", "1");
-    // The webOS backend turns this into the surface's _WEBOS_ACCESS_POLICY_KEYS_BACK
-    // property when it creates the window, so the starting value has to be set
-    // before then; `setBackHandled` only toggles it afterwards.
-    _ = SDL_SetHint("SDL_WEBOS_ACCESS_POLICY_KEYS_BACK", "false");
+    // No exit dialog
+    _ = SDL_SetHint("SDL_WEBOS_ACCESS_POLICY_KEYS_BACK", "true");
     // This SDL reports its backend as `wayland` on the TV as well -- the webOS
     // support lives inside that backend rather than in a separate one, and
     // asking for a "webOS" driver by name only gets "webOS not available".
@@ -373,15 +368,6 @@ pub fn deinit() void {
     if (lib != null) SDL_Quit();
 }
 
-/// Claim Back while the app can navigate or dismiss an editor. Root screens
-/// release it to webOS, which then opens the launcher strip instead.
-var handles_back = false;
-pub fn setBackHandled(handled: bool) void {
-    if (handles_back == handled or lib == null) return;
-    handles_back = handled;
-    _ = SDL_SetHint("SDL_WEBOS_ACCESS_POLICY_KEYS_BACK", if (handled) "true" else "false");
-}
-
 // ------------------------------------------------------------- key mapping
 //
 // SDL reports USB-HID scancodes; the app speaks evdev. Only the keys it acts
@@ -427,6 +413,18 @@ fn evdevFor(scancode: c_int) ?u32 {
 }
 
 // ------------------------------------------------------------- event pump
+
+/// Ask the main loop to stop, from any thread. SDL_PushEvent is the one part
+/// of SDL safe to call off the main thread, which is what lets the webOS
+/// lifecycle callback (src/luna.zig) end the app.
+pub fn postQuit() void {
+    if (lib == null) return;
+    var event: Event = undefined;
+    const bytes: [*]u8 = @ptrCast(&event);
+    @memset(bytes[0..@sizeOf(Event)], 0);
+    event.kind = ev_quit;
+    _ = SDL_PushEvent(&event);
+}
 
 /// Drain SDL's queue into the app's handler. Returns false once the app should
 /// stop, which is what the main loop runs on.

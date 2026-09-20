@@ -7,5 +7,6 @@
   "title": "APP",
   "icon": "icon.png",
   "bgColor": "#000000",
-  "nativeLifeCycleInterfaceVersion": 2
+  "nativeLifeCycleInterfaceVersion": 2,
+  "noSplashOnLaunch": true
 }

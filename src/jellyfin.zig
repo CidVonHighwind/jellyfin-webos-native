@@ -18,6 +18,7 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const gl = @import("gl.zig");
 const wl = @import("sdl.zig");
+const luna = @import("luna.zig");
 const loom = @import("loom/loom.zig");
 const UiRenderer = @import("ui_renderer.zig").Renderer;
 const api = @import("jellyfin/api.zig");
@@ -1268,7 +1269,6 @@ fn moveCursor(x: wl.Fixed, y: wl.Fixed) void {
 }
 
 fn onEvent(event: wl.AppEvent) void {
-    defer syncBackHandling();
     switch (event) {
         .key => |e| onKey(e.code, e.pressed),
         .text_commit => |text| appendText(text),
@@ -1302,14 +1302,6 @@ fn onEvent(event: wl.AppEvent) void {
         .close => wl.running = false,
         else => {},
     }
-}
-
-fn syncBackHandling() void {
-    wl.setBackHandled(handlesBack());
-}
-
-fn handlesBack() bool {
-    return active_field != .none or (screen != .server and screen != .home);
 }
 
 fn hovered(rect: loom.Rect) bool {
@@ -1803,7 +1795,6 @@ fn drawWrapped(ctx: *loom.Context, rect: loom.Rect, text: []const u8, size: f32)
 }
 
 fn buildUi(ctx: *loom.Context) void {
-    defer syncBackHandling();
     const width: f32 = @floatFromInt(gl.width);
     const height: f32 = @floatFromInt(gl.height);
     const scale = @min(width / 1920.0, height / 1080.0);
@@ -1953,6 +1944,9 @@ pub fn main(init: std.process.Init) !void {
     const appid = std.c.getenv("APPID") orelse @as([*:0]const u8, "dev.hookedbehemoth.jellyfin");
     try wl.init(appid, "Jellyfin", 0, 0);
     defer wl.deinit();
+    // How the TV asks the app to close. Absent off-device, where nothing asks.
+    luna.registerLifecycle(wl.postQuit) catch |err| std.debug.print("no webOS lifecycle: {s}\n", .{@errorName(err)});
+    defer luna.deinit();
     glClearColor = gl.proc(@TypeOf(glClearColor), "glClearColor");
     glClear = gl.proc(@TypeOf(glClear), "glClear");
     glViewport = gl.proc(@TypeOf(glViewport), "glViewport");
@@ -2025,9 +2019,10 @@ pub fn main(init: std.process.Init) !void {
 
 test {
     _ = @import("jellyfin/starfish.zig");
+    _ = @import("luna.zig");
 }
 
-test "Back belongs to the OS only on unedited root screens" {
+test "Back navigates out of a screen and quits from a root one" {
     defer {
         screen = .server;
         active_field = .none;
@@ -2035,36 +2030,45 @@ test "Back belongs to the OS only on unedited root screens" {
         wl.running = true;
         depth = 0;
     }
-    active_field = .none;
-    inline for (std.meta.tags(Screen)) |current| {
-        screen = current;
-        try std.testing.expectEqual(current != .server and current != .home, handlesBack());
-    }
+    // 412 is only Back on the TV.
+    wl.on_webos = true;
+    // Editing anywhere: Back dismisses the editor and stays put.
     screen = .server;
     active_field = .url;
-    try std.testing.expect(handlesBack());
-    active_field = .none;
-    wl.on_webos = true;
+    onKey(412, true);
+    try std.testing.expectEqual(Screen.server, screen);
+    try std.testing.expectEqual(EditField.none, active_field);
+    try std.testing.expect(wl.running);
+
+    // The sign-in screens unwind towards the server list.
     screen = .quick;
     onKey(412, true);
     try std.testing.expectEqual(Screen.auth, screen);
-    try std.testing.expect(handlesBack());
-    onKey(412, false);
+    onKey(412, false); // a release is not a press
     try std.testing.expectEqual(Screen.auth, screen);
     onKey(412, true);
     try std.testing.expectEqual(Screen.server, screen);
-    try std.testing.expect(!handlesBack());
+    try std.testing.expect(wl.running);
+
+    // A pushed screen pops back to what was under it.
     screen = .home;
     push();
     screen = .grid;
     onKey(412, true);
     try std.testing.expectEqual(Screen.home, screen);
-    try std.testing.expect(!handlesBack());
     try std.testing.expect(wl.running);
+
+    // ...and from a root screen there is nowhere left to go, so the app ends.
+    // This is the only way to close it when SAM did not launch it.
+    onKey(412, true);
+    try std.testing.expect(!wl.running);
+    wl.running = true;
+    screen = .server;
+    onKey(412, true);
+    try std.testing.expect(!wl.running);
+
     wl.on_webos = false;
     try std.testing.expect(!wl.isBackKey(412));
-    try std.testing.expect(wl.isBackKey(158));
-    try std.testing.expect(wl.isBackKey(1));
 }
 
 test "Back cancels late Quick Connect and sign-in replies" {
