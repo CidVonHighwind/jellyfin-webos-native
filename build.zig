@@ -7,11 +7,11 @@
 //! pointer/integer ABI and compiled for VFP; see docs/device.md.
 //! All device libraries are dlopen'd at runtime, so nothing here needs a sysroot.
 //!
-//!   zig build                        build every app into zig-out/bin
-//!   zig build run   -Dapp=wlbox      deploy one app and run it on the TV
-//!   zig build deploy                 scp every app to $WEBOS_TMP
-//!   zig build package -Dapp=wlbox    build an installable .ipk
-//!   zig build install-app -Dapp=wlbox    package, push and install via luna
+//!   zig build                        build gltri and Jellyfin into zig-out/bin
+//!   zig build run   -Dapp=jellyfin   deploy one app and run it on the TV
+//!   zig build deploy                 scp both apps to $WEBOS_TMP
+//!   zig build package -Dapp=jellyfin build an installable .ipk
+//!   zig build install-app -Dapp=jellyfin package, push and install via luna
 //!   zig build shot                   screenshot the TV over VNC
 //!   zig build info                   show the resolved .env settings
 //!
@@ -19,22 +19,11 @@
 //! steps below -- it is already KEY=VALUE, so no parser is needed here.
 const std = @import("std");
 
-/// `fbflash` pokes /dev/fb0 with raw syscalls and needs no libc, so it links
-/// fully static. The others need libc purely for dlopen.
-const App = struct { name: []const u8, src: []const u8, libc: bool, shaders: bool = false, ui: bool = false };
+const App = struct { name: []const u8, src: []const u8, shaders: bool = false, ui: bool = false };
 
 const apps = [_]App{
-    .{ .name = "fbflash", .src = "src/fbflash.zig", .libc = false },
-    .{ .name = "wlinfo", .src = "src/wlinfo.zig", .libc = true },
-    .{ .name = "wlbox", .src = "src/wlbox.zig", .libc = true },
-    .{ .name = "vkinfo", .src = "src/vkinfo.zig", .libc = true },
-    .{ .name = "fptest", .src = "src/fptest.zig", .libc = true },
-    .{ .name = "inputlog", .src = "src/inputlog.zig", .libc = true },
-    .{ .name = "glinfo", .src = "src/glinfo.zig", .libc = true },
-    .{ .name = "gltri", .src = "src/gltri.zig", .libc = true, .shaders = true },
-    .{ .name = "uidemo", .src = "src/uidemo.zig", .libc = true, .shaders = true, .ui = true },
-    .{ .name = "jellyfin", .src = "src/jellyfin.zig", .libc = true, .shaders = true, .ui = true },
-    .{ .name = "ndlplay", .src = "src/ndlplay.zig", .libc = true },
+    .{ .name = "gltri", .src = "src/gltri.zig", .shaders = true },
+    .{ .name = "jellyfin", .src = "src/jellyfin.zig", .shaders = true, .ui = true },
 };
 
 /// Sourced by every remote step. Defaults keep a fresh clone working.
@@ -60,7 +49,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSmall });
-    const selected = b.option([]const u8, "app", "Which app for run/package/install-app") orelse "wlbox";
+    const selected = b.option([]const u8, "app", "Which app for run/package/install-app") orelse "jellyfin";
     const strip_mod = b.option(bool, "strip", "Strip the executable") orelse false;
 
     var exes = std.StringHashMap(*std.Build.Step.Compile).init(b.allocator);
@@ -71,7 +60,7 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path(app.src),
                 .target = target,
                 .optimize = optimize,
-                .link_libc = app.libc,
+                .link_libc = true,
                 .strip = strip_mod,
             }),
         });
@@ -105,14 +94,14 @@ pub fn build(b: *std.Build) void {
     , &.{selected});
     b.step("info", "Show resolved .env settings").dependOn(&info.step);
 
-    // ---- deploy: every app to $WEBOS_TMP ----
+    // ---- deploy: both apps to $WEBOS_TMP ----
     const deploy = sh(b, env_preamble ++
         \\shift
         \\scp -q "$@" "$T:$TMP/"
         \\echo "deployed to $T:$TMP/"
     , &.{"deploy"});
     for (apps) |app| deploy.addFileArg(exes.get(app.name).?.getEmittedBin());
-    b.step("deploy", "scp all apps to the TV's temp dir").dependOn(&deploy.step);
+    b.step("deploy", "scp gltri and Jellyfin to the TV's temp dir").dependOn(&deploy.step);
 
     // ---- run: deploy one app, then execute it with the compositor's env ----
     // A Wayland client needs LSM's environment; an SSH session does not have it.
@@ -143,7 +132,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path(chosen_app.src),
             .target = b.resolveTargetQuery(.{}),
             .optimize = optimize,
-            .link_libc = chosen_app.libc,
+            .link_libc = true,
         }),
     });
     addAssets(b, host_exe, chosen_app);
@@ -187,13 +176,6 @@ pub fn build(b: *std.Build) void {
     , &.{ selected, b.pathFromRoot("appinfo.json") });
     b.step("launch", "Launch the installed app on the TV").dependOn(&launch.step);
 
-    // ---- videos: demo elementary streams, generated and pushed ----
-    // Raw Annex-B, not a container: NDL DirectMedia takes elementary streams,
-    // and the name carries the geometry the stream itself cannot.
-    const videos = sh(b, env_preamble ++ videos_script, &.{b.pathFromRoot("zig-out/videos")});
-    videos.stdio = .inherit;
-    b.step("videos", "Generate demo videos with ffmpeg and push them to the TV").dependOn(&videos.step);
-
     // ---- log: follow the installed app's own log ----
     // A launched app has no terminal, so it redirects stdout and stderr to
     // conf/jellyfin.log (see `logToFile`). It truncates that on every start,
@@ -221,33 +203,10 @@ pub fn build(b: *std.Build) void {
     const inst = sh(b, env_preamble ++ install_script, &.{b.pathFromRoot("zig-out")});
     inst.step.dependOn(pkg_step);
     b.step("install-app", "Package, push and install -Dapp on the TV").dependOn(&inst.step);
-
-    // ---- play: install ndlplay, point it at a source, run it ----
-    // Run from the INSTALLED path on purpose: the Luna role file generated at
-    // install time is keyed on the binary's exact path, and NDL will not
-    // register on the bus without it. SSH keeps stderr where we can see it.
-    const play_src = b.option([]const u8, "src", "File on the TV or tcp://host:port for `zig build play`") orelse
-        "/media/developer/videos/demo_1920x1080p60.h264";
-    const play = sh(b, env_preamble ++
-        \\app="$1"; src="$2"
-        \\id="dev.hookedbehemoth.$app"
-        \\ssh "$T" "mkdir -p /media/developer/videos; printf '%s\n' '$src' > /media/developer/videos/PLAY"
-        \\exec ssh "$T" "cd $APPDIR/$id && XDG_RUNTIME_DIR=/tmp/xdg WAYLAND_DISPLAY=wayland-0 ./$app"
-    , &.{ selected, play_src });
-    play.stdio = .inherit;
-    play.step.dependOn(&inst.step);
-    b.step("play", "Install -Dapp and run it on the TV against -Dsrc").dependOn(&play.step);
-
-    // ---- stream: publish a live stream from this PC and play it on the TV ----
-    const stream = sh(b, env_preamble ++ stream_script, &.{ selected, b.option([]const u8, "geom", "Stream geometry for `zig build stream`, e.g. 1920x1080p60") orelse "1920x1080p60" });
-    stream.stdio = .inherit;
-    stream.step.dependOn(&inst.step);
-    b.step("stream", "Publish a live stream from this PC and play it on the TV").dependOn(&stream.step);
 }
 
-/// The UI uses the sibling gallery project's TrueType reader and
-/// SkylineBinPack. They stay modules instead of becoming a C/system dependency,
-/// which keeps the TV cross-build sysroot-free.
+/// The UI's pure-Zig TrueType reader and skyline atlas packer are vendored so
+/// this checkout is self-contained and still needs no target sysroot.
 fn addUiDeps(
     b: *std.Build,
     root: *std.Build.Module,
@@ -268,7 +227,7 @@ fn addUiDeps(
     else
         target;
     const tt = b.createModule(.{
-        .root_source_file = b.path("../gallery-glfw/vendor/TrueType/TrueType.zig"),
+        .root_source_file = b.path("src/vendor/TrueType.zig"),
         .target = kernel_target,
         .optimize = .ReleaseFast,
     });
@@ -288,7 +247,7 @@ fn addUiDeps(
         }),
     });
     const skyline = b.createModule(.{
-        .root_source_file = b.path("../gallery-glfw/src/render/SkylineBinPack.zig"),
+        .root_source_file = b.path("src/vendor/SkylineBinPack.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -300,10 +259,9 @@ fn addUiDeps(
 /// Unused ones cost nothing: an @embedFile nobody references is not emitted.
 fn addAssets(b: *std.Build, exe: *std.Build.Step.Compile, app: App) void {
     exe.root_module.addAnonymousImport("font", .{ .root_source_file = b.path("assets/font8x16.bin") });
-    if (std.mem.eql(u8, app.name, "uidemo"))
-        exe.root_module.addAnonymousImport("media_atlas", .{ .root_source_file = b.path("assets/media-atlas.rgb") });
-    if (!app.shaders) return; // don't make every app wait on slangc
-    for (shaders) |sh_| {
+    if (!app.shaders) return;
+    const required = if (app.ui) ui_shaders[0..] else triangle_shaders[0..];
+    for (required) |sh_| {
         exe.root_module.addAnonymousImport(sh_.import, .{ .root_source_file = slangc(b, sh_) });
     }
 }
@@ -317,11 +275,14 @@ const Shader = struct {
     short: []const u8,
 };
 
-const shaders = [_]Shader{
+const triangle_shaders = [_]Shader{
     .{ .import = "tri_vs", .src = "src/shaders/tri.slang", .entry = "vsMain", .stage = "vertex", .short = "vert" },
     .{ .import = "tri_fs", .src = "src/shaders/tri.slang", .entry = "fsMain", .stage = "fragment", .short = "frag" },
     .{ .import = "text_vs", .src = "src/shaders/text.slang", .entry = "vsText", .stage = "vertex", .short = "vert" },
     .{ .import = "text_fs", .src = "src/shaders/text.slang", .entry = "fsText", .stage = "fragment", .short = "frag" },
+};
+
+const ui_shaders = [_]Shader{
     .{ .import = "ui_vs", .src = "src/shaders/ui.slang", .entry = "vsUi", .stage = "vertex", .short = "vert" },
     // One fragment program per kind of instance; see the note in ui.slang.
     .{ .import = "ui_fill", .src = "src/shaders/ui.slang", .entry = "fsFill", .stage = "fragment", .short = "frag" },
@@ -373,48 +334,6 @@ fn sh(b: *std.Build, script: []const u8, args: []const []const u8) *std.Build.St
 ///      archive is written by hand rather than with `ar`.
 ///   2. tar paths must be "usr/palm/..." with no leading "./".
 ///   3. the control tarball holds "control", not "./control".
-/// Demo streams: one per interesting capability. H.265 at 120 fps is the only
-/// 120 in the device's codec table, so that clip is the point of the exercise.
-const videos_script =
-    \\set -e
-    \\out="$1"; mkdir -p "$out"
-    \\command -v ffmpeg >/dev/null || { echo "ffmpeg not found" >&2; exit 1; }
-    \\gen() { # name codec size rate extra...
-    \\  f="$out/demo_$3p$4.$1"
-    \\  [ -s "$f" ] && { echo "have $f"; return; }
-    \\  echo "encoding $f"
-    \\  ffmpeg -hide_banner -loglevel error -f lavfi -i "testsrc2=size=$3:rate=$4:duration=8" \
-    \\    -c:v "$2" -preset ultrafast -pix_fmt yuv420p -b:v "$5" -f "$6" -y "$f"
-    \\}
-    \\gen h264 libx264 1920x1080 60  8M  h264
-    \\gen h265 libx265 1920x1080 120 10M hevc
-    \\gen h265 libx265 3840x2160 30  20M hevc
-    \\ssh "$T" "mkdir -p /media/developer/videos"
-    \\scp -q "$out"/demo_* "$T:/media/developer/videos/"
-    \\ssh "$T" "ls -la /media/developer/videos"
-;
-
-/// ffmpeg listens, the TV connects. The other direction would need the app to
-/// accept() and the TV's address to be reachable from here anyway, so this is
-/// the shorter path -- and it is exactly how a Moonlight-style client works:
-/// compressed frames straight into the hardware decoder.
-const stream_script =
-    \\set -e
-    \\app="$1"; geom="$2"; port=${WEBOS_STREAM_PORT:-9000}
-    \\size=${geom%p*}; rate=${geom#*p}
-    \\me=$(ip route get "$HOST" | sed -n 's/.*src \([0-9.]*\).*/\1/p' | head -1)
-    \\[ -n "$me" ] || { echo "cannot work out this machine's address toward $HOST" >&2; exit 1; }
-    \\echo "publishing ${size}p${rate} h264 on tcp://$me:$port"
-    \\ffmpeg -hide_banner -loglevel warning -re -f lavfi -i "testsrc2=size=$size:rate=$rate" \
-    \\  -c:v libx264 -preset ultrafast -tune zerolatency -g "$rate" -pix_fmt yuv420p -b:v 8M \
-    \\  -f h264 "tcp://0.0.0.0:$port?listen=1" &
-    \\ff=$!
-    \\trap 'kill $ff 2>/dev/null' EXIT
-    \\sleep 1
-    \\ssh "$T" "cd $APPDIR/dev.hookedbehemoth.$app && XDG_RUNTIME_DIR=/tmp/xdg WAYLAND_DISPLAY=wayland-0 \
-    \\  APPID=dev.hookedbehemoth.$app NDL_SRC=tcp://$me:$port NDL_GEOM=$geom NDL_CODEC=h264 ./$app"
-;
-
 const ipk_script =
     \\set -e
     \\app="$1"; bin="$2"; appinfo="$3"; out="$4"

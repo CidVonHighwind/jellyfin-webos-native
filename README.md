@@ -1,184 +1,44 @@
 # webos-native
 
-Native (non-JavaScript) applications for LG webOS TVs, written in Zig.
+Native Zig applications for LG webOS TVs. The project contains two programs:
 
-Cross-compiles from any Linux machine with **only Zig installed** — no webOS SDK,
-no sysroot, no cross-toolchain, no headers copied off the TV. Every device
-library is `dlopen`'d at runtime.
+- `jellyfin` — a native Jellyfin client.
+- `gltri` — an OpenGL ES triangle renderer and timing probe.
 
-## What works
-
-| | |
-|---|---|
-| `ndlplay` | hardware video via NDL DirectMedia — 1080p120 and 4K H.265 from storage or a live TCP stream, **verified on device** |
-| `gltri` | 1000 instanced rotating triangles via GL ES 3.2, CPU/GPU frame times on screen — **verified on device** |
-| `uidemo` | one-batch instanced UI, MSDF text, remote navigation and a 10,000-row virtual list — **verified on device** |
-| `jellyfin` | a Jellyfin client: discovery, sign-in, Quick Connect, home rows, a virtual library grid with server artwork, shows down to episodes — **verified on device** |
-| `glinfo` | EGL + OpenGL ES capabilities, limits and extensions |
-| `inputlog` | on-screen log of every input event — maps the remote and the cursor, **verified on device** |
-| `wlbox` | fullscreen red box via Wayland `wl_shm` + `wl_webos_shell` — **verified on device** |
-| `wlinfo` | lists the compositor's Wayland globals |
-| `vkinfo` | enumerates the Mali Vulkan ICD (1.3.260, 102 device extensions) |
-| `fbflash` | `/dev/fb0` prober — documents why direct framebuffer access is impossible |
-| `fptest` | float throughput benchmark (soft-float ABI vs hardware VFP) |
-
-Full findings are in **[docs/](docs/README.md)** — ABI, display pipeline, OpenGL
-ES, Vulkan, codecs, input, network, packaging.
+Both use the same SDL2 platform layer for webOS windowing, input, and OpenGL
+context creation. Device libraries are loaded at runtime, so cross-compiling
+requires neither the webOS SDK nor a target sysroot.
 
 ## Requirements
 
-- **Zig 0.16** (developed against `0.16.0`; the `std` API moves fast, so other
-  versions may need small edits)
-- `openssh` — `ssh`/`scp` for deploy
-- `tar`, `sed`, `coreutils` — used by the `.ipk` packager
-- `ffmpeg` — only for `zig build videos` / `zig build stream` (the NDL demo)
-- nothing for the `jellyfin` app: it `dlopen`s the TV's own `libpng16.so.16`
-  for artwork, like every other device library here — see
-  [docs/jellyfin.md](docs/jellyfin.md#artwork-why-libpng-and-why-not-the-jpeg)
-- **`slangc`** ([Slang](https://shader-slang.org/)) — only for the GL apps, which
-  compile their shaders from `src/shaders/*.slang` at build time
-- `glslangValidator` — optional; if present, every generated shader is validated
-  against GLSL ES 3.20 before it is embedded
-- the sibling `../gallery-glfw` checkout, which supplies Loom's vendored
-  pure-Zig TrueType/MSDF generator and `SkylineBinPack` for `uidemo`
-- An LG webOS TV with **root SSH access** (e.g. via
-  [Homebrew Channel](https://github.com/webosbrew/webos-homebrew-channel)) and
-  your key installed
+- Zig 0.16.0
+- `ssh`, `scp`, `tar`, `sed`, and coreutils for device operations
+- `slangc` to compile the embedded OpenGL ES shaders
+- `glslangValidator` is optional shader validation
 
-Nothing else. In particular you do **not** need `ares-cli`, the webOS SDK, or an
-ARM cross-compiler.
+The pure-Zig TrueType reader and skyline atlas packer required by Jellyfin are
+vendored under `src/vendor`; no sibling checkout is required.
 
 ## Setup
 
 ```sh
-cp .env.example .env     # then set WEBOS_HOST to your TV's address
+cp .env.example .env
 ```
 
-`.env` is git-ignored and sourced by every step that touches the TV; no address
-is hardcoded.
+Set `WEBOS_HOST` in `.env` to the TV's address.
 
-## Build commands
+## Commands
 
 ```sh
-zig build                          # build every app into zig-out/bin
-zig build info                     # show the resolved .env settings
-
-zig build run   -Dapp=wlbox        # scp one app to /tmp and run it on the TV
-zig build run-host -Dapp=inputlog  # build for this PC and run it in a local window
-zig build deploy                   # scp every app to the TV's temp dir
-
-zig build shot                     # screenshot the TV over VNC -> zig-out/shot.png
-
-zig build videos                   # encode demo clips with ffmpeg, push to the TV
-zig build play   -Dapp=ndlplay -Dsrc=/media/developer/videos/demo_1920x1080p120.h265
-zig build stream -Dapp=ndlplay -Dgeom=1920x1080p60   # publish a live stream from this PC
-
-zig build package     -Dapp=wlbox  # build zig-out/<id>_<version>_arm.ipk
-zig build install-app -Dapp=wlbox  # package, push and install via luna
-zig build launch                   # start the installed app through SAM
+zig build                              # build both applications
+zig build run -Dapp=jellyfin           # deploy and run on the TV
+zig build run-host -Dapp=gltri         # run locally through SDL
+zig build deploy                       # copy both binaries to the TV
+zig build package -Dapp=jellyfin       # create an .ipk
+zig build install-app -Dapp=jellyfin   # package, copy, and install
+zig build launch -Dapp=jellyfin        # launch the installed app
+zig build test                         # Jellyfin host tests
 ```
 
-`-Dapp=` selects the app for `run` / `run-host` / `package` / `install-app`
-(default `wlbox`).
-`zig build run` is the fast development loop: a bare binary renders fullscreen
-without being installed at all, so packaging is only needed to get an entry in
-the TV's app list.
-
-Cross-compilation target is set in `build.zig`: **`arm-linux-gnueabi`**,
-armv7-a soft-float ABI, glibc 2.31. Override with `-Dtarget=` to build for the
-host instead. Zig emits software FP for that target, so the FP-heavy MSDF glyph
-generator is a separate VFP-compiled static kernel with a pointer/integer-only
-boundary; the final executable and every TV-library call retain the required
-base ABI.
-
-## Seeing what the TV actually drew
-
-webOS exposes no screenshot service a native app can reach, but the TV runs a
-VNC server on 5900. `zig build shot` grabs one frame into `zig-out/shot.png`
-(`tools/vncshot.py`, needs `python3` + `pycryptodome`, password from
-`WEBOS_VNC_PASS` in `.env`). This is the only honest check of on-device
-rendering; the `*_DUMP=1` ASCII readbacks below are the offline fallback.
-
-## Layout
-
-```
-src/wl.zig  Wayland shim: one window, one shm buffer, all input.
-            Picks wl_webos_shell on the TV and xdg_wm_base on a PC, so the
-            same binary source runs in both places.
-src/        application sources
-src/loom/   TV-focused Loom subset: stacks, draw commands and virtual lists
-src/shaders/ Slang shaders, compiled to GLSL ES at build time
-assets/     icon.png, font8x16.bin and other packaged files
-tools/      dev-machine helpers (VNC screenshot)
-docs/       findings from investigating the device
-appinfo.json  webOS app manifest (`main` is rewritten per -Dapp at package time)
-build.zig     build, package, deploy, install, launch
-```
-
-## Gotchas that cost real time
-
-- `uname -m` says `aarch64`; **userland is 32-bit ARM, soft-float ABI**. A
-  `gnueabihf` build requests the wrong loader and passes float arguments in the
-  wrong registers. It fails with a confusing `not found`, or miscalls TV APIs.
-- App ids may **not** start with `com.webos.` — developer-mode installs of that
-  reserved namespace are refused with a generic `errorCode: -15`.
-- `/dev/fb0` cannot be mapped — scanout is AFBC-compressed. Wayland is the only
-  route to the screen.
-- Vulkan works but has **no `VK_KHR_wayland_surface`**, so a swapchain cannot
-  present; use `zwp_linux_dmabuf_v1`.
-- Zig 0.16's self-hosted x86_64 backend miscompiles `@memset` over a large
-  global slice, so `run-host` pins `use_llvm`. The ARM build is unaffected.
-- `GL_EXT_disjoint_timer_query` is advertised but returns nothing on this
-  driver, and Slang cannot emit GLSL ES directly — both are worked around and
-  explained in [docs/opengl.md](docs/opengl.md).
-- The panel is 120 Hz FreeSync but **the graphics plane is a fixed 1080p60**
-  (DRM CRTC mode, `wl_output`, and no 120 Hz mode on the connector). Apps here
-  take their size and rate from `wl_output` and never assume one. 4K and 120 fps
-  live on the **video plane**, via NDL — see [docs/ndl.md](docs/ndl.md).
-- NDL needs a Luna role, which is keyed on the installed binary's exact path, so
-  `zig build play` runs the *installed* binary over SSH rather than a copy in
-  `/tmp`. Three more NDL traps are in [docs/ndl.md](docs/ndl.md).
-
-Each is explained in [docs/](docs/README.md).
-
-## Developing on the PC
-
-`zig build run-host -Dapp=<app>` builds the same source for this machine and
-runs it as an ordinary window, so the edit/run loop does not need the TV. The
-shim binds `xdg_wm_base` when `wl_webos_shell` is absent; the app code does not
-know the difference.
-
-`inputlog` additionally renders one frame into a buffer and prints it as ASCII
-when `INPUTLOG_DUMP=1` is set, which checks the log formatting and the font
-without a compositor at all:
-
-```sh
-INPUTLOG_DUMP=1 zig build run-host -Dapp=inputlog
-GLTRI_DUMP=1    zig build run-host -Dapp=gltri     # glReadPixels -> ASCII
-UI_SCREEN=library UI_CAPTURE=uidemo.ppm zig build run-host -Dapp=uidemo # glReadPixels -> PPM
-```
-
-`jellyfin` takes the same environment plus a replayed remote, since there is no
-way to click through it headlessly:
-
-```sh
-set -a; . ./.env; set +a          # server address and credentials
-UI_SCRIPT=oddo UI_CAPTURE=jellyfin.ppm zig build run-host -Dapp=jellyfin
-```
-
-`u`/`d`/`l`/`r` are the arrows, `o` is OK, `b` is Back; each press waits for the
-fetcher to go idle, so a script cannot race a request. See
-[docs/jellyfin.md](docs/jellyfin.md).
-
-`uidemo` can also capture its current screen with F12. Both paths read this
-application's OpenGL backbuffer directly; they do not use a desktop screenshot
-tool and cannot include other windows.
-
-`assets/font8x16.bin` is the ASCII range of
-[Terminus](https://terminus-font.sourceforge.net/) (OFL-1.1), extracted from
-`Lat2-Terminus16.psfu` as 95 glyphs of 16 bytes.
-
-`uidemo` instead uses the MSDF generator and `SkylineBinPack` from the sibling
-`../gallery-glfw` checkout. On the TV it opens the installed
-`LG_Smart_UI-Regular.ttf`; see [docs/fonts.md](docs/fonts.md) for the measured
-font inventory and fallbacks.
+`GLTRI_DUMP=1 zig build run-host -Dapp=gltri` reads the rendered frame back as
+ASCII for a headless smoke test.

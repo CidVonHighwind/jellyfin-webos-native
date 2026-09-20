@@ -18,7 +18,7 @@
 //! Moonlight. `.cache/` is left to whatever libraries want it.
 //!
 //! Finding that directory needs no environment, which matters because SAM
-//! provides none (the same reason `ndlplay` reads its source from a fixed
+//! provides none (the same reason the app reads its source from a fixed
 //! path). An installed app runs with its own directory as the working
 //! directory, so `/proc/self/cwd` is the answer -- and it is also how we tell
 //! "installed" from "development".

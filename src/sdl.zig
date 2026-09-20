@@ -140,8 +140,14 @@ const ev_mousebuttondown = 0x401;
 const ev_mousebuttonup = 0x402;
 const ev_mousewheel = 0x403;
 
+const win_shown = 1;
+const win_hidden = 2;
+const win_exposed = 3;
 const win_resized = 5;
 const win_size_changed = 6;
+const win_minimized = 7;
+const win_maximized = 8;
+const win_restored = 9;
 const win_leave = 11;
 const win_close = 14;
 
@@ -162,6 +168,7 @@ var SDL_GL_GetProcAddress: *const fn ([*:0]const u8) callconv(.c) ?*anyopaque = 
 var SDL_GL_SwapWindow: *const fn (*Window) callconv(.c) void = undefined;
 var SDL_GL_SetSwapInterval: *const fn (c_int) callconv(.c) c_int = undefined;
 var SDL_PollEvent: *const fn (*Event) callconv(.c) c_int = undefined;
+var SDL_WaitEvent: *const fn (*Event) callconv(.c) c_int = undefined;
 var SDL_PushEvent: *const fn (*Event) callconv(.c) c_int = undefined;
 var SDL_StartTextInput: *const fn () callconv(.c) void = undefined;
 var SDL_StopTextInput: *const fn () callconv(.c) void = undefined;
@@ -183,7 +190,7 @@ fn bindOpt(comptime T: type, name: [*:0]const u8) ?T {
 
 // --------------------------------------------------------- app-facing API
 //
-// Same shape as src/wl.zig, so the app sees no difference.
+// This is the single platform API consumed by both applications.
 
 pub const Fixed = i32;
 pub fn toInt(f: Fixed) i32 {
@@ -222,6 +229,12 @@ fn ignoreEvent(_: AppEvent) void {}
 pub var running = true;
 /// True on the TV, where SDL drives its own webOS video backend.
 pub var on_webos = false;
+/// False while SDL reports the window minimized. Render loops wait for an
+/// event in this state instead of swapping invisible frames in a tight loop.
+pub var drawable = true;
+/// The display refresh rate reported by SDL, in millihertz. A few desktop
+/// drivers omit it, so retain the conventional 60 Hz fallback.
+pub var refresh_mhz: u32 = 60_000;
 
 /// LG's keycodes/lg maps IR_KEY_BACK to XKB 420, i.e. Wayland key 412. On
 /// desktops 412 is KEY_PREVIOUS, so only treat it as Back on the TV.
@@ -252,6 +265,7 @@ pub fn init(app_id: [*:0]const u8, title: [*:0]const u8, w: u32, h: u32) !void {
     SDL_GL_SwapWindow = try bind(@TypeOf(SDL_GL_SwapWindow), "SDL_GL_SwapWindow");
     SDL_GL_SetSwapInterval = try bind(@TypeOf(SDL_GL_SetSwapInterval), "SDL_GL_SetSwapInterval");
     SDL_PollEvent = try bind(@TypeOf(SDL_PollEvent), "SDL_PollEvent");
+    SDL_WaitEvent = try bind(@TypeOf(SDL_WaitEvent), "SDL_WaitEvent");
     SDL_PushEvent = try bind(@TypeOf(SDL_PushEvent), "SDL_PushEvent");
     SDL_StartTextInput = try bind(@TypeOf(SDL_StartTextInput), "SDL_StartTextInput");
     SDL_StopTextInput = try bind(@TypeOf(SDL_StopTextInput), "SDL_StopTextInput");
@@ -300,6 +314,7 @@ pub fn init(app_id: [*:0]const u8, title: [*:0]const u8, w: u32, h: u32) !void {
     // Ask for the display's size up front instead.
     var mode: DisplayMode = undefined;
     const display_ok = SDL_GetCurrentDisplayMode(0, &mode) == 0 and mode.w > 0 and mode.h > 0;
+    if (display_ok and mode.refresh_rate > 0) refresh_mhz = @intCast(mode.refresh_rate * 1000);
     const want_w: c_int = if (w != 0) @intCast(w) else if (display_ok) mode.w else 1280;
     const want_h: c_int = if (h != 0) @intCast(h) else if (display_ok) mode.h else 720;
     const win = SDL_CreateWindow(
@@ -320,10 +335,12 @@ pub fn init(app_id: [*:0]const u8, title: [*:0]const u8, w: u32, h: u32) !void {
     };
     // 1 = throttle to the display. SWAP_INTERVAL=0 lets frames go out as fast
     // as they are drawn, which is what shows the GPU's real ceiling.
-    _ = SDL_GL_SetSwapInterval(if (c.getenv("SWAP_INTERVAL")) |v|
+    const swap_interval = if (c.getenv("SWAP_INTERVAL")) |v|
         std.fmt.parseInt(c_int, std.mem.sliceTo(v, 0), 10) catch 1
     else
-        1);
+        1;
+    _ = SDL_GL_SetSwapInterval(swap_interval);
+    gl.swap_interval = swap_interval;
 
     // Everything above the platform layer works in framebuffer pixels, so the
     // drawable size is the one that matters -- the window size is in logical
@@ -451,6 +468,14 @@ pub fn poll() bool {
     return running;
 }
 
+/// Block until SDL delivers one event. This is used only while minimized, so a
+/// restore, close, or lifecycle event wakes the app without rendering frames.
+pub fn wait() bool {
+    var event: Event = undefined;
+    if (SDL_WaitEvent(&event) != 0) translate(&event);
+    return running;
+}
+
 fn translate(event: *const Event) void {
     switch (event.kind) {
         ev_quit => {
@@ -508,6 +533,8 @@ fn translate(event: *const Event) void {
         ev_window => {
             const w: *const WindowEvent = @ptrCast(event);
             switch (w.event) {
+                win_hidden, win_minimized => drawable = false,
+                win_shown, win_exposed, win_maximized, win_restored => drawable = true,
                 win_resized, win_size_changed => {
                     var pw: c_int = 0;
                     var ph: c_int = 0;

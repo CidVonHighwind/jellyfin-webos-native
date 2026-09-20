@@ -30,7 +30,7 @@ const fragment_sources = [_][]const u8{
     @embedFile("ui_image"),
 };
 /// A default texture for `Context.image`, for an application whose artwork is
-/// known up front -- `uidemo`'s baked atlas. An application that loads images
+/// known up front. An application that loads images
 /// at runtime passes null and makes its own textures with `createTexture`.
 pub const Media = struct {
     width: u32,

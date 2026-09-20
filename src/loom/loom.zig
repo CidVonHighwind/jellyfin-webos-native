@@ -1,6 +1,6 @@
 //! Small TV-facing subset of loom.
 //!
-//! This keeps the useful boundary from `gallery-glfw/src/loom`: layout emits
+//! This keeps a useful boundary: layout emits
 //! backend-neutral draw commands and the renderer knows nothing about widgets.
 //! The TV does not need custom 3D commands, clipboard, drag and drop,
 //! right-click state, or retained desktop-window machinery. An image is a

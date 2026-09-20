@@ -1,9 +1,9 @@
 //! A Jellyfin client for the TV: discovery, sign-in, home rows, a virtual
 //! library grid and the path down to a single episode.
 //!
-//! The UI is `uidemo`'s: one instanced batch, MSDF-free rasterised glyphs, the
-//! same remote/pointer handling and the same virtual-list geometry. What is
-//! new is that every screen is backed by a real server, so this file is mostly
+//! The UI is one instanced batch with rasterised glyphs, remote/pointer
+//! handling, and virtual-list geometry. Every screen is backed by a real
+//! server, so this file is mostly
 //! about keeping the render thread free of that: `api.Fetcher` runs the
 //! requests on worker threads, results arrive as completed tasks once a frame,
 //! and screen state is plain fixed-size storage that a task result is copied
@@ -571,7 +571,7 @@ var playback_paused = false;
 var playback_controls_until: u64 = 0;
 const playback_controls_ns = 3 * std.time.ns_per_s;
 
-// Text entry, remote and pointer, all as in uidemo.
+// Text entry, remote, and pointer input.
 var server_url: api.Text(256) = .{};
 var username: api.Text(256) = .{};
 var password: api.Text(256) = .{};
@@ -1738,7 +1738,7 @@ fn activatePlayback() void {
 fn drawPlayback(ctx: *loom.Context, width: f32, height: f32, scale: f32) void {
     if (!playback_paused and nowNs() >= playback_controls_until) return;
     // The video itself is a separate NDL plane. This graphics-plane strip is
-    // intentionally the same kind of content exercised by ndlplay's overlay.
+    // deliberately compact content for exercising the renderer.
     const panel = loom.Rect{ .x = 0, .y = height - 166 * scale, .w = width, .h = 166 * scale };
     ctx.fill(panel, null, .{ 8, 12, 20, 205 }, 0);
     ctx.label(.{ .x = 64 * scale, .y = panel.y + 20 * scale, .w = width - 128 * scale, .h = 34 * scale }, panel, playback_title.get(), TEXT, 27 * scale);
@@ -1835,7 +1835,7 @@ fn nowNs() u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
-/// This application's own backbuffer as a PPM. Same path as uidemo's F12, and
+/// This application's own backbuffer as a PPM.
 /// the only way to check on-device rendering without the VNC grab.
 fn captureFrame(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
     const width: usize = gl.width;
@@ -1911,7 +1911,7 @@ fn loadDebugEnv() void {
 }
 
 /// Launched from the TV's app list there is no terminal, so an installed app's
-/// output goes nowhere and a failure is invisible. Same fallback as `ndlplay`:
+/// output goes nowhere and a failure is invisible. The fallback is to
 /// send stderr to a file next to everything else this app writes.
 fn logToFile() void {
     if (isTty(2)) return;
@@ -2037,6 +2037,10 @@ pub fn main(init: std.process.Init) !void {
     // Without a script, hold long enough for discovery's three timeouts.
     var capture_after: u32 = if (capture_path != null and script.len == 0) 240 else 0;
     while (wl.poll()) {
+        if (!wl.drawable) {
+            _ = wl.wait();
+            continue;
+        }
         pump();
         if (screen == .playback and !player.embedded())
             glClearColor(0, 0, 0, 0) // Starfish owns the webOS video plane.

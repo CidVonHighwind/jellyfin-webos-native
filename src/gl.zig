@@ -1,4 +1,4 @@
-//! EGL + OpenGL ES on top of the Wayland shim (src/wl.zig).
+//! OpenGL ES symbol lookup shared by SDL-backed applications.
 //!
 //! libEGL, libGLESv2 and libwayland-egl are dlopen'd like everything else here,
 //! so the build still needs no headers and no sysroot. GL entry points are
@@ -9,7 +9,6 @@
 //! The TV has libGLESv1_CM as well, but nothing here touches fixed-function.
 const std = @import("std");
 const c = std.c;
-const wl = @import("wl.zig");
 
 pub const EGL_NONE = 0x3038;
 const EGL_OPENGL_ES_API = 0x30A0;
@@ -96,63 +95,8 @@ var swap_hook: ?*const fn () void = null;
 
 /// Open a window and make an ES 3 context current on it.
 pub fn init(app_id: [*:0]const u8, title: [*:0]const u8, w: u32, h: u32) !void {
-    try wl.open(app_id, title, w, h, .external);
-    width = wl.width;
-    height = wl.height;
-
-    libs[0] = c.dlopen("libEGL.so.1", .{ .NOW = true }) orelse return error.NoEGL;
-    libs[1] = c.dlopen("libGLESv2.so.2", .{ .NOW = true }) orelse return error.NoGLESv2;
-    libs[2] = c.dlopen("libwayland-egl.so.1", .{ .NOW = true }) orelse return error.NoWaylandEGL;
-    getProcAddress = @ptrCast(@alignCast(symOpt("eglGetProcAddress")));
-
-    eglGetDisplay = proc(@TypeOf(eglGetDisplay), "eglGetDisplay");
-    eglInitialize = proc(@TypeOf(eglInitialize), "eglInitialize");
-    eglBindAPI = proc(@TypeOf(eglBindAPI), "eglBindAPI");
-    eglChooseConfig = proc(@TypeOf(eglChooseConfig), "eglChooseConfig");
-    eglCreateWindowSurface = proc(@TypeOf(eglCreateWindowSurface), "eglCreateWindowSurface");
-    eglCreateContext = proc(@TypeOf(eglCreateContext), "eglCreateContext");
-    eglMakeCurrent = proc(@TypeOf(eglMakeCurrent), "eglMakeCurrent");
-    eglSwapBuffers = proc(@TypeOf(eglSwapBuffers), "eglSwapBuffers");
-    eglSwapInterval = proc(@TypeOf(eglSwapInterval), "eglSwapInterval");
-    eglQueryString = proc(@TypeOf(eglQueryString), "eglQueryString");
-    wlEglWindowCreate = proc(@TypeOf(wlEglWindowCreate), "wl_egl_window_create");
-
-    egl_display = eglGetDisplay(wl.display) orelse return error.NoEglDisplay;
-    var major: i32 = 0;
-    var minor: i32 = 0;
-    if (eglInitialize(egl_display, &major, &minor) == 0) return error.EglInitFailed;
-    if (eglBindAPI(EGL_OPENGL_ES_API) == 0) return error.EglBindApiFailed;
-
-    const cfg_attrs = [_]i32{
-        EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
-        EGL_RED_SIZE,        8,
-        EGL_GREEN_SIZE,      8,
-        EGL_BLUE_SIZE,       8,
-        EGL_ALPHA_SIZE,      8,
-        EGL_DEPTH_SIZE,      16,
-        EGL_NONE,
-    };
-    var config: ?*anyopaque = null;
-    var n: i32 = 0;
-    if (eglChooseConfig(egl_display, &cfg_attrs, @ptrCast(&config), 1, &n) == 0 or n == 0)
-        return error.NoEglConfig;
-
-    const win = wlEglWindowCreate(wl.surface.p, @intCast(width), @intCast(height)) orelse return error.NoEglWindow;
-    egl_surface = eglCreateWindowSurface(egl_display, config, win, null) orelse return error.NoEglSurface;
-
-    const ctx_attrs = [_]i32{ EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
-    egl_context = eglCreateContext(egl_display, config, null, &ctx_attrs) orelse return error.NoEglContext;
-    if (eglMakeCurrent(egl_display, egl_surface, egl_surface, egl_context) == 0) return error.EglMakeCurrentFailed;
-    // 1 = throttle to the compositor. SWAP_INTERVAL=0 in the environment lets
-    // frames go out as fast as they are drawn, which is what a variable-refresh
-    // output wants and also shows what the GPU could actually sustain.
-    setSwapInterval(if (c.getenv("SWAP_INTERVAL")) |v| parseInterval(v) else 1);
-
-    std.debug.print("EGL {d}.{d} vendor={s}\n  apis={s}\n", .{
-        major,                                                         minor,
-        std.mem.sliceTo(eglQueryString(egl_display, EGL_VENDOR).?, 0), std.mem.sliceTo(eglQueryString(egl_display, EGL_CLIENT_APIS).?, 0),
-    });
+    _ = .{ app_id, title, w, h };
+    return error.SdlRequired;
 }
 
 pub var swap_interval: i32 = 1;

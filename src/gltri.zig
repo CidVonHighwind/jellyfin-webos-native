@@ -12,7 +12,8 @@
 const std = @import("std");
 const linux = std.os.linux;
 const gl = @import("gl.zig");
-const wl = @import("wl.zig");
+const sdl = @import("sdl.zig");
+const luna = @import("luna.zig");
 const txt = @import("text.zig");
 
 const tri_vs = @embedFile("tri_vs");
@@ -277,10 +278,28 @@ fn dumpFrame(gpa: std.mem.Allocator) void {
     std.debug.print("overlay: {d} white pixels\n", .{white});
 }
 
+/// The triangle probe has no navigation state: Back is simply its close key,
+/// matching the lifecycle close request from SAM.
+fn onEvent(event: sdl.AppEvent) void {
+    switch (event) {
+        .key => |key| {
+            if (key.pressed and sdl.isBackKey(key.code)) sdl.running = false;
+        },
+        else => {},
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const appid = std.c.getenv("APPID") orelse @as([*:0]const u8, "dev.hookedbehemoth.gltri");
-    try gl.init(appid, "1000 triangles", 0, 0);
+    sdl.on_event = onEvent;
+    try sdl.init(appid, "1000 triangles", 0, 0);
+    defer sdl.deinit();
+    // SAM lifecycle messages arrive on Luna's worker thread; SDL's posted
+    // events bring them safely back to this render thread.
+    luna.registerLifecycle(sdl.postQuit, sdl.postRaise) catch |err|
+        std.debug.print("no webOS lifecycle: {s}\n", .{@errorName(err)});
+    defer luna.deinit();
     loadGl();
 
     const w: i32 = @intCast(gl.width);
@@ -394,8 +413,8 @@ pub fn main(init: std.process.Init) !void {
     var queries: [2]u32 = @splat(0);
     if (gpu_mode == .query) glGenQueriesEXT.?(2, &queries);
     std.debug.print("{d} instances at {d}x{d}, output {d}.{d:0>3} Hz, swap interval {d}, GPU timing: {s}\n", .{
-        INSTANCES,             gl.width,         gl.height,          wl.refresh_mhz / 1000,
-        wl.refresh_mhz % 1000, gl.swap_interval, @tagName(gpu_mode),
+        INSTANCES,              gl.width,         gl.height,          sdl.refresh_mhz / 1000,
+        sdl.refresh_mhz % 1000, gl.swap_interval, @tagName(gpu_mode),
     });
 
     // A couple of frames first, so the timer query has a result to show.
@@ -411,7 +430,11 @@ pub fn main(init: std.process.Init) !void {
     var frames: u64 = 0;
     var line: [OVERLAY_COLS]u8 = undefined;
 
-    while (wl.poll()) {
+    while (sdl.poll()) {
+        if (!sdl.drawable) {
+            _ = sdl.wait();
+            continue;
+        }
         const wall_start = nowNs();
         const cpu_start = cpuNs();
         frame_ms = smooth(frame_ms, @as(f64, @floatFromInt(wall_start - last_frame)) / std.time.ns_per_ms);
@@ -461,7 +484,7 @@ pub fn main(init: std.process.Init) !void {
         // we are actually presenting. On a variable-refresh output they differ.
         overlayLine(3, std.fmt.bufPrint(&line, "{d: >5.1}/{d: >5.1} Hz", .{
             if (frame_ms > 0) 1000.0 / frame_ms else 0.0,
-            @as(f64, @floatFromInt(wl.refresh_mhz)) / 1000.0,
+            @as(f64, @floatFromInt(sdl.refresh_mhz)) / 1000.0,
         }) catch "hz ?");
         // Same numbers as the overlay, once a second, so `zig build run` over
         // ssh shows them without a camera pointed at the TV.
