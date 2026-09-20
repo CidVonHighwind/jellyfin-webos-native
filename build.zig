@@ -75,6 +75,10 @@ pub fn build(b: *std.Build) void {
                 .strip = strip_mod,
             }),
         });
+        if (std.mem.eql(u8, app.name, "jellyfin")) exe.root_module.addCSourceFile(.{
+            .file = b.path("src/jellyfin/demux.c"),
+            .flags = &.{"-I/usr/include/ffmpeg4.4"},
+        });
         addAssets(b, exe, app);
         if (app.ui) addUiDeps(b, exe.root_module, target, optimize);
         b.installArtifact(exe);
@@ -455,6 +459,6 @@ const install_script =
     \\scp -q "$ipk" "$T:$TMP/$base"
     \\# luna-send -i never exits on a subscription, and killing it through a
     \\# pipe loses the buffered reply -- so let it write to a file and read that.
-    \\ssh "$T" "luna-send -i -f luna://com.webos.appInstallService/dev/install '{\"id\":\"$id\",\"ipkUrl\":\"$TMP/$base\",\"subscribe\":true}' >$TMP/install.log 2>&1 & sleep 25; kill %1 2>/dev/null; grep -oE '\"(state|reason|errorText)\" *: *\"[^\"]*\"' $TMP/install.log | tail -4; echo '--- installed files:'; ls -la $APPDIR/$id 2>&1 | head"
+    \\ssh "$T" "luna-send -i -f luna://com.webos.appInstallService/dev/install '{\"id\":\"$id\",\"ipkUrl\":\"$TMP/$base\",\"subscribe\":true}' >$TMP/install.log 2>&1 & sleep 2; kill %1 2>/dev/null; grep -oE '\"(state|reason|errorText)\" *: *\"[^\"]*\"' $TMP/install.log | tail -4; echo '--- installed files:'; ls -la $APPDIR/$id 2>&1 | head"
     \\echo "installed $id (from $base)"
 ;

@@ -72,6 +72,33 @@ int unknown1; }` followed by a 32-byte audio union. Video types are
 `H264 = 1, H265 = 2, VP9 = 3, AV1 = 4`. Zeroing the audio union means "no
 audio", which this implementation accepts.
 
+The full struct is in webosbrew/webos-userland,
+`include/libndl-media/NDL_directmedia_types.h`, and this device's
+`DMPlayer::createLoadParameter` matches it exactly. Audio types are
+**`PCM = 1, MP3 = 2, OPUS = 3`** and nothing else; the union starts at byte 16,
+with the PCM arm `{ type, unknown1, const char *format, *layout,
+*channelMode, sampleRate }` — strings validated against `isSupportedPCMFormat`
+/ `isSupportedPCMLayout`, defaults `S16LE` / `interleaved` / `stereo`. The
+sample-rate enum is **not** ordered by frequency (`48K = 1, 44.1K = 2, 32K = 3,
+24K = 4, 16K = 5, 12K = 6, 8K = 7, 22.05K = 8`) and `0` means bypass, which
+takes the pipeline down. Video and audio are emitted in one pass — the video
+branch rejoins the audio switch — so `{video, audio}` together is fine.
+
+**MP3 is in the enum but does not work.** NDL emits `"audio":{"codec":"MP3"}`
+with no rate or channel count, SMP fails to build caps for it, and Load prints
+the pair
+
+```
+g_object_set: assertion 'G_IS_OBJECT (object)' failed
+gst_mini_object_unref: assertion 'mini_object != NULL' failed
+```
+
+— `g_object_set(appsrc, "caps", …)` plus `gst_caps_unref` with both null. The
+audio source is never created; feeding it then dies in
+`StarfishMediaAPIs::Feed`, whose first instruction is `ldr r3, [r1, #0x4c]`
+(hence a fault at address `0x4c`, not a mutex bug). **Decode to PCM and feed
+that instead** — which is what the Jellyfin client does.
+
 ## Four things that cost time
 
 **1. It needs a Luna role, so it must be an installed app.** Without one you get

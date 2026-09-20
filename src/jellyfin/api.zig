@@ -454,10 +454,10 @@ pub fn episodes(http: *std.http.Client, arena: std.mem.Allocator, session: *cons
     return getList(http, arena, session, writer.buffered());
 }
 
-/// The URL a player would open. Playback itself is out of scope for now; the
-/// details screen shows and logs this.
+/// MPEG-TS lets Jellyfin remux compatible H.264/H.265/AV1 video instead of
+/// re-encoding it. The DirectMedia player demuxes its packets locally.
 pub fn streamUrl(session: *const Session, id: []const u8, buffer: []u8) []const u8 {
-    return std.fmt.bufPrint(buffer, "{s}/Videos/{s}/stream?static=true&api_key={s}", .{
+    return std.fmt.bufPrint(buffer, "{s}/Videos/{s}/stream?container=ts&audioCodec=mp3&api_key={s}", .{
         base(session), id, session.token.get(),
     }) catch "";
 }

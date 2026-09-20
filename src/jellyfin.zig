@@ -9,8 +9,8 @@
 //! and screen state is plain fixed-size storage that a task result is copied
 //! into. Nothing the renderer touches is owned by a worker.
 //!
-//! Playback is deliberately URL-only: the details screen resolves the stream
-//! URL and shows it. Feeding it to a decoder is the NDL work in docs/ndl.md.
+//! Playback uses NDL DirectMedia after the runtime FFmpeg demuxer separates
+//! Jellyfin's transport stream into video packets.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -19,6 +19,7 @@ const wl = @import("wl.zig");
 const loom = @import("loom/loom.zig");
 const UiRenderer = @import("ui_renderer.zig").Renderer;
 const api = @import("jellyfin/api.zig");
+const player = @import("jellyfin/player.zig");
 
 const GL_COLOR_BUFFER_BIT = 0x00004000;
 const GL_RGBA = 0x1908;
@@ -345,7 +346,7 @@ fn build(comptime pattern: []const u8, args: anytype) []const u8 {
 
 // -------------------------------------------------------------- app state
 
-const Screen = enum { server, auth, quick, home, grid, details, season };
+const Screen = enum { server, auth, quick, home, grid, details, season, playback };
 const EditField = enum { none, url, username, password };
 
 const row_capacity = 24;
@@ -553,6 +554,8 @@ var episode_jump = false;
 var select_unfinished_season = false;
 var select_unfinished_episode = false;
 var stream_url: api.Text(256) = .{};
+var playback_title: api.Text(160) = .{};
+var playback_paused = false;
 
 // Text entry, remote and pointer, all as in uidemo.
 var server_url: api.Text(256) = .{};
@@ -990,6 +993,13 @@ fn useServer(address: []const u8) void {
 }
 
 fn goBack() void {
+    if (screen == .playback) {
+        player.stop();
+        playback_paused = false;
+        screen = .details;
+        setStatus("Stopped playback", .{});
+        return;
+    }
     if (active_field != .none) {
         endEdit();
         return;
@@ -1045,11 +1055,9 @@ fn activate() void {
         },
         .details => activateDetails(),
         .season => if (episode_selected < episodes_row.count) {
-            var buffer: [256]u8 = undefined;
-            stream_url.set(api.streamUrl(&session, episodes_row.cards[episode_selected].id.get(), &buffer));
-            setStatus("Stream URL: {s}", .{stream_url.get()});
-            std.debug.print("play {s}\n", .{stream_url.get()});
+            startPlayback(episodes_row.cards[episode_selected].id.get(), episodes_row.cards[episode_selected].episode_title.get());
         },
+        .playback => togglePlayback(),
     }
 }
 
@@ -1075,8 +1083,33 @@ fn activateDetails() void {
         return;
     }
     if (focus == 0) {
-        setStatus("Stream URL: {s}", .{stream_url.get()});
-        std.debug.print("play {s}\n", .{stream_url.get()});
+        startPlayback(detail.id.get(), detail.title.get());
+    }
+}
+
+fn startPlayback(id: []const u8, title: []const u8) void {
+    var buffer: [256]u8 = undefined;
+    stream_url.set(api.streamUrl(&session, id, &buffer));
+    if (stream_url.len == 0) return setError("Could not build a stream URL", .{});
+    player.play(stream_url.get(), gl.width, gl.height) catch |err| {
+        setError("Playback failed: {s}: {s}", .{ @errorName(err), player.lastError() });
+        return;
+    };
+    playback_title.set(title);
+    playback_paused = false;
+    screen = .playback;
+    setStatus("Playing", .{});
+}
+
+fn togglePlayback() void {
+    if (playback_paused) {
+        player.resumePlayback();
+        playback_paused = false;
+        setStatus("Playing", .{});
+    } else {
+        player.pause();
+        playback_paused = true;
+        setStatus("Paused", .{});
     }
 }
 
@@ -1129,6 +1162,7 @@ fn move(direction: Direction) void {
             .right => focus = @min(focus + 1, focusCount() - 1),
             else => {},
         },
+        .playback => {},
         else => switch (direction) {
             .up => focus -|= 1,
             .down => focus = @min(focus + 1, focusCount() - 1),
@@ -1702,6 +1736,22 @@ fn drawSeason(ctx: *loom.Context, width: f32, height: f32, scale: f32) void {
     }
 }
 
+fn drawPlayback(ctx: *loom.Context, width: f32, height: f32, scale: f32) void {
+    // The video itself is a separate NDL plane. This graphics-plane strip is
+    // intentionally the same kind of content exercised by ndlplay's overlay.
+    const panel = loom.Rect{ .x = 0, .y = height - 156 * scale, .w = width, .h = 156 * scale };
+    ctx.fill(panel, null, .{ 8, 12, 20, 205 }, 0);
+    ctx.label(.{ .x = 64 * scale, .y = panel.y + 28 * scale, .w = width - 128 * scale, .h = 38 * scale }, panel, playback_title.get(), TEXT, 28 * scale);
+    const message = switch (player.state()) {
+        .loading => "Loading stream…",
+        .playing => if (playback_paused) "Paused — OK resumes · Back stops" else "OK pauses · Back stops",
+        .failed => player.lastError(),
+        .idle => "Stopped",
+    };
+    ctx.label(.{ .x = 64 * scale, .y = panel.y + 83 * scale, .w = width - 128 * scale, .h = 32 * scale }, panel, message, if (player.state() == .failed) RED else DIM, 22 * scale);
+    ctx.fill(.{ .x = 64 * scale, .y = panel.y + 128 * scale, .w = width - 128 * scale, .h = 6 * scale }, panel, .{ 72, 81, 94, 230 }, 3 * scale);
+}
+
 /// Greedy word wrap against the real glyph advances. The renderer clips a
 /// label to its rect but does not break it, so an overview needs splitting
 /// before it becomes draw commands.
@@ -1737,7 +1787,9 @@ fn buildUi(ctx: *loom.Context) void {
     frame_index += 1;
 
     ctx.begin(width, height);
-    ctx.fill(.{ .w = width, .h = height }, null, BG, 0);
+    // The NDL video plane sits behind this EGL surface. During playback every
+    // untouched pixel must remain transparent, otherwise the UI obscures it.
+    if (screen != .playback) ctx.fill(.{ .w = width, .h = height }, null, BG, 0);
     if (screen == .details or screen == .season) {
         const background = loom.Rect{ .w = width, .h = height };
         if (artwork(detail.backdrop_id.get(), detail.backdrop_tag.get(), .backdrop, 1920, 1080)) |slot| {
@@ -1754,6 +1806,7 @@ fn buildUi(ctx: *loom.Context) void {
         .grid => drawGrid(ctx, width, height, scale),
         .details => drawDetails(ctx, width, scale),
         .season => drawSeason(ctx, width, height, scale),
+        .playback => drawPlayback(ctx, width, height, scale),
     }
     renderer.draw(ctx.commands.items, width, height);
     pointer_press = false;
@@ -1885,6 +1938,7 @@ pub fn main(init: std.process.Init) !void {
 
     try fetcher.init(init.gpa, init.io);
     defer fetcher.deinit();
+    defer player.deinit();
     fetcher.setSession(session);
 
     // A stored token skips straight to the home rows; JELLYFIN_ADDRESS makes a
@@ -1915,6 +1969,10 @@ pub fn main(init: std.process.Init) !void {
     var capture_after: u32 = if (capture_path != null and script.len == 0) 240 else 0;
     while (wl.poll()) {
         pump();
+        if (screen == .playback)
+            glClearColor(0, 0, 0, 0)
+        else
+            glClearColor(9.0 / 255.0, 13.0 / 255.0, 22.0 / 255.0, 1);
         glClear(GL_COLOR_BUFFER_BIT);
         buildUi(&ctx);
         if (script.len != 0 and stepScript() and capture_path != null and capture_after == 0)
