@@ -1,5 +1,4 @@
-//! Jellyfin playback through LG's Starfish media pipeline. See starfish.zig
-//! for why libNDL_directmedia is not in the picture.
+//! Jellyfin playback through LG's Starfish media pipeline.
 const std = @import("std");
 const c = std.c;
 const linux = std.os.linux;
@@ -14,6 +13,7 @@ extern fn jf_demux_next(demux: *anyopaque, data: *?[*]u8, size: *c_int, stream: 
 extern fn jf_demux_video_fps(demux: *anyopaque, index: c_int, num: *c_int, den: *c_int) c_int;
 extern fn jf_demux_audio_open(demux: *anyopaque, index: c_int, rate: *c_int) c_int;
 extern fn jf_demux_video_open(demux: *anyopaque, index: c_int) c_int;
+extern fn jf_demux_video_unsupported(demux: *anyopaque) c_int;
 extern fn jf_demux_audio_decode(demux: *anyopaque, out: *?[*]u8, size: *c_int) c_int;
 extern fn jf_demux_seek(demux: *anyopaque, position_ns: i64) c_int;
 extern fn jf_demux_reopen(demux: *anyopaque, url: [*:0]const u8) c_int;
@@ -63,15 +63,36 @@ fn videoType(codec: c_int) ?VideoType {
         27 => .h264,
         173 => .h265,
         167 => .vp9,
-        226 => .av1,
+        32797 => .av1,
         else => null,
     };
 }
-var uri: [1025]u8 = @splat(0);
+const max_uri_len = 2047;
+var uri: [max_uri_len + 1]u8 = @splat(0);
+/// What to ask for instead when the original is beyond the decoder. Empty
+/// means there is nothing else to try.
+var fallback: [max_uri_len + 1]u8 = @splat(0);
+var fallback_len: usize = 0;
 const app_id = "dev.hookedbehemoth.jellyfin";
 var read_video: c_int = -1;
 var read_audio: c_int = -1;
 var window_id: [*:0]const u8 = undefined;
+var transcode_sequence = std.atomic.Value(u32).init(0);
+
+/// Jellyfin keys a running transcode by PlaySessionId.  Seeking needs a new
+/// job; reusing the id simply reconnects to the first job, whose output starts
+/// at zero regardless of StartTimeTicks.
+fn playSessionId(buffer: []u8) []const u8 {
+    const stamp = nowNs();
+    const sequence = transcode_sequence.fetchAdd(1, .monotonic);
+    return std.fmt.bufPrint(buffer, "{x:0>8}-{x:0>4}-4{x:0>3}-8{x:0>3}-{x:0>12}", .{
+        @as(u32, @truncate(stamp)),
+        @as(u16, @truncate(stamp >> 32)),
+        @as(u16, @truncate(stamp >> 48)) & 0x0fff,
+        @as(u16, @truncate(sequence)) & 0x0fff,
+        (stamp ^ (@as(u64, sequence) << 32)) & 0x0000ffffffffffff,
+    }) catch "";
+}
 
 fn feed() void {
     const z: [*:0]const u8 = @ptrCast(&uri);
@@ -81,6 +102,27 @@ fn feed() void {
         return;
     };
     defer jf_demux_close(demux);
+    // Before anything is read: a 10-bit or above-High source will never
+    // decode, so swap to the transcode URL while the demuxer is still fresh
+    // and let the discovery below run against what the server sends instead.
+    var transcoded = false;
+    if (jf_demux_video_unsupported(demux) != 0 and fallback_len > 0) {
+        std.debug.print("Jellyfin: source is beyond the decoder, transcoding\n", .{});
+        var id: [36]u8 = undefined;
+        const url = std.fmt.bufPrintZ(&uri, "{s}&PlaySessionId={s}&StartTimeTicks=0", .{
+            std.mem.sliceTo(&fallback, 0), playSessionId(&id),
+        }) catch {
+            setError("The server transcode URL is too long");
+            running.store(false, .release);
+            return;
+        };
+        if (jf_demux_reopen(demux, url.ptr) == 0) {
+            setError("The server would not transcode this item");
+            running.store(false, .release);
+            return;
+        }
+        transcoded = true;
+    }
     var video_stream: c_int = -1;
     var audio_stream: c_int = -1;
     var codec: c_int = 0;
@@ -108,8 +150,8 @@ fn feed() void {
         running.store(false, .release);
         return;
     }
-    // The pipeline takes PCM, MP3 or Opus only, and its MP3 path never builds
-    // an audio sink on this TV, so everything is decoded to PCM first.
+    // The pipeline takes PCM, MP3 or Opus; only PCM builds an audio sink on
+    // this TV, so everything is decoded to PCM first.
     var audio: ?smp.Audio = null;
     if (audio_stream >= 0) {
         var rate: c_int = 0;
@@ -126,8 +168,7 @@ fn feed() void {
     }
     read_video = video_stream;
     read_audio = audio_stream;
-    if (jf_demux_video_open(demux, video_stream) != 0)
-        std.debug.print("Jellyfin: converting video to Annex-B\n", .{});
+    _ = jf_demux_video_open(demux, video_stream);
     var fps_num: c_int = 0;
     var fps_den: c_int = 0;
     _ = jf_demux_video_fps(demux, video_stream, &fps_num, &fps_den);
@@ -143,9 +184,8 @@ fn feed() void {
         return;
     };
     defer smp.deinit(); // not just Unload: the object does not survive a reload
-    // Play before feeding: a re-loaded pipeline does not necessarily accept
-    // buffers while it is merely loaded. The cushion comes from priming (feed
-    // flat out until prime_ns is in), not from withholding this.
+    // Play before feeding: a merely loaded pipeline does not reliably accept
+    // buffers. The cushion comes from priming, not from withholding this.
     if (!smp.play()) std.debug.print("SMP Play failed: {s}\n", .{smp.lastError()});
     playback_state.store(@intFromEnum(State.playing), .release);
     while (running.load(.acquire)) {
@@ -153,7 +193,7 @@ fn feed() void {
         runSegment(demux);
         if (!seek_pending.load(.acquire)) break;
         seek_pending.store(false, .release);
-        seekTo(demux, seek_to_ms);
+        seekTo(demux, seek_to_ms, transcoded);
     }
     running.store(false, .release);
 }
@@ -161,27 +201,35 @@ fn feed() void {
 /// In-place seek: keep the pipeline loaded and re-anchor it. Runs between
 /// segments, so the reader and both feed threads are already joined and the
 /// queues and clock are ours alone.
-fn seekTo(demux: *anyopaque, target_ms: i32) void {
+fn seekTo(demux: *anyopaque, target_ms: i32, transcoded: bool) void {
     // Paused first: setTimeToDecode refuses to run while playing. Both take 0,
-    // not the target: every segment we feed is rebased to zero by `pace`, so
-    // zero is where the pipeline's new segment really begins.
+    // not the target -- `pace` rebases every segment to zero, so zero is where
+    // the pipeline's new segment begins.
     _ = smp.pause();
     if (!smp.flush(0)) std.debug.print("SMP flush refused\n", .{});
     if (!smp.setTimeToDecode(0)) std.debug.print("SMP setTimeToDecode refused\n", .{});
-    // A file the server hands over whole can be seeked in place. A stream it
-    // transcodes on the fly cannot -- no byte ranges, and av_seek_frame leaves
-    // it rewound to the head -- so that one is re-requested at the offset.
-    const in_place = jf_demux_seek(demux, @as(i64, target_ms) * std.time.ns_per_ms) != 0;
-    const reopened = !in_place and reopenAt(demux, target_ms);
-    std.debug.print("seek: from={d}ms target={d}ms in_place={} reopened={}\n", .{
-        position_ms.load(.monotonic), target_ms, in_place, reopened,
+    // A live transcode has no byte ranges. av_seek_frame nevertheless reports
+    // success for it, but positions FFmpeg at byte zero; always ask Jellyfin
+    // to create a new segment at the desired time instead. Static originals
+    // seek locally, falling back to a re-open only when that fails.
+    const moved = if (transcoded)
+        reopenAt(demux, target_ms, true)
+    else
+        jf_demux_seek(demux, @as(i64, target_ms) * std.time.ns_per_ms) != 0 or reopenAt(demux, target_ms, false);
+    std.debug.print("Jellyfin seek: target={d}ms source={s} moved={}\n", .{
+        target_ms,
+        if (transcoded) "transcode" else "static",
+        moved,
     });
-    if (!in_place and !reopened) return;
+    if (!moved) {
+        setError("Could not seek this Jellyfin stream");
+        playback_state.store(@intFromEnum(State.failed), .release);
+        return;
+    }
     stream_base_ms = target_ms;
     video_queue.reset();
     audio_queue.reset();
-    // The first packet after the seek re-anchors the clock, exactly as the
-    // first packet of a fresh stream does.
+    // The first packet after the seek re-anchors the clock.
     clock_ready.store(false, .release);
     primed.store(false, .release);
     position_ms.store(target_ms, .monotonic);
@@ -189,28 +237,31 @@ fn seekTo(demux: *anyopaque, target_ms: i32) void {
 }
 
 /// Ask the server for the same stream from `target_ms` on. Jellyfin's
-/// transcoding endpoint takes the offset as `startTimeTicks`, and what comes
-/// back is a fresh stream numbered from zero.
-///
-/// A tick is 100 ns, so a millisecond is **ten thousand** of them. The API
-/// docs say "1 tick = 10000 ms", which is the same number with the ratio
-/// upside down; dividing by it sends startTimeTicks=0 for any seek under ten
-/// seconds, which reads exactly like a seek that always jumps to the start.
-fn reopenAt(demux: *anyopaque, target_ms: i32) bool {
-    var buffer: [1100]u8 = undefined;
-    const url = std.fmt.bufPrintZ(&buffer, "{s}&startTimeTicks={d}", .{
-        std.mem.sliceTo(&uri, 0), @as(i64, target_ms) * 10_000,
-    }) catch return false;
-    // Without the api_key, which is the rest of the line: this is meant to be
-    // pasteable into curl by someone who has their own token.
-    const key = std.mem.indexOf(u8, url, "&api_key=") orelse url.len;
-    std.debug.print("reopening: {s} (+api_key), startTimeTicks={d}\n", .{
-        url[0..key], @as(i64, target_ms) * 10_000,
-    });
+/// transcoding endpoint takes the offset as `StartTimeTicks` -- a tick is
+/// 100 ns, so a millisecond is ten thousand of them -- and what comes back is
+/// a fresh stream numbered from zero.
+fn reopenAt(demux: *anyopaque, target_ms: i32, transcoded: bool) bool {
+    var buffer: [max_uri_len + 96]u8 = undefined;
+    // Use the route's canonical Pascal-case spelling. ASP.NET's current
+    // binder is case-insensitive, but older Jellyfin servers route the
+    // lower-case spelling through the opaque stream-options map instead of
+    // binding it to VideoRequestDto.StartTimeTicks.
+    var id: [36]u8 = undefined;
+    const url = if (transcoded)
+        std.fmt.bufPrintZ(&buffer, "{s}&PlaySessionId={s}&StartTimeTicks={d}", .{
+            std.mem.sliceTo(&fallback, 0), playSessionId(&id), @as(i64, target_ms) * 10_000,
+        }) catch return false
+    else
+        std.fmt.bufPrintZ(&buffer, "{s}&StartTimeTicks={d}", .{
+            std.mem.sliceTo(&uri, 0), @as(i64, target_ms) * 10_000,
+        }) catch return false;
     if (jf_demux_reopen(demux, url.ptr) == 0) return false;
-    // A re-cut stream is a new stream: nothing promises it numbers its tracks
-    // the way the last one did, and feeding video into the audio lane looks
-    // exactly like a seek that does nothing.
+    if (transcoded) {
+        @memcpy(uri[0..url.len], url);
+        uri[url.len] = 0;
+    }
+    // A re-cut stream is a new stream, and nothing promises it numbers its
+    // tracks the way the last one did.
     const had_audio = read_audio >= 0;
     read_video = -1;
     read_audio = -1;
@@ -223,7 +274,6 @@ fn reopenAt(demux: *anyopaque, target_ms: i32) bool {
         if (read_video < 0 and kind == 0 and videoType(codec) != null) read_video = @intCast(i);
         if (read_audio < 0 and kind == 1 and had_audio) read_audio = @intCast(i);
     }
-    std.debug.print("re-cut source: video stream {d}, audio stream {d}\n", .{ read_video, read_audio });
     if (read_video < 0) return false;
     _ = jf_demux_video_open(demux, read_video);
     // The decoder went with the old source.
@@ -245,10 +295,8 @@ fn runSegment(demux: *anyopaque) void {
         running.store(false, .release);
         return;
     };
-    // Audio gets its own thread. Sharing one meant a chunk of audio due later
-    // held up every video frame queued behind it, and waiting for room in the
-    // audio sink stalled video as well -- with rendering on arrival, that
-    // head-of-line blocking is visible as stutter.
+    // Audio gets its own thread: on a shared one, a chunk of audio due later
+    // holds up every video frame queued behind it.
     var audio_feeder: ?std.Thread = null;
     defer {
         // Clearing this first is what lets both threads fall out of their
@@ -277,8 +325,8 @@ fn runSegment(demux: *anyopaque) void {
     }
 }
 
-/// Audio runs on the same clock as video -- one origin, set by whichever
-/// stream is fed first -- so the two stay aligned without sharing a thread.
+/// Audio runs on the same clock as video, so the two stay aligned without
+/// sharing a thread.
 fn feedAudio() void {
     while (audio_queue.pop()) |chunk| {
         defer std.heap.c_allocator.free(chunk.bytes);
@@ -305,18 +353,13 @@ fn read(demux: *anyopaque) void {
             if (jf_demux_audio_decode(demux, &pcm, &pcm_size) == 0) continue;
             bytes = (pcm orelse continue)[0..@intCast(pcm_size)];
         }
-        // The clock origin is taken here, not in the feed threads: the reader
-        // sees packets in container order, so the first one is genuinely the
-        // earliest. Racing two feed threads for it let the loser go negative,
-        // and a negative pts reaches libpf as an enormous unsigned one -- with
-        // audioSync the audio sink is the master clock, so that wedges the
-        // whole pipeline with every buffer still reported accepted.
+        // The clock origin belongs here, not in the feed threads: the reader
+        // sees packets in container order, so the first one is the earliest.
+        // Two feed threads racing for it would send the loser negative, and
+        // libpf reads a negative pts as an enormous unsigned one.
         if (!clock_ready.load(.acquire)) {
             clock_pts = pts;
             clock_ready.store(true, .release);
-            std.debug.print("segment starts at {d}ms of the source (base {d}ms)\n", .{
-                @divTrunc(pts, std.time.ns_per_ms), stream_base_ms,
-            });
         }
         // Both buffers belong to the demuxer and die on the next read.
         const copy = std.heap.c_allocator.dupe(u8, bytes) catch break;
@@ -327,22 +370,20 @@ fn read(demux: *anyopaque) void {
     audio_queue.finish();
 }
 
-// One clock for both feed threads. Plain values, published by whichever
-// stream is fed first: 64-bit atomics do not exist on this target, so a flag
-// with release/acquire ordering hands them over instead.
+// One clock for both feed threads. Plain values: 64-bit atomics do not exist
+// on this target, so a flag with release/acquire ordering hands them over.
 var clock_pts: i64 = 0;
 var clock_ns: u64 = 0;
 var clock_ready = std.atomic.Value(bool).init(false);
-/// False until the pipeline has a cushion and Play() has been called. Until
-/// then both lanes feed flat out: starting an empty pipeline gives you one
-/// frame and then a stall, which is what the first stream after launch did.
+/// False until the pipeline has a cushion. Until then both lanes feed flat
+/// out -- an empty pipeline shows one frame and then stalls.
 var primed = std.atomic.Value(bool).init(false);
 
 /// Sleep until this packet is due, and return its stream-relative timestamp.
 fn pace(packet_pts: i64) i64 {
     // Stream-relative, not container-absolute: we call Play(), so the pipeline
-    // has a base time and TS timestamps start wherever they like. Clamped
-    // because a stream can still hand us a packet older than its first one.
+    // has a base time and container timestamps start wherever they like.
+    // Clamped because a stream can hand us a packet older than its first.
     const pts = @max(0, packet_pts - clock_pts);
     if (!primed.load(.acquire)) return pts; // priming: as fast as it will take
     const due = clock_ns + @as(u64, @intCast(pts));
@@ -426,8 +467,7 @@ fn nowNs() u64 {
 }
 
 /// Feed one chunk, waiting out backpressure. A full pipeline answers
-/// BufferFull and keeps nothing: the chunk has to be offered again, which is
-/// the backpressure path, not a reason to drop the frame.
+/// BufferFull and keeps nothing, so the chunk has to be offered again.
 fn feedRetrying(lane: Lane, bytes: []const u8, pts: i64) bool {
     var tries: u32 = 0;
     while (flowing()) : (tries += 1) {
@@ -453,8 +493,8 @@ fn feedRetrying(lane: Lane, bytes: []const u8, pts: i64) bool {
 }
 const Lane = enum(u8) { video, audio };
 
-/// A pacing sleep that a stop can cut short: the session teardown joins these
-/// threads, and a whole second of cushion is a whole second of waiting.
+/// A pacing sleep a stop can cut short, so teardown does not wait out a
+/// second of cushion.
 fn sleepPaced(ns: u64) void {
     var left = ns;
     while (left > 0 and flowing()) {
@@ -495,11 +535,11 @@ pub fn seek(delta_seconds: i32) void {
 
 var session: ?std.Thread = null;
 
-pub fn play(stream_uri: []const u8, width: u32, height: u32) !void {
+pub fn play(stream_uri: []const u8, transcode_uri: []const u8, width: u32, height: u32) !void {
+    std.log.debug("stream: {s}, transcode: {s}", .{ stream_uri, transcode_uri });
     if (running.load(.acquire)) return error.AlreadyPlaying;
-    // The previous session unloads the pipeline on its way out. Detaching it
-    // meant that Unload could land after the next Load and take the new stream
-    // down with it, so wait for it here.
+    // The previous session unloads the pipeline on its way out, and that must
+    // land before the next Load.
     if (session) |t| {
         t.join();
         session = null;
@@ -509,9 +549,12 @@ pub fn play(stream_uri: []const u8, width: u32, height: u32) !void {
     const rect = [4]i32{ 0, 0, @intCast(width), @intCast(height) };
     window_id = try wl.exportVideoWindow(rect, rect);
     try smp.init(app_id);
-    if (stream_uri.len >= uri.len) return error.UriTooLong;
+    if (stream_uri.len >= uri.len or transcode_uri.len >= fallback.len) return error.UriTooLong;
     @memcpy(uri[0..stream_uri.len], stream_uri);
     uri[stream_uri.len] = 0;
+    fallback_len = transcode_uri.len;
+    @memcpy(fallback[0..fallback_len], transcode_uri[0..fallback_len]);
+    fallback[fallback_len] = 0;
     video_queue.reset();
     audio_queue.reset();
     clock_ready.store(false, .release);

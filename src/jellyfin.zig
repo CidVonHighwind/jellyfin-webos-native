@@ -1094,7 +1094,12 @@ fn startPlayback(id: []const u8, title: []const u8) void {
     var buffer: [256]u8 = undefined;
     stream_url.set(api.streamUrl(&session, id, &buffer));
     if (stream_url.len == 0) return setError("Could not build a stream URL", .{});
-    player.play(stream_url.get(), gl.width, gl.height) catch |err| {
+    // The transcode request carries the hardware capability constraints. Keep
+    // this comfortably above a long reverse-proxy address plus access token;
+    // bufPrint otherwise returns an empty URL without an error at this layer.
+    var transcode_buffer: [2048]u8 = undefined;
+    const transcode_url = api.transcodeUrl(&session, id, &transcode_buffer);
+    player.play(stream_url.get(), transcode_url, gl.width, gl.height) catch |err| {
         setError("Playback failed: {s}: {s}", .{ @errorName(err), player.lastError() });
         return;
     };

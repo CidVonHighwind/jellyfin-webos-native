@@ -456,6 +456,34 @@ pub fn episodes(http: *std.http.Client, arena: std.mem.Allocator, session: *cons
 
 /// MPEG-TS lets Jellyfin remux compatible H.264/H.265/AV1 video instead of
 /// re-encoding it. The DirectMedia player demuxes its packets locally.
+/// What the server should send when the original is beyond the TV's decoder.
+/// Deliberately disable stream copy as well as naming the codecs.  This path
+/// is selected precisely because the source is outside the hardware decoder's
+/// limits, so a copied H.264 stream can still be High 10, 4:2:2, or above the
+/// level the decoder accepts.  The `h264-*` options are Jellyfin's codec
+/// profile constraints; generic `profile` and `level` alone do not constrain
+/// all server versions' encoder choice.
+///
+/// The bitrate has to be stated. Left out, the server picks a default meant
+/// for a client that declared no capabilities, and 1080p arrives visibly soft.
+pub fn transcodeUrl(session: *const Session, id: []const u8, buffer: []u8) []const u8 {
+    return std.fmt.bufPrint(
+        buffer,
+        "{s}/Videos/{s}/stream.ts?videoCodec=h264&audioCodec=mp3" ++
+            "&allowVideoStreamCopy=false&allowAudioStreamCopy=false" ++
+            "&maxVideoBitDepth=8&profile=high&level=41" ++
+            "&h264-profile=high&h264-level=41&h264-videobitdepth=8&h264-rangetype=SDR" ++
+            "&requireAvc=true&maxAudioChannels=2&transcodingMaxAudioChannels=2" ++
+            // Some server releases only honour the copy-disabling flags after
+            // a transcode reason is supplied.  Without it, an unsupported
+            // H.264 source may be remuxed again and its seek request is
+            // accepted but ignored by the live HTTP response.
+            "&enableAutoStreamCopy=false&transcodeReasons=VideoCodecNotSupported" ++
+            "&videoBitRate=20000000&audioBitRate=192000&api_key={s}",
+        .{ base(session), id, session.token.get() },
+    ) catch "";
+}
+
 pub fn streamUrl(session: *const Session, id: []const u8, buffer: []u8) []const u8 {
     // static=true is the original file, byte ranges and all, which is what
     // makes seeking work: a server-side remux is a live stream with no

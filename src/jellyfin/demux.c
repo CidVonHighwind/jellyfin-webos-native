@@ -190,6 +190,21 @@ int jf_demux_stream(void *opaque, int index, int *kind, int *codec, int *width, 
     *kind = p->codec_type; *codec = p->codec_id; *width = p->width; *height = p->height;
     return 1;
 }
+/// 1 when the video in this container is beyond what the TV's decoder takes:
+/// more than 8 bits per sample, or H.264 above High profile. Hardware decoders
+/// answer either with "Sequence Init Fail" and no picture, so the caller has
+/// to ask the server to transcode instead.
+int jf_demux_video_unsupported(void *opaque) {
+    struct jf_demux *d = opaque;
+    for (unsigned i = 0; i < d->format->nb_streams; i++) {
+        AVCodecParameters *p = d->format->streams[i]->codecpar;
+        if (p->codec_type != AVMEDIA_TYPE_VIDEO) continue;
+        if (p->bits_per_raw_sample > 8) return 1;
+        return p->codec_id == AV_CODEC_ID_H264 && p->profile > FF_PROFILE_H264_HIGH;
+    }
+    return 0;
+}
+
 /// Route this video stream through a bitstream filter when the container
 /// stores it length-prefixed (an AVCC/HVCC extradata block starts with 1).
 /// Elementary-stream containers already carry start codes and need none.
