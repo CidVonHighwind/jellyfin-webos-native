@@ -4,6 +4,10 @@ const c = std.c;
 const linux = std.os.linux;
 const wl = @import("../sdl.zig");
 const smp = @import("starfish.zig");
+const Queue = @import("packet_queue.zig").Queue;
+var io: std.Io = undefined;
+var segment_mutex: std.Io.Mutex = .init;
+var interrupted: std.Io.Event = .unset;
 
 extern fn jf_demux_open(url: [*:0]const u8) ?*anyopaque;
 extern fn jf_demux_close(demux: *anyopaque) void;
@@ -36,6 +40,11 @@ fn setError(message: []const u8) void {
     const n = @min(message.len, error_text.len - 1);
     @memcpy(error_text[0..n], message[0..n]);
     error_text[n] = 0;
+    setState(.failed);
+}
+fn setState(value: State) void {
+    playback_state.store(@intFromEnum(value), .release);
+    wl.wake();
 }
 pub fn lastError() []const u8 {
     return std.mem.sliceTo(&error_text, 0);
@@ -43,15 +52,18 @@ pub fn lastError() []const u8 {
 pub fn state() State {
     return @enumFromInt(playback_state.load(.acquire));
 }
-/// Starfish uses libc and needs nothing from the app's IO; the hook exists
-/// because both backends expose it.
-pub fn init(_: std.Io) void {}
+pub fn init(app_io: std.Io) void {
+    io = app_io;
+}
 /// False: the video is on the TV's own plane, not in our framebuffer, so the
 /// app punches a transparent hole rather than drawing a background.
 pub fn embedded() bool {
     return false;
 }
 pub fn render(_: u32, _: u32) void {}
+pub fn needsFrame() bool {
+    return false; // Starfish presents video independently of the graphics plane.
+}
 
 /// Pipeline state and errors arrive here.
 fn onLoad(kind: i32, num: i64, str: ?[*:0]const u8) callconv(.c) void {
@@ -104,6 +116,15 @@ fn playSessionId(buffer: []u8) []const u8 {
 }
 
 fn feed() void {
+    defer {
+        running.store(false, .release);
+        if (state() != .failed) setState(.idle);
+    }
+    smp.init(app_id) catch {
+        setError(smp.lastError());
+        return;
+    };
+    defer smp.deinit();
     const z: [*:0]const u8 = @ptrCast(&uri);
     const demux = jf_demux_open(z) orelse {
         setError("FFmpeg could not open the Jellyfin stream");
@@ -192,17 +213,31 @@ fn feed() void {
         running.store(false, .release);
         return;
     };
-    defer smp.deinit(); // not just Unload: the object does not survive a reload
     // Play before feeding: a merely loaded pipeline does not reliably accept
     // buffers. The cushion comes from priming, not from withholding this.
     if (!smp.play()) std.debug.print("SMP Play failed: {s}\n", .{smp.lastError()});
-    playback_state.store(@intFromEnum(State.playing), .release);
+    setState(.playing);
     while (running.load(.acquire)) {
+        segment_mutex.lockUncancelable(io);
+        if (!running.load(.acquire)) {
+            segment_mutex.unlock(io);
+            break;
+        }
+        // Serialize new seek requests with segment startup. A request arriving
+        // during a slow reopen stays pending for the next iteration.
+        if (seek_pending.swap(false, .acq_rel)) {
+            const target = seek_to_ms;
+            segment_mutex.unlock(io);
+            seekTo(demux, target, transcoded);
+            continue;
+        }
+        video_queue.reset(io);
+        audio_queue.reset(io);
+        interrupted.reset();
         segment.store(true, .release);
+        segment_mutex.unlock(io);
         runSegment(demux);
         if (!seek_pending.load(.acquire)) break;
-        seek_pending.store(false, .release);
-        seekTo(demux, seek_to_ms, transcoded);
     }
     running.store(false, .release);
 }
@@ -232,12 +267,10 @@ fn seekTo(demux: *anyopaque, target_ms: i32, transcoded: bool) void {
     });
     if (!moved) {
         setError("Could not seek this Jellyfin stream");
-        playback_state.store(@intFromEnum(State.failed), .release);
+        running.store(false, .release);
         return;
     }
     stream_base_ms = target_ms;
-    video_queue.reset();
-    audio_queue.reset();
     // The first packet after the seek re-anchors the clock.
     clock_ready.store(false, .release);
     primed.store(false, .release);
@@ -310,18 +343,21 @@ fn runSegment(demux: *anyopaque) void {
     defer {
         // Clearing this first is what lets both threads fall out of their
         // queues; joining before it would wait forever.
-        segment.store(false, .release);
+        interruptSegment();
         reader.join();
         if (audio_feeder) |t| t.join();
     }
-    if (read_audio >= 0) audio_feeder = std.Thread.spawn(.{}, feedAudio, .{}) catch null;
+    if (read_audio >= 0) audio_feeder = std.Thread.spawn(.{}, feedAudio, .{}) catch |err| {
+        setError(@errorName(err));
+        return;
+    };
 
-    while (video_queue.pop()) |chunk| {
+    while (video_queue.pop(io)) |chunk| {
         defer std.heap.c_allocator.free(chunk.bytes);
+        if (!flowing()) break;
         const pts = pace(chunk.pts);
         if (!feedRetrying(.video, chunk.bytes, pts)) {
-            setError(smp.lastError());
-            playback_state.store(@intFromEnum(State.failed), .release);
+            if (flowing()) setError(smp.lastError());
             break;
         }
         position_ms.store(stream_base_ms + @as(i32, @intCast(@divTrunc(pts, std.time.ns_per_ms))), .monotonic);
@@ -337,8 +373,9 @@ fn runSegment(demux: *anyopaque) void {
 /// Audio runs on the same clock as video, so the two stay aligned without
 /// sharing a thread.
 fn feedAudio() void {
-    while (audio_queue.pop()) |chunk| {
+    while (audio_queue.pop(io)) |chunk| {
         defer std.heap.c_allocator.free(chunk.bytes);
+        if (!flowing()) break;
         const pts = pace(chunk.pts);
         // A chunk the sink will not take costs a gap in the sound, not the
         // whole playback, so a lost race here is not fatal.
@@ -373,10 +410,10 @@ fn read(demux: *anyopaque) void {
         // Both buffers belong to the demuxer and die on the next read.
         const copy = std.heap.c_allocator.dupe(u8, bytes) catch break;
         const target = if (audio) &audio_queue else &video_queue;
-        if (!target.push(.{ .bytes = copy, .stream = stream, .pts = pts })) break;
+        if (!target.push(io, .{ .bytes = copy, .pts = pts })) break;
     }
-    video_queue.finish();
-    audio_queue.finish();
+    video_queue.close(io);
+    audio_queue.close(io);
 }
 
 // One clock for both feed threads. Plain values: 64-bit atomics do not exist
@@ -406,66 +443,6 @@ fn pace(packet_pts: i64) i64 {
 /// Content buffered before Play(), and the cushion kept afterwards.
 const prime_ns = 1000 * std.time.ns_per_ms;
 
-/// Demuxed-and-ready data waiting for its presentation time. One producer
-/// (the reader thread), one consumer (the feed loop), so plain atomics do;
-/// both sides idle with a short sleep rather than a condition variable.
-const Chunk = struct { bytes: []u8, stream: c_int, pts: i64 };
-const Queue = struct {
-    const slots = 512;
-    const capacity_bytes = 8 << 20; // ~4s of 1080p at 15 Mbit
-    const idle_ns = 2 * std.time.ns_per_ms;
-
-    ring: [slots]Chunk = undefined,
-    write: std.atomic.Value(usize) = .init(0),
-    read: std.atomic.Value(usize) = .init(0),
-    bytes: std.atomic.Value(usize) = .init(0),
-    done: std.atomic.Value(bool) = .init(false),
-
-    /// False once playback is over, and the chunk is then the caller's to free.
-    fn push(self: *@This(), chunk: Chunk) bool {
-        const w = self.write.load(.monotonic);
-        while (flowing()) {
-            const full = (w + 1) % slots == self.read.load(.acquire) or
-                self.bytes.load(.monotonic) >= capacity_bytes;
-            if (!full) break;
-            sleepNs(idle_ns);
-        } else {
-            std.heap.c_allocator.free(chunk.bytes);
-            return false;
-        }
-        self.ring[w] = chunk;
-        _ = self.bytes.fetchAdd(chunk.bytes.len, .monotonic);
-        self.write.store((w + 1) % slots, .release);
-        return true;
-    }
-
-    fn pop(self: *@This()) ?Chunk {
-        if (!flowing()) return null; // a stop or a seek drops what is queued
-        const r = self.read.load(.monotonic);
-        while (r == self.write.load(.acquire)) {
-            if (self.done.load(.acquire) or !flowing()) return null;
-            sleepNs(idle_ns);
-        }
-        const chunk = self.ring[r];
-        _ = self.bytes.fetchSub(chunk.bytes.len, .monotonic);
-        self.read.store((r + 1) % slots, .release);
-        return chunk;
-    }
-
-    /// End of stream: let the feed drain what is left, then stop.
-    fn finish(self: *@This()) void {
-        self.done.store(true, .release);
-    }
-
-    fn reset(self: *@This()) void {
-        var r = self.read.raw;
-        while (r != self.write.raw) : (r = (r + 1) % slots) std.heap.c_allocator.free(self.ring[r].bytes);
-        self.read.raw = 0;
-        self.write.raw = 0;
-        self.bytes.raw = 0;
-        self.done.raw = false;
-    }
-};
 var video_queue: Queue = .{};
 var audio_queue: Queue = .{};
 
@@ -494,7 +471,7 @@ fn feedRetrying(lane: Lane, bytes: []const u8, pts: i64) bool {
             },
             .buffer_full => {
                 if (tries > 600) return false; // 3s: something is wedged
-                sleepNs(5 * std.time.ns_per_ms);
+                sleepPaced(5 * std.time.ns_per_ms);
             },
         }
     }
@@ -505,17 +482,28 @@ const Lane = enum(u8) { video, audio };
 /// A pacing sleep a stop can cut short, so teardown does not wait out a
 /// second of cushion.
 fn sleepPaced(ns: u64) void {
-    var left = ns;
-    while (left > 0 and flowing()) {
-        const slice = @min(left, 20 * std.time.ns_per_ms);
-        sleepNs(slice);
-        left -= slice;
+    const due = nowNs() + ns;
+    while (flowing()) {
+        const now = nowNs();
+        if (now >= due) return;
+        interrupted.waitTimeout(io, .{ .duration = .{
+            .raw = .fromNanoseconds(due - now),
+            .clock = .awake,
+        } }) catch {};
     }
 }
 
-fn sleepNs(ns: u64) void {
-    const ts = linux.timespec{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
-    _ = linux.nanosleep(&ts, null);
+fn interruptSegment() void {
+    segment_mutex.lockUncancelable(io);
+    defer segment_mutex.unlock(io);
+    interruptSegmentLocked();
+}
+
+fn interruptSegmentLocked() void {
+    segment.store(false, .release);
+    video_queue.close(io);
+    audio_queue.close(io);
+    interrupted.set(io);
 }
 
 /// Where the feed has got to, in stream milliseconds. This is the *fed*
@@ -536,10 +524,12 @@ pub fn position() i32 {
 /// Jump `delta_seconds` from where the feed is. The segment loop performs the
 /// seek once both feed threads have parked, so this only has to ask.
 pub fn seek(delta_seconds: i32) void {
+    segment_mutex.lockUncancelable(io);
+    defer segment_mutex.unlock(io);
     if (!running.load(.acquire)) return;
     seek_to_ms = @max(0, position_ms.load(.monotonic) + delta_seconds * 1000);
     seek_pending.store(true, .release);
-    segment.store(false, .release);
+    interruptSegmentLocked();
 }
 
 var session: ?std.Thread = null;
@@ -554,24 +544,22 @@ pub fn play(stream_uri: []const u8, transcode_uri: []const u8, width: u32, heigh
         session = null;
     }
     @memset(&error_text, 0);
-    playback_state.store(@intFromEnum(State.loading), .release);
+    setState(.loading);
     const rect = [4]i32{ 0, 0, @intCast(width), @intCast(height) };
     window_id = try wl.exportVideoWindow(rect, rect);
-    try smp.init(app_id);
     if (stream_uri.len >= uri.len or transcode_uri.len >= fallback.len) return error.UriTooLong;
     @memcpy(uri[0..stream_uri.len], stream_uri);
     uri[stream_uri.len] = 0;
     fallback_len = transcode_uri.len;
     @memcpy(fallback[0..fallback_len], transcode_uri[0..fallback_len]);
     fallback[fallback_len] = 0;
-    video_queue.reset();
-    audio_queue.reset();
     clock_ready.store(false, .release);
     primed.store(false, .release);
     seek_pending.store(false, .release);
     position_ms.store(0, .monotonic);
     stream_base_ms = 0;
     running.store(true, .release);
+    errdefer running.store(false, .release);
     session = try std.Thread.spawn(.{}, feed, .{});
 }
 pub fn pause() void {
@@ -582,8 +570,8 @@ pub fn resumePlayback() void {
 }
 pub fn stop() void {
     running.store(false, .release);
-    segment.store(false, .release);
-    playback_state.store(@intFromEnum(State.idle), .release);
+    interruptSegment();
+    setState(.idle);
 }
 pub fn deinit() void {
     stop();
@@ -592,4 +580,6 @@ pub fn deinit() void {
         session = null;
     }
     smp.deinit();
+    video_queue.reset(io);
+    audio_queue.reset(io);
 }

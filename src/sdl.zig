@@ -131,6 +131,7 @@ const ev_quit = 0x100;
 /// Our own event, so a foreign thread can ask the main thread to do something
 /// that only the main thread may do. SDL_USEREVENT.
 const ev_user = 0x8000;
+const ev_wake = 0x8001;
 const ev_window = 0x200;
 const ev_keydown = 0x300;
 const ev_keyup = 0x301;
@@ -169,6 +170,7 @@ var SDL_GL_SwapWindow: *const fn (*Window) callconv(.c) void = undefined;
 var SDL_GL_SetSwapInterval: *const fn (c_int) callconv(.c) c_int = undefined;
 var SDL_PollEvent: *const fn (*Event) callconv(.c) c_int = undefined;
 var SDL_WaitEvent: *const fn (*Event) callconv(.c) c_int = undefined;
+var SDL_WaitEventTimeout: *const fn (*Event, c_int) callconv(.c) c_int = undefined;
 var SDL_PushEvent: *const fn (*Event) callconv(.c) c_int = undefined;
 var SDL_StartTextInput: *const fn () callconv(.c) void = undefined;
 var SDL_StopTextInput: *const fn () callconv(.c) void = undefined;
@@ -232,6 +234,9 @@ pub var on_webos = false;
 /// False while SDL reports the window minimized. Render loops wait for an
 /// event in this state instead of swapping invisible frames in a tight loop.
 pub var drawable = true;
+/// Main-thread invalidation. Worker wakeups alone do not request a redraw.
+pub var frame_requested = true;
+var wake_pending = std.atomic.Value(bool).init(false);
 /// The display refresh rate reported by SDL, in millihertz. A few desktop
 /// drivers omit it, so retain the conventional 60 Hz fallback.
 pub var refresh_mhz: u32 = 60_000;
@@ -266,6 +271,7 @@ pub fn init(app_id: [*:0]const u8, title: [*:0]const u8, w: u32, h: u32) !void {
     SDL_GL_SetSwapInterval = try bind(@TypeOf(SDL_GL_SetSwapInterval), "SDL_GL_SetSwapInterval");
     SDL_PollEvent = try bind(@TypeOf(SDL_PollEvent), "SDL_PollEvent");
     SDL_WaitEvent = try bind(@TypeOf(SDL_WaitEvent), "SDL_WaitEvent");
+    SDL_WaitEventTimeout = try bind(@TypeOf(SDL_WaitEventTimeout), "SDL_WaitEventTimeout");
     SDL_PushEvent = try bind(@TypeOf(SDL_PushEvent), "SDL_PushEvent");
     SDL_StartTextInput = try bind(@TypeOf(SDL_StartTextInput), "SDL_StartTextInput");
     SDL_StopTextInput = try bind(@TypeOf(SDL_StopTextInput), "SDL_StopTextInput");
@@ -460,6 +466,14 @@ pub fn postRaise() void {
     _ = SDL_PushEvent(&event);
 }
 
+/// Wake the event loop without input, window activation, or forced rendering.
+/// Coalesce worker completions until the main thread consumes the empty event.
+pub fn wake() void {
+    if (lib == null or wake_pending.swap(true, .acq_rel)) return;
+    var event: Event = .{ .kind = ev_wake, .rest = @splat(0) };
+    if (SDL_PushEvent(&event) <= 0) wake_pending.store(false, .release);
+}
+
 /// Drain SDL's queue into the app's handler. Returns false once the app should
 /// stop, which is what the main loop runs on.
 pub fn poll() bool {
@@ -468,11 +482,17 @@ pub fn poll() bool {
     return running;
 }
 
-/// Block until SDL delivers one event. This is used only while minimized, so a
-/// restore, close, or lifecycle event wakes the app without rendering frames.
+/// Block until SDL delivers one event.
 pub fn wait() bool {
     var event: Event = undefined;
     if (SDL_WaitEvent(&event) != 0) translate(&event);
+    return running;
+}
+
+/// A negative timeout waits indefinitely; zero only checks pending events.
+pub fn waitTimeout(milliseconds: i32) bool {
+    var event: Event = undefined;
+    if (SDL_WaitEventTimeout(&event, milliseconds) != 0) translate(&event);
     return running;
 }
 
@@ -484,7 +504,11 @@ fn translate(event: *const Event) void {
         },
         // Only the main thread may touch the window, so `postRaise` comes
         // back through the queue to be acted on here.
-        ev_user => if (window) |win| SDL_RaiseWindow(win),
+        ev_user => {
+            if (window) |win| SDL_RaiseWindow(win);
+            frame_requested = true;
+        },
+        ev_wake => wake_pending.store(false, .release),
         ev_keydown, ev_keyup => {
             const key = readKey(event, event.kind == ev_keydown);
             // Auto-repeat drives held-down navigation, so it is not filtered.
@@ -534,7 +558,10 @@ fn translate(event: *const Event) void {
             const w: *const WindowEvent = @ptrCast(event);
             switch (w.event) {
                 win_hidden, win_minimized => drawable = false,
-                win_shown, win_exposed, win_maximized, win_restored => drawable = true,
+                win_shown, win_exposed, win_maximized, win_restored => {
+                    drawable = true;
+                    frame_requested = true;
+                },
                 win_resized, win_size_changed => {
                     var pw: c_int = 0;
                     var ph: c_int = 0;
@@ -603,6 +630,21 @@ test "scancodes map to the evdev codes the app navigates with" {
     // from the key event and once from SDL_TEXTINPUT.
     try std.testing.expectEqual(@as(?u32, null), evdevFor(4)); // 'a'
     try std.testing.expectEqual(@as(?u32, null), evdevFor(30)); // '1'
+}
+
+test "empty worker events wake without activating the window or requesting a frame" {
+    const was_requested = frame_requested;
+    const was_pending = wake_pending.load(.acquire);
+    defer {
+        frame_requested = was_requested;
+        wake_pending.store(was_pending, .release);
+    }
+    frame_requested = false;
+    wake_pending.store(true, .release);
+    const event: Event = .{ .kind = ev_wake, .rest = @splat(0) };
+    translate(&event);
+    try std.testing.expect(!wake_pending.load(.acquire));
+    try std.testing.expect(!frame_requested);
 }
 
 test "SDL_Event variants stay inside the 56-byte union" {

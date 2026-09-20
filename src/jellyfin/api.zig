@@ -639,7 +639,7 @@ pub const Task = struct {
     image: ?image_decoder.Image = null,
     err: Text(128) = .{},
 
-    pub const State = enum { free, queued, running, ready, failed };
+    pub const State = enum { free, reserved, queued, running, ready, failed };
 
     pub fn ok(self: *const Task) bool {
         return self.state == .ready;
@@ -650,7 +650,9 @@ pub const Fetcher = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     mutex: std.Io.Mutex = .init,
-    work: std.Io.Condition = .init,
+    work: std.Io.Queue(*Task) = undefined,
+    work_buffer: [slots]*Task = undefined,
+    wake: ?*const fn () void = null,
     tasks: [slots]Task = undefined,
     threads: [workers]std.Thread = undefined,
     /// The session workers use. Copied under the lock at the start of every
@@ -663,10 +665,20 @@ pub const Fetcher = struct {
     const slots = 32;
     const workers = 4;
 
-    pub fn init(self: *Fetcher, allocator: std.mem.Allocator, io: std.Io) !void {
-        self.* = .{ .allocator = allocator, .io = io };
+    pub fn init(self: *Fetcher, allocator: std.mem.Allocator, io: std.Io, wake: ?*const fn () void) !void {
+        self.* = .{ .allocator = allocator, .io = io, .wake = wake };
+        self.work = .init(&self.work_buffer);
         for (&self.tasks) |*task| task.* = .{ .arena = .init(allocator) };
-        for (&self.threads) |*thread| thread.* = try std.Thread.spawn(.{}, run, .{self});
+        var started: usize = 0;
+        errdefer {
+            self.work.close(io);
+            for (self.threads[0..started]) |thread| thread.join();
+            for (&self.tasks) |*task| task.arena.deinit();
+        }
+        for (&self.threads) |*thread| {
+            thread.* = try std.Thread.spawn(.{}, run, .{self});
+            started += 1;
+        }
     }
 
     pub fn deinit(self: *Fetcher) void {
@@ -674,8 +686,8 @@ pub const Fetcher = struct {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             self.running = false;
-            self.work.broadcast(self.io);
         }
+        self.work.close(self.io);
         for (self.threads) |thread| thread.join();
         for (&self.tasks) |*task| task.arena.deinit();
     }
@@ -686,14 +698,14 @@ pub const Fetcher = struct {
         self.session = session;
     }
 
-    /// Claim a slot and queue it. Null means every slot is busy.
+    /// Reserve a slot; only `start` publishes its inputs to workers.
     pub fn submit(self: *Fetcher, job: Job, tag: u32) ?*Task {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         for (&self.tasks) |*task| {
             if (task.state != .free) continue;
             const arena = task.arena;
-            task.* = .{ .job = job, .tag = tag, .arena = arena, .state = .queued };
+            task.* = .{ .job = job, .tag = tag, .arena = arena, .state = .reserved };
             return task;
         }
         return null;
@@ -702,10 +714,14 @@ pub const Fetcher = struct {
     /// Hand a filled-in task to the workers. Between `submit` and `start` the
     /// slot is reserved but not yet visible to a worker, so the caller can set
     /// the inputs without a lock.
-    pub fn start(self: *Fetcher, _: *Task) void {
+    pub fn start(self: *Fetcher, task: *Task) void {
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        self.work.signal(self.io);
+        std.debug.assert(task.state == .reserved);
+        task.state = .queued;
+        self.mutex.unlock(self.io);
+        // There are only `slots` tasks, so publishing a reserved task cannot
+        // fill a queue of the same capacity and stall the UI.
+        self.work.putOneUncancelable(self.io, task) catch unreachable;
     }
 
     /// The next finished task, or null. Call until it returns null each frame.
@@ -743,21 +759,15 @@ pub const Fetcher = struct {
         var http: std.http.Client = .{ .allocator = self.allocator, .io = self.io };
         defer http.deinit();
         while (true) {
+            const task = self.work.getOneUncancelable(self.io) catch return;
             self.mutex.lockUncancelable(self.io);
-            const claimed: ?*Task = while (true) {
-                if (!self.running) break null;
-                const next: ?*Task = for (&self.tasks) |*task| {
-                    if (task.state == .queued) break task;
-                } else null;
-                if (next) |task| {
-                    task.state = .running;
-                    break task;
-                }
-                self.work.waitUncancelable(self.io, &self.mutex);
-            };
+            if (!self.running) {
+                self.mutex.unlock(self.io);
+                return;
+            }
+            task.state = .running;
             const session = self.session;
             self.mutex.unlock(self.io);
-            const task = claimed orelse return;
 
             const arena = task.arena.allocator();
             if (execute(&http, self.io, arena, &session, task)) |_| {
@@ -770,6 +780,7 @@ pub const Fetcher = struct {
                 task.state = .failed;
                 self.mutex.unlock(self.io);
             }
+            if (self.wake) |wake| wake();
         }
     }
 };
@@ -794,6 +805,33 @@ fn execute(http: *std.http.Client, io: std.Io, arena: std.mem.Allocator, session
         .episodes => task.list = try episodes(http, arena, session, task.a.get(), task.b.get()),
         .poster => task.image = try artwork(http, io, arena, session, task.a.get(), task.b.get(), task.start, task.limit, task.image_kind),
     }
+}
+
+test "workers see requests only after publication and notify on completion" {
+    const Notify = struct {
+        var ready: std.Io.Event = .unset;
+        fn wake() void {
+            ready.set(std.testing.io);
+        }
+    };
+    Notify.ready = .unset;
+    var fetch: Fetcher = undefined;
+    try fetch.init(std.testing.allocator, std.testing.io, Notify.wake);
+    defer fetch.deinit();
+    const reserved = fetch.submit(.views, 1).?;
+    const published = fetch.submit(.views, 2).?;
+    // Empty server URL fails locally, without any network access.
+    fetch.start(published);
+    try Notify.ready.waitTimeout(std.testing.io, .{ .duration = .{
+        .raw = .fromSeconds(5),
+        .clock = .awake,
+    } });
+    try std.testing.expectEqual(published, fetch.finished().?);
+    try std.testing.expectEqual(Task.State.reserved, reserved.state);
+    reserved.a.set("inputs still belong to the UI");
+    fetch.release(published);
+    fetch.release(reserved);
+    try std.testing.expectEqual(@as(usize, 0), fetch.pending());
 }
 
 // Live round trip against a real server. Skipped unless the environment names

@@ -67,11 +67,14 @@ var mpv_set_property_string: *const fn (*Handle, [*:0]const u8, [*:0]const u8) c
 var mpv_get_property: *const fn (*Handle, [*:0]const u8, Format, *anyopaque) callconv(.c) c_int = undefined;
 var mpv_command: *const fn (*Handle, [*:null]const ?[*:0]const u8) callconv(.c) c_int = undefined;
 var mpv_wait_event: *const fn (*Handle, f64) callconv(.c) *Event = undefined;
+var mpv_wakeup: *const fn (*Handle) callconv(.c) void = undefined;
 var mpv_request_log_messages: *const fn (*Handle, [*:0]const u8) callconv(.c) c_int = undefined;
 var mpv_error_string: *const fn (c_int) callconv(.c) [*:0]const u8 = undefined;
 var mpv_render_context_create: *const fn (**RenderCtx, *Handle, [*]RenderParam) callconv(.c) c_int = undefined;
 var mpv_render_context_render: *const fn (*RenderCtx, [*]RenderParam) callconv(.c) c_int = undefined;
 var mpv_render_context_free: *const fn (*RenderCtx) callconv(.c) void = undefined;
+var mpv_render_context_set_update_callback: *const fn (*RenderCtx, ?*const fn (?*anyopaque) callconv(.c) void, ?*anyopaque) callconv(.c) void = undefined;
+var mpv_render_context_update: *const fn (*RenderCtx) callconv(.c) u64 = undefined;
 
 var lib: ?*anyopaque = null;
 
@@ -95,11 +98,14 @@ fn openLib() !void {
     mpv_get_property = try bind(@TypeOf(mpv_get_property), "mpv_get_property");
     mpv_command = try bind(@TypeOf(mpv_command), "mpv_command");
     mpv_wait_event = try bind(@TypeOf(mpv_wait_event), "mpv_wait_event");
+    mpv_wakeup = try bind(@TypeOf(mpv_wakeup), "mpv_wakeup");
     mpv_request_log_messages = try bind(@TypeOf(mpv_request_log_messages), "mpv_request_log_messages");
     mpv_error_string = try bind(@TypeOf(mpv_error_string), "mpv_error_string");
     mpv_render_context_create = try bind(@TypeOf(mpv_render_context_create), "mpv_render_context_create");
     mpv_render_context_render = try bind(@TypeOf(mpv_render_context_render), "mpv_render_context_render");
     mpv_render_context_free = try bind(@TypeOf(mpv_render_context_free), "mpv_render_context_free");
+    mpv_render_context_set_update_callback = try bind(@TypeOf(mpv_render_context_set_update_callback), "mpv_render_context_set_update_callback");
+    mpv_render_context_update = try bind(@TypeOf(mpv_render_context_update), "mpv_render_context_update");
 }
 
 // ------------------------------------------------------------- app state
@@ -121,6 +127,7 @@ pub fn state() State {
 }
 fn setState(s: State) void {
     playback_state.store(@intFromEnum(s), .release);
+    wl.wake();
 }
 
 /// The IO the rest of the app runs on. mpv has its own threads and needs
@@ -211,7 +218,7 @@ fn loadTranscode(target_ms: i32) bool {
 fn pumpEvents() void {
     const h = handle.?;
     while (pumping.load(.acquire)) {
-        const event = mpv_wait_event(h, 0.05);
+        const event = mpv_wait_event(h, -1);
         switch (event.id) {
             .none => {},
             .shutdown => return,
@@ -334,6 +341,7 @@ pub fn stop() void {
 pub fn deinit() void {
     const h = handle orelse return;
     pumping.store(false, .release);
+    mpv_wakeup(h);
     if (pump_thread) |t| t.join();
     pump_thread = null;
     if (render_ctx) |ctx| mpv_render_context_free(ctx);
@@ -345,6 +353,20 @@ pub fn deinit() void {
 // ------------------------------------------------- desktop embedded video
 
 var render_ctx: ?*RenderCtx = null;
+var update_pending = std.atomic.Value(bool).init(false);
+
+fn onRenderUpdate(_: ?*anyopaque) callconv(.c) void {
+    update_pending.store(true, .release);
+    wl.wake();
+}
+
+/// Only MPV_RENDER_UPDATE_FRAME requests presentation; other callbacks can
+/// service mpv without rebuilding or redrawing the UI.
+pub fn needsFrame() bool {
+    if (!update_pending.swap(false, .acq_rel)) return false;
+    const ctx = render_ctx orelse return false;
+    return mpv_render_context_update(ctx) & 1 != 0;
+}
 
 fn getProcAddress(_: ?*anyopaque, name: [*:0]const u8) callconv(.c) ?*anyopaque {
     return gl.procAddress(name);
@@ -370,6 +392,7 @@ pub fn render(width: u32, height: u32) void {
             return;
         }
         render_ctx = ctx;
+        mpv_render_context_set_update_callback(ctx, onRenderUpdate, null);
     }
     // Into the default framebuffer, which GL addresses from the bottom left
     // while the UI above it works top-down.

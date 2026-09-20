@@ -18,11 +18,28 @@ src/jellyfin/store.zig    where files go on disk, and the artwork cache
 ```
 
 Requests never touch the render thread. `api.Fetcher` owns a fixed pool of 32
-task slots and four worker threads; the UI submits a task, polls it once a
-frame, copies what it needs into fixed-size screen state and hands the slot
-back. A task's results live in that task's arena, so "copy what you need" is
+task slots and four worker threads. `submit` reserves a slot; `start` publishes
+its filled-in inputs through a `std.Io.Queue`. Workers fetch and decode artwork
+(including disk-cache hits), then post a coalesced, empty SDL event. The UI
+drains completed tasks, uploads decoded pixels to GL, copies screen data and
+hands slots back. A task's results live in that task's arena, so "copy what you need" is
 the rule that keeps a draw command from holding a pointer into memory a worker
 is about to reuse.
+
+The main loop waits in SDL when idle. Input, window exposure/resizing and
+changed results request frames; Quick Connect polling and playback-control
+expiry provide the only normal UI deadlines. Debug scripts and captures
+explicitly request their own frames. A minimized window continues processing
+results without drawing. Desktop mpv signals new video frames through its render
+callback; those frames reuse the retained UI command list for compositing.
+Starfish presents video on a separate plane, so TV playback does not schedule
+graphics frames once the controls are hidden.
+
+Starfish initialization, demuxing, audio decoding and feeding run on background
+threads. Bounded `std.Io.Queue` packet queues keep both the packet-count and
+8 MiB read-ahead limits without polling. Stop and seek close the queues and wake
+the pacing event before threads are joined. Thread priorities remain at their
+defaults.
 
 Two bugs that cost time and are easy to reintroduce:
 

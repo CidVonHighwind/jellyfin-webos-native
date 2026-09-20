@@ -5,7 +5,7 @@
 //! handling, and virtual-list geometry. Every screen is backed by a real
 //! server, so this file is mostly
 //! about keeping the render thread free of that: `api.Fetcher` runs the
-//! requests on worker threads, results arrive as completed tasks once a frame,
+//! requests and image decoding on worker threads, results wake the event loop,
 //! and screen state is plain fixed-size storage that a task result is copied
 //! into. Nothing the renderer touches is owned by a worker.
 //!
@@ -116,7 +116,15 @@ fn artwork(id: []const u8, tag: []const u8, kind: api.ImageKind, width: u32, hei
             victim = slot;
         }
     }
-    const claimed = victim orelse return null;
+    const claimed = victim orelse {
+        // A navigation frame may still protect the previous screen's slots.
+        // Advance that grace period once, even with no requests in flight.
+        for (slots) |slot| if (!slot.loading and slot.used < frame_index) {
+            wl.frame_requested = true;
+            break;
+        };
+        return null;
+    };
     const index: u32 = @intCast((@intFromPtr(claimed) - @intFromPtr(&slots)) / @sizeOf(Slot));
 
     const task = fetcher.submit(.poster, index) orelse return null;
@@ -591,6 +599,7 @@ var status: api.Text(200) = .{};
 var status_error = false;
 
 fn setStatus(comptime pattern: []const u8, args: anytype) void {
+    wl.frame_requested = true;
     var buffer: [200]u8 = undefined;
     status.set(std.fmt.bufPrint(&buffer, pattern, args) catch "");
     status_error = false;
@@ -907,6 +916,8 @@ fn onFailure(task: *api.Task) void {
 
 fn pump() void {
     while (fetcher.finished()) |task| {
+        if (task.job != .quick_poll or !task.ok() or task.quick.Authenticated)
+            wl.frame_requested = true;
         consume(task);
         fetcher.release(task);
     }
@@ -1233,6 +1244,7 @@ fn gridRows() usize {
 
 fn onKey(code: u32, pressed: bool) void {
     if (!pressed) return;
+    wl.frame_requested = true;
     if (wl.isBackKey(code)) return goBack();
     if (screen == .playback) {
         if (code == 103) { // Up dismisses player chrome immediately.
@@ -1269,6 +1281,14 @@ fn moveCursor(x: wl.Fixed, y: wl.Fixed) void {
 }
 
 fn onEvent(event: wl.AppEvent) void {
+    switch (event) {
+        .key => {}, // Key releases do not change the UI.
+        .close => {},
+        .pointer_button => |e| {
+            if (e.pressed) wl.frame_requested = true;
+        },
+        else => wl.frame_requested = true,
+    }
     switch (event) {
         .key => |e| onKey(e.code, e.pressed),
         .text_commit => |text| appendText(text),
@@ -1825,8 +1845,24 @@ fn buildUi(ctx: *loom.Context) void {
         .season => drawSeason(ctx, width, height, scale),
         .playback => drawPlayback(ctx, width, height, scale),
     }
-    renderer.draw(ctx.commands.items, width, height);
+    // Pointer activation happens during layout; rebuild its resulting screen.
+    if (pointer_press) wl.frame_requested = true;
     pointer_press = false;
+}
+
+/// Only these two UI features have time-dependent work in normal operation.
+fn nextDeadline(now: u64, controls_visible: bool) ?u64 {
+    var deadline: ?u64 = null;
+    if (screen == .quick and quick_secret.len != 0) deadline = @max(now, quick_poll_at);
+    if (screen == .playback and !playback_paused and controls_visible)
+        deadline = @min(deadline orelse std.math.maxInt(u64), playback_controls_until);
+    return deadline;
+}
+
+fn waitMilliseconds(now: u64, deadline: ?u64) i32 {
+    const due = deadline orelse return -1;
+    const remaining = due -| now;
+    return @intCast(@min(std.math.maxInt(i32), remaining / std.time.ns_per_ms + @intFromBool(remaining % std.time.ns_per_ms != 0)));
 }
 
 fn nowNs() u64 {
@@ -2004,7 +2040,7 @@ pub fn main(init: std.process.Init) !void {
     var ctx = loom.Context.init(init.gpa);
     defer ctx.deinit();
 
-    try fetcher.init(init.gpa, init.io);
+    try fetcher.init(init.gpa, init.io, wl.wake);
     defer fetcher.deinit();
     player.init(init.io);
     defer player.deinit();
@@ -2036,19 +2072,41 @@ pub fn main(init: std.process.Init) !void {
     script = env("UI_SCRIPT") orelse "";
     // Without a script, hold long enough for discovery's three timeouts.
     var capture_after: u32 = if (capture_path != null and script.len == 0) 240 else 0;
+    var controls_visible = false;
+    var last_player_state = player.state();
     while (wl.poll()) {
-        if (!wl.drawable) {
-            _ = wl.wait();
+        pump();
+        const current_state = player.state();
+        if (current_state != last_player_state) {
+            last_player_state = current_state;
+            if (screen == .playback) wl.frame_requested = true;
+        }
+        const now = nowNs();
+        const visible = screen == .playback and (playback_paused or now < playback_controls_until);
+        if (visible != controls_visible) {
+            controls_visible = visible;
+            wl.frame_requested = true;
+        }
+        const video_frame = player.needsFrame();
+        const scripted_frame = script_at < script.len or capture_after > 0;
+        if (!wl.drawable or (!wl.frame_requested and !video_frame and !scripted_frame and !capture_requested)) {
+            _ = wl.waitTimeout(waitMilliseconds(nowNs(), nextDeadline(now, controls_visible)));
             continue;
         }
-        pump();
+        glViewport(0, 0, @intCast(gl.width), @intCast(gl.height));
         if (screen == .playback and !player.embedded())
             glClearColor(0, 0, 0, 0) // Starfish owns the webOS video plane.
         else
             glClearColor(9.0 / 255.0, 13.0 / 255.0, 22.0 / 255.0, 1);
         glClear(GL_COLOR_BUFFER_BIT);
         if (screen == .playback) player.render(gl.width, gl.height);
-        buildUi(&ctx);
+        if (wl.frame_requested or scripted_frame) {
+            wl.frame_requested = false;
+            buildUi(&ctx);
+        }
+        // Embedded video needs the retained overlay composited over new frames,
+        // but neither layout nor artwork requests need to run for those frames.
+        renderer.draw(ctx.commands.items, @floatFromInt(gl.width), @floatFromInt(gl.height));
         if (script.len != 0 and stepScript() and capture_path != null and capture_after == 0)
             capture_after = script_beat;
         if (capture_after > 0) {
@@ -2066,8 +2124,44 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test {
+    _ = @import("jellyfin/packet_queue.zig");
     _ = @import("jellyfin/starfish.zig");
     _ = @import("luna.zig");
+}
+
+test "idle UI waits indefinitely and deadlines round up to milliseconds" {
+    try std.testing.expectEqual(@as(i32, -1), waitMilliseconds(10, null));
+    try std.testing.expectEqual(@as(i32, 0), waitMilliseconds(10, 9));
+    try std.testing.expectEqual(@as(i32, 1), waitMilliseconds(10, 11));
+    try std.testing.expectEqual(@as(i32, 2), waitMilliseconds(10, 10 + std.time.ns_per_ms + 1));
+}
+
+test "playback controls and Quick Connect schedule only their next deadline" {
+    const old_screen = screen;
+    const old_secret = quick_secret;
+    const old_poll = quick_poll_at;
+    const old_controls = playback_controls_until;
+    const old_paused = playback_paused;
+    defer {
+        screen = old_screen;
+        quick_secret = old_secret;
+        quick_poll_at = old_poll;
+        playback_controls_until = old_controls;
+        playback_paused = old_paused;
+    }
+    screen = .home;
+    try std.testing.expect(nextDeadline(10, false) == null);
+    screen = .quick;
+    quick_secret.set("pending");
+    quick_poll_at = 20;
+    try std.testing.expectEqual(@as(?u64, 20), nextDeadline(10, false));
+    screen = .playback;
+    playback_controls_until = 30;
+    playback_paused = false;
+    try std.testing.expectEqual(@as(?u64, 30), nextDeadline(10, true));
+    try std.testing.expect(nextDeadline(30, false) == null);
+    playback_paused = true;
+    try std.testing.expect(nextDeadline(10, true) == null);
 }
 
 test "Back navigates out of a screen and quits from a root one" {
