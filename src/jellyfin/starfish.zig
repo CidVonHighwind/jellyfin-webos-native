@@ -12,19 +12,19 @@ const c = std.c;
 
 pub const LoadCallback = ?*const fn (i32, i64, ?[*:0]const u8) callconv(.c) void;
 
-/// The sample rates the pipeline accepts, which are not ordered by frequency.
-/// Zero means "bypass" and takes the pipeline down, so an unlisted rate has to
-/// mean no audio at all.
-pub const SampleRate = enum(u8) {
+/// The sample rates the pipeline accepts, by their actual frequency. An
+/// unlisted rate has to mean no audio at all: the pipeline takes a rate it
+/// does not know as "bypass" and comes down.
+pub const SampleRate = enum(u32) {
     none = 0,
-    hz_48000 = 1,
-    hz_44100 = 2,
-    hz_32000 = 3,
-    hz_24000 = 4,
-    hz_16000 = 5,
-    hz_12000 = 6,
-    hz_8000 = 7,
-    hz_22050 = 8,
+    hz_8000 = 8000,
+    hz_12000 = 12000,
+    hz_16000 = 16000,
+    hz_22050 = 22050,
+    hz_24000 = 24000,
+    hz_32000 = 32000,
+    hz_44100 = 44100,
+    hz_48000 = 48000,
 
     pub fn of(hertz: c_int) SampleRate {
         return switch (hertz) {
@@ -151,10 +151,15 @@ var json_buf: [2048]u8 = undefined;
 /// Every key here is one libpf-1.0.so.1 parses on this firmware.
 fn buildPayload(buf: []u8, app_id: []const u8, window_id: []const u8, video: Video, audio: ?Audio) ![:0]u8 {
     var pcm_scratch: [192]u8 = undefined;
+    // `sampleRate` is in kHz as a decimal -- 48, 44.1, 22.05 -- not hertz. A
+    // value the pipeline cannot read is not an error: it quietly builds the
+    // sink at 44.1 kHz instead, and 48 kHz PCM fed into that plays about 9%
+    // slow, heard as audio drifting away from the picture rather than as
+    // anything failing.
     const pcm = if (audio) |a| try std.fmt.bufPrint(
         &pcm_scratch,
         ",\"pcmInfo\":{{\"sampleRate\":{d},\"channelMode\":\"{s}\",\"format\":\"S16LE\",\"layout\":\"interleaved\",\"bitsPerSample\":16}}",
-        .{ @intFromEnum(a.sample_rate), if (a.channels == 1) "mono" else "stereo" },
+        .{ @as(f64, @floatFromInt(@intFromEnum(a.sample_rate))) / 1000.0, if (a.channels == 1) "mono" else "stereo" },
     ) else "";
     var fps_scratch: [64]u8 = undefined;
     const fps = if (video.fps_num > 0 and video.fps_den > 0) try std.fmt.bufPrint(
@@ -208,6 +213,7 @@ test "payload carries the keys libpf parses on this firmware" {
         "\"videoFpsValue\":24000,\"videoFpsScale\":1001",
         "\"pauseAtDecodeTime\":false",
         "\"bitsPerSample\":16",
+        "\"sampleRate\":48,",
         "\"srcBufferLevelVideo\":{\"minimum\":1,\"maximum\":8388608}",
         "\"queryPosition\":true",
         "\"windowId\":\"_Window_Id_66\"",
@@ -232,6 +238,23 @@ test "payload is valid JSON" {
     }, .{ .sample_rate = .hz_48000, .channels = 2 });
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, built, .{});
     defer parsed.deinit();
+}
+
+test "pcm sample rates go out in kHz, not hertz and not an enum tag" {
+    var buf: [2048]u8 = undefined;
+    const video = Video{ .width = 1920, .height = 1080, .codec = "H265" };
+    for ([_]struct { rate: SampleRate, want: []const u8 }{
+        .{ .rate = .hz_48000, .want = "\"sampleRate\":48," },
+        .{ .rate = .hz_44100, .want = "\"sampleRate\":44.1," },
+        .{ .rate = .hz_22050, .want = "\"sampleRate\":22.05," },
+        .{ .rate = .hz_8000, .want = "\"sampleRate\":8," },
+    }) |case| {
+        const built = try buildPayload(&buf, "app", "_Window_Id_1", video, .{ .sample_rate = case.rate, .channels = 2 });
+        std.testing.expect(std.mem.indexOf(u8, built, case.want) != null) catch |err| {
+            std.debug.print("missing {s}\nin {s}\n", .{ case.want, built });
+            return err;
+        };
+    }
 }
 
 test "no audio means no audio block" {

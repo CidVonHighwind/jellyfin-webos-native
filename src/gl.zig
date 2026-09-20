@@ -45,6 +45,12 @@ pub fn procOpt(comptime T: type, name: [*:0]const u8) ?T {
     if (getProcAddress) |g| if (g(name)) |p| return @ptrCast(@alignCast(p));
     return null;
 }
+
+/// Runtime variant used by libraries which resolve GL symbols through a
+/// callback instead of a compile-time function type.
+pub fn procAddress(name: [*:0]const u8) ?*anyopaque {
+    return symOpt(name) orelse if (getProcAddress) |g| g(name) else null;
+}
 pub fn proc(comptime T: type, name: [*:0]const u8) T {
     return procOpt(T, name) orelse std.debug.panic("missing GL entry point: {s}", .{name});
 }
@@ -68,6 +74,25 @@ pub var egl_surface: ?*anyopaque = null;
 pub var egl_context: ?*anyopaque = null;
 pub var width: u32 = 0;
 pub var height: u32 = 0;
+
+/// Take over a window and context made by another platform layer (src/sdl.zig)
+/// so that `proc` and `swap` work against it. libGLESv2 is opened directly
+/// because on Mali the core ES entry points are real symbols that no
+/// GetProcAddress returns.
+pub fn adopt(
+    get_proc: *const fn ([*:0]const u8) callconv(.c) ?*anyopaque,
+    swap_fn: *const fn () void,
+    w: u32,
+    h: u32,
+) void {
+    getProcAddress = get_proc;
+    swap_hook = swap_fn;
+    width = w;
+    height = h;
+    libs[1] = c.dlopen("libGLESv2.so.2", .{ .NOW = true });
+}
+
+var swap_hook: ?*const fn () void = null;
 
 /// Open a window and make an ES 3 context current on it.
 pub fn init(app_id: [*:0]const u8, title: [*:0]const u8, w: u32, h: u32) !void {
@@ -141,6 +166,7 @@ fn parseInterval(v: [*:0]const u8) i32 {
 }
 
 pub fn swap() void {
+    if (swap_hook) |f| return f();
     _ = eglSwapBuffers(egl_display, egl_surface);
 }
 

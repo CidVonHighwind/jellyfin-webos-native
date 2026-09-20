@@ -323,6 +323,12 @@ pub const Renderer = struct {
         self.batches = 0;
         self.covered_by_kind = @splat(0);
 
+        // libmpv's video output draws into this same context, so the blend
+        // state it left behind is not ours to assume. Re-establish it once a
+        // frame; the per-batch cache below is only valid from here on.
+        glDisable(GL_BLEND);
+        self.blend_enabled = false;
+
         const uniforms = Uniforms{ .viewport = .{ width, height } };
         glBindVertexArray(self.vao);
         glBindBufferBase(GL_UNIFORM_BUFFER, 0, self.uniform_buffer);

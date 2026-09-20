@@ -9,17 +9,26 @@
 //! and screen state is plain fixed-size storage that a task result is copied
 //! into. Nothing the renderer touches is owned by a worker.
 //!
-//! Playback uses NDL DirectMedia after the runtime FFmpeg demuxer separates
-//! Jellyfin's transport stream into video packets.
+//! Playback is per-platform: the TV runs a runtime FFmpeg demuxer into LG's
+//! Starfish pipeline (jellyfin/player.zig), the desktop runs the system
+//! libmpv into our own GL context (jellyfin/player_mpv.zig).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 const gl = @import("gl.zig");
-const wl = @import("wl.zig");
+const wl = @import("sdl.zig");
 const loom = @import("loom/loom.zig");
 const UiRenderer = @import("ui_renderer.zig").Renderer;
 const api = @import("jellyfin/api.zig");
-const player = @import("jellyfin/player.zig");
+// One backend per platform. The TV feeds LG's Starfish pipeline straight from
+// an FFmpeg demuxer, which keeps compressed packets on a path that never
+// touches this process; the desktop drives the system libmpv and renders into
+// our own GL context.
+const player = if (builtin.cpu.arch == .arm)
+    @import("jellyfin/player.zig")
+else
+    @import("jellyfin/player_mpv.zig");
 
 const GL_COLOR_BUFFER_BIT = 0x00004000;
 const GL_RGBA = 0x1908;
@@ -556,6 +565,10 @@ var select_unfinished_episode = false;
 var stream_url: api.Text(256) = .{};
 var playback_title: api.Text(160) = .{};
 var playback_paused = false;
+/// The player chrome is deliberately transient: it never covers a scene for
+/// more than three seconds unless playback is paused.
+var playback_controls_until: u64 = 0;
+const playback_controls_ns = 3 * std.time.ns_per_s;
 
 // Text entry, remote and pointer, all as in uidemo.
 var server_url: api.Text(256) = .{};
@@ -566,8 +579,6 @@ var url_rect: loom.Rect = .{};
 var username_rect: loom.Rect = .{};
 var password_rect: loom.Rect = .{};
 var active_field: EditField = .none;
-var shift_down = false;
-var caps_lock = false;
 var capture_requested = false;
 
 var cursor_x: f32 = -1;
@@ -1057,10 +1068,7 @@ fn activate() void {
         .season => if (episode_selected < episodes_row.count) {
             startPlayback(episodes_row.cards[episode_selected].id.get(), episodes_row.cards[episode_selected].episode_title.get());
         },
-        .playback => switch (playback_buttons[@min(focus, playback_buttons.len - 1)].delta) {
-            0 => togglePlayback(),
-            else => |delta| player.seek(delta),
-        },
+        .playback => activatePlayback(),
     }
 }
 
@@ -1106,6 +1114,7 @@ fn startPlayback(id: []const u8, title: []const u8) void {
     playback_title.set(title);
     playback_paused = false;
     focus = play_pause_index;
+    playback_controls_until = nowNs() + playback_controls_ns;
     screen = .playback;
     setStatus("Playing", .{});
 }
@@ -1221,62 +1230,25 @@ fn gridRows() usize {
 
 // ------------------------------------------------------------------ input
 
-const KeyPair = struct { code: u32, lower: u8, upper: u8 };
-const key_pairs = [_]KeyPair{
-    .{ .code = 2, .lower = '1', .upper = '!' },   .{ .code = 3, .lower = '2', .upper = '@' },
-    .{ .code = 4, .lower = '3', .upper = '#' },   .{ .code = 5, .lower = '4', .upper = '$' },
-    .{ .code = 6, .lower = '5', .upper = '%' },   .{ .code = 7, .lower = '6', .upper = '^' },
-    .{ .code = 8, .lower = '7', .upper = '&' },   .{ .code = 9, .lower = '8', .upper = '*' },
-    .{ .code = 10, .lower = '9', .upper = '(' },  .{ .code = 11, .lower = '0', .upper = ')' },
-    .{ .code = 12, .lower = '-', .upper = '_' },  .{ .code = 13, .lower = '=', .upper = '+' },
-    .{ .code = 16, .lower = 'q', .upper = 'Q' },  .{ .code = 17, .lower = 'w', .upper = 'W' },
-    .{ .code = 18, .lower = 'e', .upper = 'E' },  .{ .code = 19, .lower = 'r', .upper = 'R' },
-    .{ .code = 20, .lower = 't', .upper = 'T' },  .{ .code = 21, .lower = 'y', .upper = 'Y' },
-    .{ .code = 22, .lower = 'u', .upper = 'U' },  .{ .code = 23, .lower = 'i', .upper = 'I' },
-    .{ .code = 24, .lower = 'o', .upper = 'O' },  .{ .code = 25, .lower = 'p', .upper = 'P' },
-    .{ .code = 26, .lower = '[', .upper = '{' },  .{ .code = 27, .lower = ']', .upper = '}' },
-    .{ .code = 30, .lower = 'a', .upper = 'A' },  .{ .code = 31, .lower = 's', .upper = 'S' },
-    .{ .code = 32, .lower = 'd', .upper = 'D' },  .{ .code = 33, .lower = 'f', .upper = 'F' },
-    .{ .code = 34, .lower = 'g', .upper = 'G' },  .{ .code = 35, .lower = 'h', .upper = 'H' },
-    .{ .code = 36, .lower = 'j', .upper = 'J' },  .{ .code = 37, .lower = 'k', .upper = 'K' },
-    .{ .code = 38, .lower = 'l', .upper = 'L' },  .{ .code = 39, .lower = ';', .upper = ':' },
-    .{ .code = 40, .lower = '\'', .upper = '"' }, .{ .code = 43, .lower = '\\', .upper = '|' },
-    .{ .code = 44, .lower = 'z', .upper = 'Z' },  .{ .code = 45, .lower = 'x', .upper = 'X' },
-    .{ .code = 46, .lower = 'c', .upper = 'C' },  .{ .code = 47, .lower = 'v', .upper = 'V' },
-    .{ .code = 48, .lower = 'b', .upper = 'B' },  .{ .code = 49, .lower = 'n', .upper = 'N' },
-    .{ .code = 50, .lower = 'm', .upper = 'M' },  .{ .code = 51, .lower = ',', .upper = '<' },
-    .{ .code = 52, .lower = '.', .upper = '>' },  .{ .code = 53, .lower = '/', .upper = '?' },
-    .{ .code = 57, .lower = ' ', .upper = ' ' },
-};
-
-fn keyByte(code: u32) ?u8 {
-    for (key_pairs) |pair| if (pair.code == code) {
-        const letter = pair.lower >= 'a' and pair.lower <= 'z';
-        return if (shift_down != (caps_lock and letter)) pair.upper else pair.lower;
-    };
-    return null;
-}
-
 fn onKey(code: u32, pressed: bool) void {
-    if (code == 42 or code == 54) {
-        shift_down = pressed;
-        return;
-    }
     if (!pressed) return;
     if (wl.isBackKey(code)) return goBack();
+    if (screen == .playback) {
+        if (code == 103) { // Up dismisses player chrome immediately.
+            playback_controls_until = 0;
+            return;
+        }
+        playback_controls_until = nowNs() + playback_controls_ns;
+    }
     if (code == 88) { // F12
         capture_requested = true;
-        return;
-    }
-    if (code == 58) {
-        caps_lock = !caps_lock;
         return;
     }
     if (active_field != .none) {
         switch (code) {
             1, 158, 28, 96, 352 => endEdit(),
             14 => eraseText(1),
-            else => if (keyByte(code)) |byte| appendText(&.{byte}),
+            else => {},
         }
         return;
     }
@@ -1295,20 +1267,11 @@ fn moveCursor(x: wl.Fixed, y: wl.Fixed) void {
     cursor_present = true;
 }
 
-fn onEvent(event: wl.Event) void {
+fn onEvent(event: wl.AppEvent) void {
     defer syncBackHandling();
     switch (event) {
         .key => |e| onKey(e.code, e.pressed),
         .text_commit => |text| appendText(text),
-        .text_delete => |edit| eraseText(@max(1, edit.length)),
-        .text_keysym => |e| if (e.pressed and active_field != .none) switch (e.sym) {
-            0xff08 => eraseText(1),
-            0xff0d, 0xff8d, 0xff1b => endEdit(),
-            else => {},
-        },
-        .input_panel => |visible| {
-            if (!visible and active_field != .none) active_field = .none;
-        },
         .pointer_enter => |e| moveCursor(e.x, e.y),
         .pointer_motion => |e| moveCursor(e.x, e.y),
         .pointer_leave => {
@@ -1752,41 +1715,66 @@ fn drawSeason(ctx: *loom.Context, width: f32, height: f32, scale: f32) void {
 
 /// The transport row. A zero delta is the play/pause button; the rest seek by
 /// their own number of seconds.
-const playback_buttons = [_]struct { label: []const u8, delta: i32 }{
-    .{ .label = "-30", .delta = -30 },
-    .{ .label = "-10", .delta = -10 },
-    .{ .label = "Play/Pause", .delta = 0 },
-    .{ .label = "+10", .delta = 10 },
-    .{ .label = "+30", .delta = 30 },
+const PlaybackAction = enum { previous, back_30, back_10, pause, forward_10, forward_30, next, subtitles, audio };
+const playback_buttons = [_]struct { label: []const u8, action: PlaybackAction }{
+    .{ .label = "|<", .action = .previous },
+    .{ .label = "-30", .action = .back_30 },
+    .{ .label = "-10", .action = .back_10 },
+    .{ .label = "Pause", .action = .pause },
+    .{ .label = "+10", .action = .forward_10 },
+    .{ .label = "+30", .action = .forward_30 },
+    .{ .label = ">|", .action = .next },
+    .{ .label = "Subtitles", .action = .subtitles },
+    .{ .label = "Audio", .action = .audio },
 };
-const play_pause_index = 2;
+const play_pause_index = 3;
+
+fn activatePlayback() void {
+    playback_controls_until = nowNs() + playback_controls_ns;
+    switch (playback_buttons[@min(focus, playback_buttons.len - 1)].action) {
+        .back_30 => player.seek(-30),
+        .back_10 => player.seek(-10),
+        .pause => togglePlayback(),
+        .forward_10 => player.seek(10),
+        .forward_30 => player.seek(30),
+        .previous, .next => setStatus("Episode navigation is not available for this item", .{}),
+        .subtitles => setStatus("No subtitle tracks are available", .{}),
+        .audio => setStatus("This stream has one audio track", .{}),
+    }
+}
 
 fn drawPlayback(ctx: *loom.Context, width: f32, height: f32, scale: f32) void {
+    if (!playback_paused and nowNs() >= playback_controls_until) return;
     // The video itself is a separate NDL plane. This graphics-plane strip is
     // intentionally the same kind of content exercised by ndlplay's overlay.
-    const panel = loom.Rect{ .x = 0, .y = height - 156 * scale, .w = width, .h = 156 * scale };
+    const panel = loom.Rect{ .x = 0, .y = height - 166 * scale, .w = width, .h = 166 * scale };
     ctx.fill(panel, null, .{ 8, 12, 20, 205 }, 0);
-    ctx.label(.{ .x = 64 * scale, .y = panel.y + 28 * scale, .w = width - 128 * scale, .h = 38 * scale }, panel, playback_title.get(), TEXT, 28 * scale);
+    ctx.label(.{ .x = 64 * scale, .y = panel.y + 20 * scale, .w = width - 128 * scale, .h = 34 * scale }, panel, playback_title.get(), TEXT, 27 * scale);
     const message = switch (player.state()) {
         .loading => "Loading stream…",
         .playing => if (playback_paused) "Paused — OK resumes · Back stops" else "OK pauses · Back stops",
         .failed => player.lastError(),
         .idle => "Stopped",
     };
-    ctx.label(.{ .x = 64 * scale, .y = panel.y + 83 * scale, .w = 560 * scale, .h = 32 * scale }, panel, message, if (player.state() == .failed) RED else DIM, 22 * scale);
-    var x = width - 64 * scale;
-    var index = playback_buttons.len;
-    while (index > 0) {
-        index -= 1;
-        const button_width: f32 = if (playback_buttons[index].delta == 0) 210 else 110;
-        const button = loom.Rect{
-            .x = x - button_width * scale,
-            .y = panel.y + 74 * scale,
+    ctx.label(.{ .x = 64 * scale, .y = panel.y + 58 * scale, .w = width - 128 * scale, .h = 26 * scale }, panel, message, if (player.state() == .failed) RED else DIM, 19 * scale);
+    // Center transport, with track controls held at the right edge.
+    var x = (width - 830 * scale) / 2;
+    for (playback_buttons[0..7], 0..) |control, index| {
+        const button_width: f32 = if (control.action == .pause) 130 else 88;
+        const rect = loom.Rect{
+            .x = x,
+            .y = panel.y + 96 * scale,
             .w = button_width * scale,
-            .h = 56 * scale,
+            .h = 48 * scale,
         };
-        drawButton(ctx, button, playback_buttons[index].label, index, scale);
-        x = button.x - 12 * scale;
+        drawButton(ctx, rect, control.label, index, scale);
+        x += rect.w + 10 * scale;
+    }
+    x = width - 64 * scale - 210 * scale;
+    for (playback_buttons[7..], 7..) |control, index| {
+        const rect = loom.Rect{ .x = x, .y = panel.y + 96 * scale, .w = 100 * scale, .h = 48 * scale };
+        drawButton(ctx, rect, control.label, index, scale);
+        x += 110 * scale;
     }
 }
 
@@ -1906,6 +1894,9 @@ fn logToFile() void {
     var rc = linux.openat(linux.AT.FDCWD, name, flags, 0o644);
     if (@as(isize, @bitCast(rc)) < 0) rc = linux.openat(linux.AT.FDCWD, "/tmp/jellyfin.log", flags, 0o644);
     if (@as(isize, @bitCast(rc)) < 0) return;
+    // stdout as well as stderr: SDL and the webOS Luna bridge report on
+    // stdout, and those lines are the only diagnosis when a backend refuses.
+    _ = linux.dup2(@intCast(rc), 1);
     _ = linux.dup2(@intCast(rc), 2);
 }
 
@@ -1960,7 +1951,8 @@ pub fn main(init: std.process.Init) !void {
 
     wl.on_event = onEvent;
     const appid = std.c.getenv("APPID") orelse @as([*:0]const u8, "dev.hookedbehemoth.jellyfin");
-    try gl.init(appid, "Jellyfin", 0, 0);
+    try wl.init(appid, "Jellyfin", 0, 0);
+    defer wl.deinit();
     glClearColor = gl.proc(@TypeOf(glClearColor), "glClearColor");
     glClear = gl.proc(@TypeOf(glClear), "glClear");
     glViewport = gl.proc(@TypeOf(glViewport), "glViewport");
@@ -1976,6 +1968,7 @@ pub fn main(init: std.process.Init) !void {
 
     try fetcher.init(init.gpa, init.io);
     defer fetcher.deinit();
+    player.init(init.io);
     defer player.deinit();
     fetcher.setSession(session);
 
@@ -2007,11 +2000,12 @@ pub fn main(init: std.process.Init) !void {
     var capture_after: u32 = if (capture_path != null and script.len == 0) 240 else 0;
     while (wl.poll()) {
         pump();
-        if (screen == .playback)
-            glClearColor(0, 0, 0, 0)
+        if (screen == .playback and !player.embedded())
+            glClearColor(0, 0, 0, 0) // Starfish owns the webOS video plane.
         else
             glClearColor(9.0 / 255.0, 13.0 / 255.0, 22.0 / 255.0, 1);
         glClear(GL_COLOR_BUFFER_BIT);
+        if (screen == .playback) player.render(gl.width, gl.height);
         buildUi(&ctx);
         if (script.len != 0 and stepScript() and capture_path != null and capture_after == 0)
             capture_after = script_beat;
@@ -2027,6 +2021,10 @@ pub fn main(init: std.process.Init) !void {
         }
         gl.swap();
     }
+}
+
+test {
+    _ = @import("jellyfin/starfish.zig");
 }
 
 test "Back belongs to the OS only on unedited root screens" {

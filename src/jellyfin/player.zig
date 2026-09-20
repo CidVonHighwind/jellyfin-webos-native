@@ -2,7 +2,7 @@
 const std = @import("std");
 const c = std.c;
 const linux = std.os.linux;
-const wl = @import("../wl.zig");
+const wl = @import("../sdl.zig");
 const smp = @import("starfish.zig");
 
 extern fn jf_demux_open(url: [*:0]const u8) ?*anyopaque;
@@ -43,6 +43,15 @@ pub fn lastError() []const u8 {
 pub fn state() State {
     return @enumFromInt(playback_state.load(.acquire));
 }
+/// Starfish uses libc and needs nothing from the app's IO; the hook exists
+/// because both backends expose it.
+pub fn init(_: std.Io) void {}
+/// False: the video is on the TV's own plane, not in our framebuffer, so the
+/// app punches a transparent hole rather than drawing a background.
+pub fn embedded() bool {
+    return false;
+}
+pub fn render(_: u32, _: u32) void {}
 
 /// Pipeline state and errors arrive here.
 fn onLoad(kind: i32, num: i64, str: ?[*:0]const u8) callconv(.c) void {

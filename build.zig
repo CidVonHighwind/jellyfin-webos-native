@@ -149,6 +149,9 @@ pub fn build(b: *std.Build) void {
     addAssets(b, host_exe, chosen_app);
     if (chosen_app.ui) addUiDeps(b, host_exe.root_module, b.resolveTargetQuery(.{}), optimize);
     const run_host = b.addRunArtifact(host_exe);
+    // Same reason as `run`: an interactive app's output is the point, and the
+    // build otherwise only replays it if the command fails.
+    run_host.stdio = .inherit;
     b.step("run-host", "Build -Dapp for this PC and run it locally").dependOn(&run_host.step);
 
     const ui_tests = b.addTest(.{
