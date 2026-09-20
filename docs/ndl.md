@@ -84,6 +84,48 @@ sample-rate enum is **not** ordered by frequency (`48K = 1, 44.1K = 2, 32K = 3,
 takes the pipeline down. Video and audio are emitted in one pass — the video
 branch rejoins the audio switch — so `{video, audio}` together is fine.
 
+### The ES player has no clock
+
+`DIRECTMEDIA-ES-PLAYER` presents each buffer as it arrives. The PTS you pass
+is used for A/V alignment and the render-queue bookkeeping, not as a
+presentation deadline — **the application holds the clock**. Three things were
+tried against the real pipeline, by interposing
+`StarfishMediaAPIs::Load` with `LD_PRELOAD` and rewriting its payload:
+
+| lever | result |
+|---|---|
+| `"lowDelayMode": false` | still arrival-paced |
+| `"videoInfo":{"isGameMode": false}` | still arrival-paced |
+| `StarfishMediaAPIs::Play()` (returns 1) | still arrival-paced |
+
+That last one is worth knowing on its own: `NDL_Media::DMPlayer::Play()` is
+exported, calls `StarfishMediaAPIs::Play()`, and **nothing in the library ever
+calls it** — there is no `NDL_DirectMediaPlay` in v2, and `SetAppState` only
+reaches `DVPlayer::SetVisible`. Calling it by hand changes nothing.
+
+The load payload NDL actually sends, for reference:
+
+```json
+{"args":[{"mediaTransportType":"DIRECTMEDIA-ES-PLAYER","option":{
+  "appId":"...","lowDelayMode":true,
+  "externalStreamingInfo":{"contents":{
+    "codec":{"video":"H265","audio":"PCM"},
+    "esInfo":{"videoHeight":1080,"videoWidth":1920,
+              "pauseAtDecodeTime":true,"ptsToDecode":0},
+    "pcmInfo":{"sampleRate":1,"channelMode":"stereo",
+               "format":"S16LE","layout":"interleaved"}}},
+  "adaptiveStreaming":{"maxHeight":1080,"maxFrameRate":120,"maxWidth":1920},
+  "windowId":"_Window_Id_66","videoInfo":{"isGameMode":true}}}]}
+```
+
+So a player on this API needs its own clock and its own read-ahead: pace the
+feed against the PTS, and demux on another thread so a stall in the source
+never lands on a frame deadline. The untried lever, if presentation timing
+ever becomes worth it, is `setMasterClock`/`setSlaveClock` plus
+`setMediaSynchronizerOptions` — the media-synchronizer path, which is a
+different project. `libNDL_media` (URI player) is the other way out: it clocks
+playback itself, at the cost of owning demux and everything else.
+
 **MP3 is in the enum but does not work.** NDL emits `"audio":{"codec":"MP3"}`
 with no rate or channel count, SMP fails to build caps for it, and Load prints
 the pair

@@ -1,8 +1,10 @@
-//! Jellyfin playback through the documented NDL DirectMedia v2 packet API.
+//! Jellyfin playback through LG's Starfish media pipeline. See starfish.zig
+//! for why libNDL_directmedia is not in the picture.
 const std = @import("std");
 const c = std.c;
 const linux = std.os.linux;
 const wl = @import("../wl.zig");
+const smp = @import("starfish.zig");
 
 extern fn jf_demux_open(url: [*:0]const u8) ?*anyopaque;
 extern fn jf_demux_close(demux: *anyopaque) void;
@@ -12,79 +14,13 @@ extern fn jf_demux_next(demux: *anyopaque, data: *?[*]u8, size: *c_int, stream: 
 extern fn jf_demux_audio_open(demux: *anyopaque, index: c_int, rate: *c_int) c_int;
 extern fn jf_demux_audio_decode(demux: *anyopaque, out: *?[*]u8, size: *c_int) c_int;
 
-// NDL_DIRECTMEDIA_DATA_INFO_T, webosbrew/webos-userland include/libndl-media.
-// The audio member is a union over a 32-byte payload; the arm selected by
-// `type` is the only part NDL reads, everything else must stay zero.
 const VideoType = enum(u32) { h264 = 1, h265 = 2, vp9 = 3, av1 = 4 };
-const AudioType = enum(u32) { none = 0, pcm = 1, mp3 = 2, opus = 3 };
-/// Not sorted by frequency; 22.05 kHz really is 8. Zero means "bypass" and
-/// crashes the pipeline, so an unlisted rate means no audio at all.
-const SampleRate = enum(u32) {
-    none = 0,
-    hz_48000 = 1,
-    hz_44100 = 2,
-    hz_32000 = 3,
-    hz_24000 = 4,
-    hz_16000 = 5,
-    hz_12000 = 6,
-    hz_8000 = 7,
-    hz_22050 = 8,
 
-    fn of(hertz: c_int) SampleRate {
-        return switch (hertz) {
-            48000 => .hz_48000,
-            44100 => .hz_44100,
-            32000 => .hz_32000,
-            24000 => .hz_24000,
-            16000 => .hz_16000,
-            12000 => .hz_12000,
-            8000 => .hz_8000,
-            22050 => .hz_22050,
-            else => .none,
-        };
-    }
-};
-const PcmInfo = extern struct {
-    type: AudioType = .pcm,
-    unknown1: i32 = 0,
-    format: [*:0]const u8 = "S16LE",
-    layout: [*:0]const u8 = "interleaved",
-    channel_mode: [*:0]const u8 = "stereo",
-    sample_rate: SampleRate,
-};
-const DataInfo = extern struct {
-    video: extern struct { width: i32, height: i32, type: VideoType, unknown1: i32 = 0 },
-    audio: extern union { type: AudioType, pcm: PcmInfo, padding: [32]u8 },
-};
-
-comptime {
-    // NDL reads fixed offsets; a drifting layout is silent corruption.
-    std.debug.assert(@sizeOf(DataInfo) == 48);
-    std.debug.assert(@offsetOf(DataInfo, "audio") == 16);
-    std.debug.assert(@offsetOf(PcmInfo, "channel_mode") == 16);
-    std.debug.assert(@offsetOf(PcmInfo, "sample_rate") == 20);
-}
-
-var ndl: ?*anyopaque = null;
-var dl_init: *const fn () callconv(.c) bool = undefined;
-var media_init: *const fn ([*:0]const u8) callconv(.c) i32 = undefined;
-var set_window: *const fn ([*:0]const u8) callconv(.c) i32 = undefined;
-var media_load: *const fn (*DataInfo, ?*const fn (i32, i64, ?[*:0]const u8) callconv(.c) void) callconv(.c) i32 = undefined;
-var media_unload: *const fn () callconv(.c) i32 = undefined;
-var media_quit: *const fn () callconv(.c) i32 = undefined;
-var media_error: *const fn () callconv(.c) ?[*:0]const u8 = undefined;
-var set_state: *const fn (u32) callconv(.c) i32 = undefined;
-var video_play: *const fn (*const anyopaque, u32, i64) callconv(.c) i32 = undefined;
-var audio_play: *const fn (*const anyopaque, u32, i64) callconv(.c) i32 = undefined;
-var audio_room: *const fn (*c_int) callconv(.c) i32 = undefined;
 var running = std.atomic.Value(bool).init(false);
 pub const State = enum(u8) { idle, loading, playing, failed };
 var playback_state = std.atomic.Value(u8).init(@intFromEnum(State.idle));
 var error_text: [160]u8 = @splat(0);
 
-fn sym(comptime T: type, name: [*:0]const u8) !T {
-    return @ptrCast(@alignCast(c.dlsym(ndl, name) orelse return error.MissingNdlSymbol));
-}
 fn setError(message: []const u8) void {
     const n = @min(message.len, error_text.len - 1);
     @memcpy(error_text[0..n], message[0..n]);
@@ -97,32 +33,19 @@ pub fn state() State {
     return @enumFromInt(playback_state.load(.acquire));
 }
 
-fn openNdl(window: [*:0]const u8) !void {
-    if (ndl == null) {
-        ndl = c.dlopen("libNDL_directmedia.so.1", .{ .NOW = true }) orelse return error.NoNdlDirectMedia;
-        dl_init = try sym(@TypeOf(dl_init), "NDL_DirectMedia_DL_Initialize");
-        if (!dl_init()) return error.NdlDlInitFailed;
-        media_init = try sym(@TypeOf(media_init), "NDL_DirectMediaInit");
-        set_window = try sym(@TypeOf(set_window), "NDL_DirectMediaSetWindowId");
-        media_load = try sym(@TypeOf(media_load), "NDL_DirectMediaLoad");
-        media_unload = try sym(@TypeOf(media_unload), "NDL_DirectMediaUnload");
-        media_quit = try sym(@TypeOf(media_quit), "NDL_DirectMediaQuit");
-        media_error = try sym(@TypeOf(media_error), "NDL_DirectMediaGetError");
-        set_state = try sym(@TypeOf(set_state), "NDL_DirectMediaSetAppState");
-        video_play = try sym(@TypeOf(video_play), "NDL_DirectVideoPlay");
-        audio_play = try sym(@TypeOf(audio_play), "NDL_DirectAudioPlay");
-        audio_room = try sym(@TypeOf(audio_room), "NDL_DirectAudioGetAvailableBufferSize");
-    }
-    if (set_window(window) != 0) return error.NdlWindowFailed;
-    if (media_init("dev.hookedbehemoth.jellyfin") != 0) return error.NdlMediaInitFailed;
-}
-
-/// NDL reports pipeline state and errors here. Passing null hides exactly the
-/// failure we are chasing, so always pass this.
+/// Pipeline state and errors arrive here.
 fn onLoad(kind: i32, num: i64, str: ?[*:0]const u8) callconv(.c) void {
-    std.debug.print("NDL event: type={d} value={d} text={s}\n", .{
+    std.debug.print("SMP event: type={d} value={d} text={s}\n", .{
         kind, num, if (str) |t| std.mem.sliceTo(t, 0) else "",
     });
+}
+fn codecName(kind: VideoType) []const u8 {
+    return switch (kind) {
+        .h264 => "H264",
+        .h265 => "H265",
+        .vp9 => "VP9",
+        .av1 => "AV1",
+    };
 }
 fn videoType(codec: c_int) ?VideoType {
     return switch (codec) {
@@ -134,6 +57,10 @@ fn videoType(codec: c_int) ?VideoType {
     };
 }
 var uri: [1025]u8 = @splat(0);
+const app_id = "dev.hookedbehemoth.jellyfin";
+var read_video: c_int = -1;
+var read_audio: c_int = -1;
+var window_id: [*:0]const u8 = undefined;
 
 fn feed() void {
     const z: [*:0]const u8 = @ptrCast(&uri);
@@ -170,37 +97,41 @@ fn feed() void {
         running.store(false, .release);
         return;
     }
-    // NDL takes PCM, MP3 or Opus only, and its MP3 arm never builds an audio
-    // pipeline here (g_object_set on a null appsrc at Load), so decode to PCM.
-    var info = std.mem.zeroes(DataInfo);
-    info.video = .{ .width = width, .height = height, .type = videoType(codec).? };
+    // The pipeline takes PCM, MP3 or Opus only, and its MP3 path never builds
+    // an audio sink on this TV, so everything is decoded to PCM first.
+    var audio: ?smp.Audio = null;
     if (audio_stream >= 0) {
         var rate: c_int = 0;
         const sample_rate = if (jf_demux_audio_open(demux, audio_stream, &rate) != 0)
-            SampleRate.of(rate)
+            smp.SampleRate.of(rate)
         else
-            SampleRate.none;
+            .none;
         if (sample_rate == .none) {
             std.debug.print("Jellyfin: no usable audio decode ({d} Hz), playing video only\n", .{rate});
             audio_stream = -1;
         } else {
-            info.audio.pcm = .{ .sample_rate = sample_rate };
+            audio = .{ .sample_rate = sample_rate, .channels = 2 };
         }
     }
-    if (media_load(&info, onLoad) != 0) {
-        setError(std.mem.sliceTo(media_error() orelse "NDL load failed", 0));
+    read_video = video_stream;
+    read_audio = audio_stream;
+    smp.load(app_id, std.mem.sliceTo(window_id, 0), .{
+        .width = width,
+        .height = height,
+        .codec = codecName(videoType(codec).?),
+    }, audio, onLoad) catch {
+        setError(smp.lastError());
         running.store(false, .release);
         return;
-    }
-    defer _ = media_unload();
-    // FOREGROUND after Load, as ndlplay does: before Load it does not stick.
-    _ = set_state(0);
+    };
+    defer smp.unload();
+    // Nothing else starts the pipeline: NDL never called Play either, which is
+    // why it could not pause or resume.
+    _ = smp.play();
     playback_state.store(@intFromEnum(State.playing), .release);
     // The pipeline presents what it is given as it arrives, so we hold the
     // clock. Reading ahead happens on its own thread: a stall in av_read_frame
     // must not land on a frame deadline.
-    queue.video = video_stream;
-    queue.audio = audio_stream;
     const reader = std.Thread.spawn(.{}, read, .{demux}) catch |err| {
         setError(@errorName(err));
         running.store(false, .release);
@@ -210,30 +141,18 @@ fn feed() void {
         running.store(false, .release);
         reader.join();
     }
-    var origin_pts: ?i64 = null;
-    var origin_ns: u64 = 0;
-    while (queue.pop()) |chunk| {
+    // Audio gets its own thread. Sharing one meant a chunk of audio due later
+    // held up every video frame queued behind it, and waiting for room in the
+    // audio sink stalled video as well -- with rendering on arrival, that
+    // head-of-line blocking is visible as stutter.
+    const audio_feeder = if (audio_stream >= 0) std.Thread.spawn(.{}, feedAudio, .{}) catch null else null;
+    defer if (audio_feeder) |t| t.join();
+
+    while (video_queue.pop()) |chunk| {
         defer std.heap.c_allocator.free(chunk.bytes);
-        if (origin_pts == null) {
-            origin_pts = chunk.pts;
-            origin_ns = nowNs();
-        }
-        // A fixed lead, not a queue depth: enough to cover feed jitter without
-        // handing the pipeline a burst it would play early.
-        const elapsed: u64 = @intCast(@max(0, chunk.pts - origin_pts.?));
-        const due = origin_ns + elapsed;
-        const now = nowNs() + feed_lead_ns;
-        if (due > now) sleepNs(due - now);
-        if (chunk.stream == audio_stream) {
-            // PCM is ~176 KB/s, so NDL's audio buffer does fill up. A rejected
-            // chunk costs a gap in the sound, not the whole playback.
-            waitFor(audio_room, @intCast(chunk.bytes.len), .at_least);
-            if (audio_play(chunk.bytes.ptr, @intCast(chunk.bytes.len), chunk.pts) != 0)
-                std.log.debug("audio dropped: {s}", .{std.mem.sliceTo(media_error() orelse "", 0)});
-            continue;
-        }
-        if (video_play(chunk.bytes.ptr, @intCast(chunk.bytes.len), chunk.pts) != 0) {
-            setError(std.mem.sliceTo(media_error() orelse "NDL packet feed failed", 0));
+        const pts = pace(chunk.pts);
+        if (smp.feedVideo(chunk.bytes, pts) == .failed) {
+            setError(smp.lastError());
             playback_state.store(@intFromEnum(State.failed), .release);
             break;
         }
@@ -241,16 +160,31 @@ fn feed() void {
     running.store(false, .release);
 }
 
-/// Demux ahead of playback, decoding audio on the way, until the queue is full.
+/// Audio runs on the same clock as video -- one origin, set by whichever
+/// stream is fed first -- so the two stay aligned without sharing a thread.
+fn feedAudio() void {
+    while (audio_queue.pop()) |chunk| {
+        defer std.heap.c_allocator.free(chunk.bytes);
+        const pts = pace(chunk.pts);
+        // PCM is ~176 KB/s, so the audio sink does fill up. A rejected chunk
+        // costs a gap in the sound, not the whole playback.
+        waitForAudioRoom(@intCast(chunk.bytes.len));
+        if (smp.feedAudio(chunk.bytes, pts) == .failed)
+            std.log.debug("audio dropped: {s}", .{smp.lastError()});
+    }
+}
+
+/// Demux ahead of playback, decoding audio on the way, until a queue is full.
 fn read(demux: *anyopaque) void {
     var packet: ?[*]u8 = null;
     var size: c_int = 0;
     var stream: c_int = 0;
     var pts: i64 = 0;
     while (running.load(.acquire) and jf_demux_next(demux, &packet, &size, &stream, &pts) != 0) {
-        if ((stream != queue.video and stream != queue.audio) or size <= 0) continue;
+        if ((stream != read_video and stream != read_audio) or size <= 0) continue;
         var bytes: []const u8 = (packet orelse continue)[0..@intCast(size)];
-        if (stream == queue.audio) {
+        const audio = stream == read_audio;
+        if (audio) {
             var pcm: ?[*]u8 = null;
             var pcm_size: c_int = 0;
             if (jf_demux_audio_decode(demux, &pcm, &pcm_size) == 0) continue;
@@ -258,19 +192,48 @@ fn read(demux: *anyopaque) void {
         }
         // Both buffers belong to the demuxer and die on the next read.
         const copy = std.heap.c_allocator.dupe(u8, bytes) catch break;
-        if (!queue.push(.{ .bytes = copy, .stream = stream, .pts = pts })) break;
+        const target = if (audio) &audio_queue else &video_queue;
+        if (!target.push(.{ .bytes = copy, .stream = stream, .pts = pts })) break;
     }
-    queue.finish();
+    video_queue.finish();
+    audio_queue.finish();
 }
 
-/// How far ahead of the clock a packet is handed to NDL.
+// One clock for both feed threads. Plain values, published by whichever
+// stream is fed first: 64-bit atomics do not exist on this target, and the
+// ready flag orders the handoff.
+var clock_pts: i64 = 0;
+var clock_ns: u64 = 0;
+var clock_claimed = std.atomic.Value(bool).init(false);
+var clock_ready = std.atomic.Value(bool).init(false);
+
+/// Sleep until this packet is due, and return its stream-relative timestamp.
+fn pace(packet_pts: i64) i64 {
+    if (clock_claimed.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
+        clock_pts = packet_pts;
+        clock_ns = nowNs();
+        clock_ready.store(true, .release);
+    }
+    while (!clock_ready.load(.acquire) and running.load(.acquire)) sleepNs(std.time.ns_per_ms);
+    // Stream-relative, not container-absolute: we call Play(), so the pipeline
+    // has a base time and TS timestamps start wherever they like.
+    const pts = packet_pts - clock_pts;
+    const due = clock_ns + @as(u64, @intCast(@max(0, pts)));
+    const now = nowNs() + feed_lead_ns;
+    // JF_NOPACE=1 feeds flat out: correct speed then means the pipeline is
+    // clocking on the PTS itself, and this pacing can go.
+    if (due > now and c.getenv("JF_NOPACE") == null) sleepNs(due - now);
+    return pts;
+}
+
+/// How far ahead of the clock a packet is handed to the pipeline.
 const feed_lead_ns = 60 * std.time.ns_per_ms;
 
 /// Demuxed-and-ready data waiting for its presentation time. One producer
 /// (the reader thread), one consumer (the feed loop), so plain atomics do;
 /// both sides idle with a short sleep rather than a condition variable.
 const Chunk = struct { bytes: []u8, stream: c_int, pts: i64 };
-var queue: struct {
+const Queue = struct {
     const slots = 512;
     const capacity_bytes = 8 << 20; // ~4s of 1080p at 15 Mbit
     const idle_ns = 2 * std.time.ns_per_ms;
@@ -280,8 +243,6 @@ var queue: struct {
     read: std.atomic.Value(usize) = .init(0),
     bytes: std.atomic.Value(usize) = .init(0),
     done: std.atomic.Value(bool) = .init(false),
-    video: c_int = -1,
-    audio: c_int = -1,
 
     /// False once playback is over, and the chunk is then the caller's to free.
     fn push(self: *@This(), chunk: Chunk) bool {
@@ -327,7 +288,9 @@ var queue: struct {
         self.bytes.raw = 0;
         self.done.raw = false;
     }
-} = .{};
+};
+var video_queue: Queue = .{};
+var audio_queue: Queue = .{};
 
 fn nowNs() u64 {
     var ts: linux.timespec = undefined;
@@ -335,18 +298,13 @@ fn nowNs() u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
-/// Block until an NDL queue has room: video reports frames waiting, audio
-/// reports bytes free. Bounded so a stalled pipeline cannot pin this thread.
-fn waitFor(query: *const fn (*c_int) callconv(.c) i32, limit: c_int, comptime want: enum { at_most, at_least }) void {
+/// Block until the audio sink can take this many bytes. Bounded, so a stalled
+/// pipeline cannot pin the feed thread.
+fn waitForAudioRoom(need: c_int) void {
     var spins: u32 = 0;
     while (running.load(.acquire) and spins < 400) : (spins += 1) {
-        var value: c_int = 0;
-        if (query(&value) != 0) return; // no reading: feed and let NDL judge
-        const room = switch (want) {
-            .at_most => value <= limit,
-            .at_least => value >= limit,
-        };
-        if (room) return;
+        const room = smp.audioRoom() orelse return; // no reading: feed anyway
+        if (room >= need) return;
         sleepNs(5 * std.time.ns_per_ms);
     }
 }
@@ -361,23 +319,30 @@ pub fn play(stream_uri: []const u8, width: u32, height: u32) !void {
     @memset(&error_text, 0);
     playback_state.store(@intFromEnum(State.loading), .release);
     const rect = [4]i32{ 0, 0, @intCast(width), @intCast(height) };
-    const window = try wl.exportVideoWindow(rect, rect);
-    try openNdl(window);
+    window_id = try wl.exportVideoWindow(rect, rect);
+    try smp.init(app_id);
     if (stream_uri.len >= uri.len) return error.UriTooLong;
     @memcpy(uri[0..stream_uri.len], stream_uri);
     uri[stream_uri.len] = 0;
-    queue.reset();
+    video_queue.reset();
+    audio_queue.reset();
+    clock_claimed.store(false, .release);
+    clock_ready.store(false, .release);
     running.store(true, .release);
     const thread = try std.Thread.spawn(.{}, feed, .{});
     thread.detach();
 }
-pub fn pause() void {}
-pub fn resumePlayback() void {}
+pub fn pause() void {
+    _ = smp.pause();
+}
+pub fn resumePlayback() void {
+    _ = smp.play();
+}
 pub fn stop() void {
     running.store(false, .release);
     playback_state.store(@intFromEnum(State.idle), .release);
 }
 pub fn deinit() void {
     stop();
-    if (ndl != null) _ = media_quit();
+    smp.deinit();
 }
