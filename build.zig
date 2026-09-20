@@ -194,6 +194,18 @@ pub fn build(b: *std.Build) void {
     videos.stdio = .inherit;
     b.step("videos", "Generate demo videos with ffmpeg and push them to the TV").dependOn(&videos.step);
 
+    // ---- log: follow the installed app's own log ----
+    // A launched app has no terminal, so it redirects stdout and stderr to
+    // conf/jellyfin.log (see `logToFile`). It truncates that on every start,
+    // which `tail -F` survives and `tail -f` does not.
+    const app_log = sh(b, env_preamble ++
+        \\app="$1"
+        \\id="dev.hookedbehemoth.$app"
+        \\exec ssh "$T" "tail -n 200 -F $APPDIR/$id/conf/$app.log"
+    , &.{selected});
+    app_log.stdio = .inherit;
+    b.step("log", "Follow -Dapp's log on the TV").dependOn(&app_log.step);
+
     // ---- shot: a PNG of whatever is on the TV right now ----
     // There is no screenshot service a native app can reach, but the TV runs a
     // VNC server; this is the only way to see the real output from here.

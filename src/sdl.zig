@@ -128,6 +128,9 @@ const WindowEvent = extern struct {
 };
 
 const ev_quit = 0x100;
+/// Our own event, so a foreign thread can ask the main thread to do something
+/// that only the main thread may do. SDL_USEREVENT.
+const ev_user = 0x8000;
 const ev_window = 0x200;
 const ev_keydown = 0x300;
 const ev_keyup = 0x301;
@@ -149,6 +152,7 @@ var SDL_SetHint: *const fn ([*:0]const u8, [*:0]const u8) callconv(.c) c_int = u
 var SDL_GetCurrentVideoDriver: *const fn () callconv(.c) ?[*:0]const u8 = undefined;
 var SDL_CreateWindow: *const fn ([*:0]const u8, c_int, c_int, c_int, c_int, u32) callconv(.c) ?*Window = undefined;
 var SDL_GetWindowSize: *const fn (*Window, *c_int, *c_int) callconv(.c) void = undefined;
+var SDL_RaiseWindow: *const fn (*Window) callconv(.c) void = undefined;
 var SDL_GL_GetDrawableSize: *const fn (*Window, *c_int, *c_int) callconv(.c) void = undefined;
 var SDL_webOSGetPanelResolution: ?*const fn (*c_int, *c_int) callconv(.c) c_int = null;
 var SDL_GetCurrentDisplayMode: *const fn (c_int, *DisplayMode) callconv(.c) c_int = undefined;
@@ -239,6 +243,7 @@ pub fn init(app_id: [*:0]const u8, title: [*:0]const u8, w: u32, h: u32) !void {
     SDL_GetCurrentVideoDriver = try bind(@TypeOf(SDL_GetCurrentVideoDriver), "SDL_GetCurrentVideoDriver");
     SDL_CreateWindow = try bind(@TypeOf(SDL_CreateWindow), "SDL_CreateWindow");
     SDL_GetWindowSize = try bind(@TypeOf(SDL_GetWindowSize), "SDL_GetWindowSize");
+    SDL_RaiseWindow = try bind(@TypeOf(SDL_RaiseWindow), "SDL_RaiseWindow");
     SDL_GL_GetDrawableSize = try bind(@TypeOf(SDL_GL_GetDrawableSize), "SDL_GL_GetDrawableSize");
     SDL_GetCurrentDisplayMode = try bind(@TypeOf(SDL_GetCurrentDisplayMode), "SDL_GetCurrentDisplayMode");
     SDL_GL_SetAttribute = try bind(@TypeOf(SDL_GL_SetAttribute), "SDL_GL_SetAttribute");
@@ -426,6 +431,18 @@ pub fn postQuit() void {
     _ = SDL_PushEvent(&event);
 }
 
+/// Bring the window back to the front, from any thread. webOS hands a
+/// minimised app a `relaunch` and expects it to raise itself; an app that
+/// ignores it stays in the background and cannot be reopened at all.
+pub fn postRaise() void {
+    if (lib == null) return;
+    var event: Event = undefined;
+    const bytes: [*]u8 = @ptrCast(&event);
+    @memset(bytes[0..@sizeOf(Event)], 0);
+    event.kind = ev_user;
+    _ = SDL_PushEvent(&event);
+}
+
 /// Drain SDL's queue into the app's handler. Returns false once the app should
 /// stop, which is what the main loop runs on.
 pub fn poll() bool {
@@ -440,6 +457,9 @@ fn translate(event: *const Event) void {
             running = false;
             on_event(.close);
         },
+        // Only the main thread may touch the window, so `postRaise` comes
+        // back through the queue to be acted on here.
+        ev_user => if (window) |win| SDL_RaiseWindow(win),
         ev_keydown, ev_keyup => {
             const key = readKey(event, event.kind == ev_keydown);
             // Auto-repeat drives held-down navigation, so it is not filtered.

@@ -1871,6 +1871,45 @@ fn isTty(fd: i32) bool {
     return @as(isize, @bitCast(linux.ioctl(fd, 0x5401, @intFromPtr(&probe)))) >= 0; // TCGETS
 }
 
+extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern var stdout: *anyopaque;
+extern fn setvbuf(stream: *anyopaque, buf: ?[*]u8, mode: c_int, size: usize) c_int;
+
+/// SAM launches an app with an environment of its own making and no way to
+/// add to it, so the debug switches (`JF_KEYLOG`, `JF_LUNALOG`, `JF_MPVLOG`)
+/// would be reachable only from a hand-started run -- which is exactly the
+/// run that behaves differently. Read them from `conf/debug.env` instead, one
+/// `KEY=VALUE` per line, so they work however the app was started:
+///
+///     echo JF_KEYLOG=1 > $APPDIR/<id>/conf/debug.env
+///
+/// Anything already in the environment wins, so a manual run can still
+/// override the file.
+fn loadDebugEnv() void {
+    var path: [512]u8 = undefined;
+    const name = std.fmt.bufPrintZ(&path, "{s}/conf/debug.env", .{api.storeRoot()}) catch return;
+    const rc = linux.openat(linux.AT.FDCWD, name, .{ .ACCMODE = .RDONLY }, 0);
+    if (@as(isize, @bitCast(rc)) < 0) return;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    var text: [1024]u8 = undefined;
+    const n = linux.read(fd, &text, text.len);
+    if (@as(isize, @bitCast(n)) <= 0) return;
+
+    var lines = std.mem.tokenizeAny(u8, text[0..n], "\r\n");
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t");
+        if (line.len == 0 or line[0] == '#') continue;
+        const split = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        var pair: [256]u8 = undefined;
+        const key = std.fmt.bufPrintZ(&pair, "{s}", .{std.mem.trim(u8, line[0..split], " \t")}) catch continue;
+        var value_buf: [256]u8 = undefined;
+        const value = std.fmt.bufPrintZ(&value_buf, "{s}", .{std.mem.trim(u8, line[split + 1 ..], " \t")}) catch continue;
+        _ = setenv(key.ptr, value.ptr, 0);
+        std.debug.print("debug.env: {s}={s}\n", .{ key, value });
+    }
+}
+
 /// Launched from the TV's app list there is no terminal, so an installed app's
 /// output goes nowhere and a failure is invisible. Same fallback as `ndlplay`:
 /// send stderr to a file next to everything else this app writes.
@@ -1889,6 +1928,8 @@ fn logToFile() void {
     // stdout, and those lines are the only diagnosis when a backend refuses.
     _ = linux.dup2(@intCast(rc), 1);
     _ = linux.dup2(@intCast(rc), 2);
+    // force line buffering for file logging
+    _ = setvbuf(stdout, null, 1, 0);
 }
 
 // A remote, replayed. There is no way to click through this app without a TV
@@ -1938,6 +1979,9 @@ pub fn main(init: std.process.Init) !void {
     api.deviceId(&session.device_id);
     api.initStore(init.io, init.gpa);
     logToFile();
+    // After the redirect, so the confirmation lands in the log rather than on
+    // a stdout nobody is reading.
+    loadDebugEnv();
     const restored = api.load(&session);
 
     wl.on_event = onEvent;
@@ -1945,7 +1989,7 @@ pub fn main(init: std.process.Init) !void {
     try wl.init(appid, "Jellyfin", 0, 0);
     defer wl.deinit();
     // How the TV asks the app to close. Absent off-device, where nothing asks.
-    luna.registerLifecycle(wl.postQuit) catch |err| std.debug.print("no webOS lifecycle: {s}\n", .{@errorName(err)});
+    luna.registerLifecycle(wl.postQuit, wl.postRaise) catch |err| std.debug.print("no webOS lifecycle: {s}\n", .{@errorName(err)});
     defer luna.deinit();
     glClearColor = gl.proc(@TypeOf(glClearColor), "glClearColor");
     glClear = gl.proc(@TypeOf(glClear), "glClear");

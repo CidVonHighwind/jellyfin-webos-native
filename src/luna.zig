@@ -48,15 +48,17 @@ fn bind(comptime T: type, handle: ?*anyopaque, name: [*:0]const u8) !T {
     return @ptrCast(@alignCast(c.dlsym(handle.?, name) orelse return error.MissingLunaSymbol));
 }
 
-/// What to do when the system asks for the app to go away. Called from the
-/// GLib thread, so it must be something a foreign thread may do --
-/// `sdl.postQuit` is, because SDL_PushEvent is thread-safe.
+/// What to do when the system asks the app to go away, and to come back.
+/// Both are called from the GLib thread, so they must be things a foreign
+/// thread may do -- `sdl.postQuit` and `sdl.postRaise` are, because
+/// SDL_PushEvent is thread-safe.
 var quit: *const fn () void = ignore;
+var raise: *const fn () void = ignore;
 fn ignore() void {}
 
 /// Subscribe to the lifecycle. Fails on anything that is not a webOS device,
 /// which is not an error there: nothing is asking the app to close.
-pub fn registerLifecycle(on_quit: *const fn () void) !void {
+pub fn registerLifecycle(on_quit: *const fn () void, on_relaunch: *const fn () void) !void {
     if (helpers != null) return;
     helpers = c.dlopen("libhelpers.so.2", .{ .NOW = true }) orelse
         c.dlopen("libhelpers.so", .{ .NOW = true }) orelse return error.NoLibHelpers;
@@ -68,6 +70,7 @@ pub fn registerLifecycle(on_quit: *const fn () void) !void {
     g_main_loop_run = try bind(@TypeOf(g_main_loop_run), glib, "g_main_loop_run");
     g_main_loop_quit = try bind(@TypeOf(g_main_loop_quit), glib, "g_main_loop_quit");
     quit = on_quit;
+    raise = on_relaunch;
 
     // A subscription, so the reply keeps arriving for the life of the app.
     context = .{ .callback = onEvent, .multiple = 1, .is_public = 1 };
@@ -104,7 +107,9 @@ fn onEvent(_: ?*LSHandle, message: ?*LSMessage, _: ?*anyopaque) callconv(.c) boo
     const event = jsonString(text, "event") orelse return true;
     std.debug.print("luna lifecycle: {s}\n", .{event});
     if (std.mem.eql(u8, event, "close")) quit();
-    // "relaunch" needs nothing: the window is fullscreen and already up.
+    // A minimised app is still running, so opening it from the launcher is a
+    // relaunch rather than a start: nothing else will raise the window.
+    if (std.mem.eql(u8, event, "relaunch")) raise();
     return true;
 }
 
