@@ -10,6 +10,9 @@
 const std = @import("std");
 const c = std.c;
 
+extern fn jf_starfish_begin_segment(pipeline: *anyopaque, pts_ns: i64) bool;
+extern fn jf_starfish_segment_error() [*:0]const u8;
+
 pub const LoadCallback = ?*const fn (i32, i64, ?[*:0]const u8) callconv(.c) void;
 
 /// The sample rates the pipeline accepts, by their actual frequency. An
@@ -85,11 +88,11 @@ var smp_load: *const fn (*anyopaque, [*:0]const u8, LoadCallback) callconv(.c) b
 var smp_feed: *const fn (*StdString, *anyopaque, [*:0]const u8) callconv(.c) void = undefined;
 var smp_play: *const fn (*anyopaque) callconv(.c) bool = undefined;
 var smp_pause: *const fn (*anyopaque) callconv(.c) bool = undefined;
+var smp_play_rate: *const fn (*anyopaque, [*:0]const u8) callconv(.c) bool = undefined;
 var smp_unload: *const fn (*anyopaque) callconv(.c) bool = undefined;
 var smp_eos: *const fn (*anyopaque) callconv(.c) bool = undefined;
 var smp_seek: *const fn (*anyopaque, [*:0]const u8) callconv(.c) bool = undefined;
 var smp_flush: *const fn (*anyopaque, [*:0]const u8) callconv(.c) bool = undefined;
-var smp_time_to_decode: *const fn (*anyopaque, [*:0]const u8) callconv(.c) bool = undefined;
 var smp_foreground: *const fn (*anyopaque) callconv(.c) bool = undefined;
 var smp_queue_length: *const fn (*anyopaque, *c_int) callconv(.c) bool = undefined;
 var smp_playtime: *const fn (*anyopaque) callconv(.c) i64 = undefined;
@@ -130,11 +133,11 @@ pub fn init(app_id: []const u8) !void {
     smp_feed = try sym(lib, @TypeOf(smp_feed), "_ZN17StarfishMediaAPIs4FeedB5cxx11EPKc");
     smp_play = try sym(lib, @TypeOf(smp_play), "_ZN17StarfishMediaAPIs4PlayEv");
     smp_pause = try sym(lib, @TypeOf(smp_pause), "_ZN17StarfishMediaAPIs5PauseEv");
+    smp_play_rate = try sym(lib, @TypeOf(smp_play_rate), "_ZN17StarfishMediaAPIs11SetPlayRateEPKc");
     smp_unload = try sym(lib, @TypeOf(smp_unload), "_ZN17StarfishMediaAPIs6UnloadEv");
     smp_eos = try sym(lib, @TypeOf(smp_eos), "_ZN17StarfishMediaAPIs7pushEOSEv");
     smp_seek = try sym(lib, @TypeOf(smp_seek), "_ZN17StarfishMediaAPIs4SeekEPKc");
     smp_flush = try sym(lib, @TypeOf(smp_flush), "_ZN17StarfishMediaAPIs5flushEPKc");
-    smp_time_to_decode = try sym(lib, @TypeOf(smp_time_to_decode), "_ZN17StarfishMediaAPIs15setTimeToDecodeEPKc");
     smp_foreground = try sym(lib, @TypeOf(smp_foreground), "_ZN17StarfishMediaAPIs16notifyForegroundEv");
     smp_queue_length = try sym(lib, @TypeOf(smp_queue_length), "_ZN17StarfishMediaAPIs25getVideoRenderQueueLengthERi");
     smp_playtime = try sym(lib, @TypeOf(smp_playtime), "_ZN17StarfishMediaAPIs18getCurrentPlaytimeEv");
@@ -146,9 +149,11 @@ pub fn init(app_id: []const u8) !void {
 }
 var symbols_loaded = false;
 
-var json_buf: [2048]u8 = undefined;
+var json_buf: [4096]u8 = undefined;
 
-/// Every key here is one libpf-1.0.so.1 parses on this firmware.
+/// Raw elementary-stream payload shared in substance with spool-mpv's
+/// Starfish backend. PCM needs much smaller source buffers than compressed
+/// audio; using the generic limits adds a large, unnecessary audio queue.
 fn buildPayload(buf: []u8, app_id: []const u8, window_id: []const u8, video: Video, audio: ?Audio) ![:0]u8 {
     var pcm_scratch: [192]u8 = undefined;
     // `sampleRate` is in kHz as a decimal -- 48, 44.1, 22.05 -- not hertz. A
@@ -167,35 +172,62 @@ fn buildPayload(buf: []u8, app_id: []const u8, window_id: []const u8, video: Vid
         ",\"videoFpsValue\":{d},\"videoFpsScale\":{d}",
         .{ video.fps_num, video.fps_den },
     ) else "";
-    return std.fmt.bufPrintZ(buf, "{{\"args\":[{{\"mediaTransportType\":\"BUFFERSTREAM\",\"option\":{{" ++
-        "\"appId\":\"{s}\",\"lowDelayMode\":false,\"queryPosition\":true,\"restartStreaming\":false," ++
+    const system_clock = if (audio == null) "\"useCurrentTimeWithSystemClock\":true," else "";
+    return std.fmt.bufPrintZ(buf, "{{\"args\":[" ++
+        "{{" ++
+        "\"mediaTransportType\":\"BUFFERSTREAM\"," ++
+        "\"option\":{{" ++
+        "\"appId\":\"{s}\"," ++
+        "\"needAudio\":{s}," ++
+        "\"seekMode\":\"keep-rate\"," ++
+        "\"queryPosition\":true," ++
+        "\"useDroppedFrameEvent\":true," ++
+        "{s}" ++
+        "\"windowId\":\"{s}\"," ++
+        "\"transmission\":{{" ++
+        "\"contentsType\":\"LIVE\"," ++
+        "\"trickType\":\"client-side\"" ++
+        "}}," ++
         "\"externalStreamingInfo\":{{" ++
-        // audioSync makes the audio sink the master clock, which is what a
-        // player wants; the two streamQuality keys turn on the pipeline's own
-        // dropped/presented frame counters (callback types 46 and 47).
-        "\"audioSync\":{s},\"streamQualityInfo\":true,\"streamQualityInfoNonFlushable\":true," ++
-        "\"contents\":{{\"provider\":\"jellyfin\",\"codec\":{{\"video\":\"{s}\"{s}}}," ++
-        // pauseAtDecodeTime is false on purpose: with true and no
-        // setTimeToDecode trigger, "decode until pts 0, then pause" is what
-        // the pipeline is being asked for.
-        "\"esInfo\":{{\"videoHeight\":{d},\"videoWidth\":{d},\"pauseAtDecodeTime\":false,\"ptsToDecode\":0{s}}}{s}}}," ++
-        "\"bufferingCtrInfo\":{{\"preBufferByte\":0,\"qBufferLevelAudio\":0,\"qBufferLevelVideo\":0," ++
-        "\"srcBufferLevelAudio\":{{\"minimum\":1,\"maximum\":1048576}}," ++
-        "\"srcBufferLevelVideo\":{{\"minimum\":1,\"maximum\":8388608}}}}}}," ++
-        "\"transmission\":{{\"contentsType\":\"LIVE\"}}," ++
-        "\"adaptiveStreaming\":{{\"maxHeight\":{d},\"maxFrameRate\":120,\"maxWidth\":{d}}}," ++
-        "\"windowId\":\"{s}\",\"videoInfo\":{{\"isGameMode\":false}}}}}}]}}", .{
-        app_id,       if (audio != null) "true" else "false",
-        video.codec,  if (audio != null) ",\"audio\":\"PCM\"" else "",
-        video.height, video.width,
-        fps,          pcm,
-        video.height, video.width,
+        "\"audioSync\":{s}," ++
+        "\"streamQualityInfo\":true," ++
+        "\"streamQualityInfoNonFlushable\":true," ++
+        "\"streamQualityInfoCorruptedFrame\":true," ++
+        "\"contents\":{{\"format\":\"RAW\"," ++
+        "\"provider\":\"{s}\"," ++
+        "\"codec\":{{\"video\":\"{s}\"{s}}}," ++
+        "\"esInfo\":{{" ++
+        "\"pauseAtDecodeTime\":true," ++
+        "\"seperatedPTS\":true," ++
+        "\"ptsToDecode\":0," ++
+        "\"videoWidth\":{d}," ++
+        "\"videoHeight\":{d}{s}}}{s}}}," ++
+        "\"bufferingCtrInfo\":{{\"preBufferByte\":0," ++
+        "\"bufferMinLevel\":0," ++
+        "\"bufferMaxLevel\":0," ++
+        "\"qBufferLevelVideo\":0," ++
+        "\"srcBufferLevelVideo\":{{\"minimum\":1048576," ++
+        "\"maximum\":8388608}}," ++
+        "\"qBufferLevelAudio\":0," ++
+        "\"srcBufferLevelAudio\":{{\"minimum\":32768," ++
+        "\"maximum\":262144}}}}}}}}}}]}}", .{
+        app_id,
+        if (audio != null) "true" else "false",
+        system_clock,
         window_id,
+        if (audio != null) "true" else "false",
+        app_id,
+        video.codec,
+        if (audio != null) ",\"audio\":\"PCM\"" else "",
+        video.width,
+        video.height,
+        fps,
+        pcm,
     });
 }
 
-test "payload carries the keys libpf parses on this firmware" {
-    var buf: [2048]u8 = undefined;
+test "payload matches the spool-mpv raw ES contract" {
+    var buf: [4096]u8 = undefined;
     const built = try buildPayload(&buf, "dev.hookedbehemoth.jellyfin", "_Window_Id_66", .{
         .width = 1920,
         .height = 1080,
@@ -203,18 +235,22 @@ test "payload carries the keys libpf parses on this firmware" {
         .fps_num = 24000,
         .fps_den = 1001,
     }, .{ .sample_rate = .hz_48000, .channels = 2 });
-    // Checked against libpf-1.0.so.1's string table. needAudio, seperatedPTS
-    // and bufferMaxLevel are absent because this firmware does not parse them.
     for ([_][]const u8{
         "\"mediaTransportType\":\"BUFFERSTREAM\"",
+        "\"needAudio\":true",
+        "\"seekMode\":\"keep-rate\"",
         "\"audioSync\":true",
+        "\"format\":\"RAW\"",
         "\"streamQualityInfo\":true",
         "\"streamQualityInfoNonFlushable\":true",
+        "\"streamQualityInfoCorruptedFrame\":true",
         "\"videoFpsValue\":24000,\"videoFpsScale\":1001",
-        "\"pauseAtDecodeTime\":false",
+        "\"pauseAtDecodeTime\":true",
+        "\"seperatedPTS\":true",
         "\"bitsPerSample\":16",
         "\"sampleRate\":48,",
-        "\"srcBufferLevelVideo\":{\"minimum\":1,\"maximum\":8388608}",
+        "\"srcBufferLevelAudio\":{\"minimum\":32768,\"maximum\":262144}",
+        "\"srcBufferLevelVideo\":{\"minimum\":1048576,\"maximum\":8388608}",
         "\"queryPosition\":true",
         "\"windowId\":\"_Window_Id_66\"",
     }) |needle| {
@@ -223,12 +259,10 @@ test "payload carries the keys libpf parses on this firmware" {
             return err;
         };
     }
-    for ([_][]const u8{ "needAudio", "seperatedPTS", "bufferMaxLevel" }) |absent|
-        try std.testing.expect(std.mem.indexOf(u8, built, absent) == null);
 }
 
 test "payload is valid JSON" {
-    var buf: [2048]u8 = undefined;
+    var buf: [4096]u8 = undefined;
     const built = try buildPayload(&buf, "dev.hookedbehemoth.jellyfin", "_Window_Id_89", .{
         .width = 1920,
         .height = 1080,
@@ -241,7 +275,7 @@ test "payload is valid JSON" {
 }
 
 test "pcm sample rates go out in kHz, not hertz and not an enum tag" {
-    var buf: [2048]u8 = undefined;
+    var buf: [4096]u8 = undefined;
     const video = Video{ .width = 1920, .height = 1080, .codec = "H265" };
     for ([_]struct { rate: SampleRate, want: []const u8 }{
         .{ .rate = .hz_48000, .want = "\"sampleRate\":48," },
@@ -258,15 +292,17 @@ test "pcm sample rates go out in kHz, not hertz and not an enum tag" {
 }
 
 test "no audio means no audio block" {
-    var buf: [2048]u8 = undefined;
+    var buf: [4096]u8 = undefined;
     const built = try buildPayload(&buf, "app", "_Window_Id_1", .{ .width = 1280, .height = 720, .codec = "H264" }, null);
     try std.testing.expect(std.mem.indexOf(u8, built, "pcmInfo") == null);
     try std.testing.expect(std.mem.indexOf(u8, built, "\"audioSync\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, built, "\"useCurrentTimeWithSystemClock\":true") != null);
 }
 
 pub fn load(app_id: []const u8, window_id: []const u8, video: Video, audio: ?Audio, on_event: LoadCallback) !void {
     const self = pipeline orelse return error.NotInitialized;
     const payload = try buildPayload(&json_buf, app_id, window_id, video, audio);
+    std.debug.print("SMP Load payload: {s}\n", .{payload});
     if (!smp_load(self, payload.ptr, on_event)) {
         setError("Starfish rejected the load payload");
         return error.LoadFailed;
@@ -307,8 +343,8 @@ pub fn renderQueueLength() ?c_int {
     return frames;
 }
 
-/// Where the pipeline says playback actually is. Units are not documented;
-/// the first run prints it next to a known feed timestamp.
+/// PTS of the frame actually displayed, in nanoseconds. The value is
+/// frame-quantized, so callers pair it with a host-time sample and project it.
 pub fn playtime() i64 {
     const self = pipeline orelse return 0;
     return smp_playtime(self);
@@ -321,6 +357,15 @@ pub fn play() bool {
 pub fn pause() bool {
     const self = pipeline orelse return false;
     return smp_pause(self);
+}
+pub fn setPlayRate(rate_millis: i32, audio_output: bool) bool {
+    const self = pipeline orelse return false;
+    var text: [64]u8 = undefined;
+    const arg = std.fmt.bufPrintZ(&text, "{{\"audioOutput\":{},\"playRate\":{d:.3}}}", .{
+        audio_output,
+        @as(f64, @floatFromInt(rate_millis)) / 1000.0,
+    }) catch return false;
+    return smp_play_rate(self, arg.ptr);
 }
 pub fn endOfStream() void {
     if (pipeline) |self| _ = smp_eos(self);
@@ -341,13 +386,16 @@ pub fn flush(position: i64) bool {
     return smp_flush(self, arg.ptr);
 }
 
-/// Tell the decoder where the buffers that follow begin. Wants the pipeline
-/// paused: libpf logs "Failed to setTimeToDecode current state: %s" otherwise.
-pub fn setTimeToDecode(position: i64) bool {
+/// Establish the CustomPipeline segment that both elementary streams share.
+/// StarfishMediaAPIs does not forward sendSegmentEvent, so the ABI bridge
+/// follows its documented player member to the underlying libpf pipeline.
+pub fn beginSegment(position: i64) bool {
     const self = pipeline orelse return false;
-    var text: [48]u8 = undefined;
-    const arg = std.fmt.bufPrintZ(&text, "{{\"position\":{d}}}", .{position}) catch return false;
-    return smp_time_to_decode(self, arg.ptr);
+    return jf_starfish_begin_segment(self, position);
+}
+
+pub fn segmentError() []const u8 {
+    return std.mem.sliceTo(jf_starfish_segment_error(), 0);
 }
 
 /// Seek takes **milliseconds** -- `Seek(const char *millis)` in the header.
@@ -373,4 +421,69 @@ pub fn deinit() void {
         pipeline = null;
         instance = @splat(0);
     }
+}
+
+pub fn event_desc(kind: i32) []const u8 {
+    return switch (kind) {
+        0x0 => "TYPE_FRAMEREADY",
+        0x1 => "TYPE_STR_STREAMING_INFO_PERI",
+        0x2 => "TYPE_INT_BUFFER_RANGE_INFO",
+        0x3 => "TYPE_INT_DURATION",
+        0x4 => "TYPE_STR_VIDEO_INFO",
+        0x5 => "TYPE_STR_VIDEO_TRACK_INFO",
+        0x7 => "TYPE_STR_AUDIO_INFO",
+        0x8 => "TYPE_STR_AUDIO_TRACK_INFO",
+        0x9 => "TYPE_STR_SUBT_TRACK_INFO",
+        0xa => "TYPE_STR_BUFF_EVENT",
+        0xb => "TYPE_STR_SOURCE_INFO",
+        0xd => "TYPE_INT_NUM_PROGRAM",
+        0xe => "TYPE_INT_NUM_VIDEO_TRACK",
+        0xf => "TYPE_INT_NUM_AUDIO_TRACK",
+        0x11 => "TYPE_STR_RESOURCE_INFO",
+        0x12 => "TYPE_INT_ERROR",
+        0x13 => "TYPE_STR_ERROR",
+        0x15 => "TYPE_STR_STATE_UPDATE__PRELOADCOMPLETED",
+        0x16 => "TYPE_STR_STATE_UPDATE__LOADCOMPLETED",
+        0x17 => "TYPE_STR_STATE_UPDATE__UNLOADCOMPLETED",
+        0x18 => "TYPE_STR_STATE_UPDATE__TRACKSELECTED",
+        0x19 => "TYPE_STR_STATE_UPDATE__SEEKDONE",
+        0x1a => "TYPE_STR_STATE_UPDATE__PLAYING",
+        0x1b => "TYPE_STR_STATE_UPDATE__PAUSED",
+        0x1c => "TYPE_STR_STATE_UPDATE__ENDOFSTREAM",
+        0x1d => "TYPE_STR_CUSTOM",
+        0x26 => "TYPE_INT_NEED_DATA",
+        0x27 => "TYPE_INT_ENOUGH_DATA",
+        0x2b => "TYPE_INT_SVP_VDEC_READY",
+        0x2c => "TYPE_INT_BUFFERLOW",
+        0x2d => "TYPE_STR_BUFFERFULL",
+        0x2e => "TYPE_STR_BUFFERLOW",
+        0x30 => "TYPE_DROPPED_FRAME",
+        0x270 => "USER_DEFINED",
+        else => "(unknown)",
+    };
+}
+
+/// The callback's third argument is only a C string for string-valued events.
+/// For integer events libpf may leave the slot unspecified, so dereferencing
+/// it produces garbage or can fault while trying to improve diagnostics.
+pub fn eventHasText(kind: i32) bool {
+    return switch (kind) {
+        0x1,
+        0x4,
+        0x5,
+        0x7,
+        0x8,
+        0x9,
+        0xa,
+        0xb,
+        0x11,
+        0x13,
+        0x15...0x1d,
+        0x2d,
+        0x2e,
+        10001,
+        10002,
+        => true,
+        else => false,
+    };
 }

@@ -65,10 +65,16 @@ pub fn build(b: *std.Build) void {
                 .strip = strip_mod,
             }),
         });
-        if (std.mem.eql(u8, app.name, "jellyfin")) exe.root_module.addCSourceFile(.{
-            .file = b.path("src/jellyfin/demux.c"),
-            .flags = &.{"-I/usr/include/ffmpeg4.4"},
-        });
+        if (std.mem.eql(u8, app.name, "jellyfin")) {
+            exe.root_module.addCSourceFile(.{
+                .file = b.path("src/jellyfin/demux.c"),
+                .flags = &.{"-I/usr/include/ffmpeg4.4"},
+            });
+            exe.root_module.addCSourceFile(.{
+                .file = b.path("src/jellyfin/starfish_bridge.c"),
+                .flags = &.{},
+            });
+        }
         addAssets(b, exe, app);
         if (app.ui) addUiDeps(b, exe.root_module, target, optimize);
         b.installArtifact(exe);
@@ -156,6 +162,10 @@ pub fn build(b: *std.Build) void {
     ui_tests.root_module.addCSourceFile(.{
         .file = b.path("src/jellyfin/demux.c"),
         .flags = &.{"-I/usr/include/ffmpeg4.4"},
+    });
+    ui_tests.root_module.addCSourceFile(.{
+        .file = b.path("src/jellyfin/starfish_bridge.c"),
+        .flags = &.{},
     });
     for (apps) |app| if (std.mem.eql(u8, app.name, "jellyfin")) addAssets(b, ui_tests, app);
     addUiDeps(b, ui_tests.root_module, b.resolveTargetQuery(.{}), optimize);

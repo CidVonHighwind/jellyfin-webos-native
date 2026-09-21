@@ -16,6 +16,7 @@ struct jf_demux {
     struct SwrContext *swr;
     uint8_t *pcm;
     int pcm_cap, pcm_size;
+    int64_t audio_next_pts;
     // A file container stores H.264/H.265 length-prefixed with the parameter
     // sets off in extradata. The hardware decoder wants Annex-B start codes --
     // without them it reports "Sequence Init Fail" and never starts.
@@ -45,6 +46,8 @@ static struct SwrContext *(*p_swr_alloc_set_opts)(struct SwrContext *, int64_t, 
 static int (*p_swr_init)(struct SwrContext *);
 static int (*p_swr_convert)(struct SwrContext *, uint8_t **, int, const uint8_t **, int);
 static void (*p_swr_free)(struct SwrContext **);
+static int64_t (*p_swr_get_delay)(struct SwrContext *, int64_t);
+static int64_t (*p_rescale_q)(int64_t, AVRational, AVRational);
 static void (*p_log_set_level)(int);
 static int (*p_seek)(AVFormatContext *, int, int64_t, int);
 static void (*p_flush_buffers)(AVCodecContext *);
@@ -97,6 +100,8 @@ static int load(void) {
     *(void **)(&p_swr_init) = dlsym(swr_lib, "swr_init");
     *(void **)(&p_swr_convert) = dlsym(swr_lib, "swr_convert");
     *(void **)(&p_swr_free) = dlsym(swr_lib, "swr_free");
+    *(void **)(&p_swr_get_delay) = dlsym(swr_lib, "swr_get_delay");
+    *(void **)(&p_rescale_q) = dlsym(util_lib, "av_rescale_q");
     // find_stream_info opens a decoder per stream to probe it; we only ever
     // demux, so its per-frame complaints are noise on our stderr.
     *(void **)(&p_log_set_level) = dlsym(util_lib, "av_log_set_level");
@@ -108,12 +113,18 @@ static int load(void) {
 /// stream's own rate; the pipeline takes nothing else. 1 on success.
 int jf_demux_audio_open(void *opaque, int index, int *rate) {
     struct jf_demux *d = opaque;
-    if (!p_find_decoder || !p_frame_alloc || !p_swr_alloc_set_opts) return 0;
+    if (!p_find_decoder || !p_frame_alloc || !p_swr_alloc_set_opts || !p_swr_get_delay || !p_rescale_q) return 0;
     if (index < 0 || index >= (int)d->format->nb_streams) return 0;
     AVCodecParameters *par = d->format->streams[index]->codecpar;
     AVCodec *dec = p_find_decoder(par->codec_id);
     if (!dec || !(d->audio = p_alloc_context(dec))) return 0;
-    if (p_parameters_to_context(d->audio, par) < 0 || p_codec_open(d->audio, dec, 0) < 0) return 0;
+    if (p_parameters_to_context(d->audio, par) < 0) return 0;
+    // The decoder needs the packet timebase to adjust frame PTS when it
+    // removes codec padding (e.g. Opus pre-skip). Otherwise the samples are
+    // trimmed but still carry the timestamp of the discarded samples.
+    d->audio->pkt_timebase = d->format->streams[index]->time_base;
+    d->audio_next_pts = AV_NOPTS_VALUE;
+    if (p_codec_open(d->audio, dec, 0) < 0) return 0;
     if (!(d->frame = p_frame_alloc())) return 0;
     int64_t in_layout = d->audio->channel_layout;
     if (!in_layout) in_layout = d->audio->channels == 1 ? AV_CH_LAYOUT_MONO : AV_CH_LAYOUT_STEREO;
@@ -125,12 +136,21 @@ int jf_demux_audio_open(void *opaque, int index, int *rate) {
 }
 
 /// Decode the packet jf_demux_next last returned into interleaved S16LE stereo.
-/// The buffer stays valid until the next call. 1 when there are samples.
-int jf_demux_audio_decode(void *opaque, uint8_t **out, int *size) {
+/// pts enters as the packet timestamp and leaves as the first output sample's
+/// timestamp, in nanoseconds. The buffer stays valid until the next call.
+int jf_demux_audio_decode(void *opaque, uint8_t **out, int *size, int64_t *pts) {
     struct jf_demux *d = opaque;
     d->pcm_size = 0;
+    int64_t first_pts = AV_NOPTS_VALUE;
     if (!d->audio || p_send_packet(d->audio, d->packet) < 0) return 0;
     while (p_receive_frame(d->audio, d->frame) == 0) {
+        const AVRational ns = {1, 1000000000};
+        // Decoded frames may belong to an earlier packet or have leading
+        // samples removed. Resampler buffering also belongs in the timestamp.
+        int64_t frame_pts = d->frame->pts != AV_NOPTS_VALUE
+            ? p_rescale_q(d->frame->pts, d->audio->pkt_timebase, ns)
+                - p_swr_get_delay(d->swr, 1000000000)
+            : d->audio_next_pts != AV_NOPTS_VALUE ? d->audio_next_pts : *pts;
         int need = d->pcm_size + d->frame->nb_samples * 4; // 2 channels, 2 bytes
         if (need > d->pcm_cap) {
             uint8_t *grown = realloc(d->pcm, need);
@@ -141,10 +161,15 @@ int jf_demux_audio_decode(void *opaque, uint8_t **out, int *size) {
         uint8_t *dst = d->pcm + d->pcm_size;
         int got = p_swr_convert(d->swr, &dst, d->frame->nb_samples,
                                 (const uint8_t **)d->frame->extended_data, d->frame->nb_samples);
-        if (got > 0) d->pcm_size += got * 4;
+        if (got > 0) {
+            if (d->pcm_size == 0) first_pts = frame_pts;
+            d->pcm_size += got * 4;
+            d->audio_next_pts = frame_pts + p_rescale_q(got, (AVRational){1, d->audio->sample_rate}, ns);
+        }
     }
     *out = d->pcm;
     *size = d->pcm_size;
+    if (d->pcm_size > 0) *pts = first_pts;
     return d->pcm_size > 0;
 }
 
@@ -240,6 +265,7 @@ int jf_demux_reopen(void *opaque, const char *url) {
     if (d->frame) p_frame_free(&d->frame);
     if (d->audio) p_free_context(&d->audio);
     d->pcm_size = 0;
+    d->audio_next_pts = AV_NOPTS_VALUE;
     p_close(&d->format);
     if (p_open(&d->format, url, 0, 0) < 0) return 0;
     return p_info(d->format, 0) >= 0;
@@ -253,7 +279,10 @@ int jf_demux_seek(void *opaque, int64_t position_ns) {
     if (p_seek(d->format, -1, position_ns / 1000, AVSEEK_FLAG_BACKWARD) < 0) return 0;
     if (d->audio && p_flush_buffers) p_flush_buffers(d->audio);
     if (d->bsf && p_bsf_flush) p_bsf_flush(d->bsf);
+    // Discard any buffered conversion samples along with the decoder state.
+    if (d->swr && p_swr_init(d->swr) < 0) return 0;
     d->pcm_size = 0;
+    d->audio_next_pts = AV_NOPTS_VALUE;
     return 1;
 }
 

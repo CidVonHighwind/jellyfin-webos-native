@@ -7,6 +7,9 @@ const smp = @import("starfish.zig");
 const Queue = @import("packet_queue.zig").Queue;
 var io: std.Io = undefined;
 var segment_mutex: std.Io.Mutex = .init;
+/// StarfishMediaAPIs is one C++ object. Feed, clock queries and state changes
+/// must not enter it concurrently from the reader, audio and UI threads.
+var pipeline_mutex: std.Io.Mutex = .init;
 var interrupted: std.Io.Event = .unset;
 
 extern fn jf_demux_open(url: [*:0]const u8) ?*anyopaque;
@@ -18,7 +21,7 @@ extern fn jf_demux_video_fps(demux: *anyopaque, index: c_int, num: *c_int, den: 
 extern fn jf_demux_audio_open(demux: *anyopaque, index: c_int, rate: *c_int) c_int;
 extern fn jf_demux_video_open(demux: *anyopaque, index: c_int) c_int;
 extern fn jf_demux_video_unsupported(demux: *anyopaque) c_int;
-extern fn jf_demux_audio_decode(demux: *anyopaque, out: *?[*]u8, size: *c_int) c_int;
+extern fn jf_demux_audio_decode(demux: *anyopaque, out: *?[*]u8, size: *c_int, pts: *i64) c_int;
 extern fn jf_demux_seek(demux: *anyopaque, position_ns: i64) c_int;
 extern fn jf_demux_reopen(demux: *anyopaque, url: [*:0]const u8) c_int;
 
@@ -40,6 +43,7 @@ fn setError(message: []const u8) void {
     const n = @min(message.len, error_text.len - 1);
     @memcpy(error_text[0..n], message[0..n]);
     error_text[n] = 0;
+    std.debug.print("Jellyfin player error: {s}\n", .{message});
     setState(.failed);
 }
 fn setState(value: State) void {
@@ -65,10 +69,44 @@ pub fn needsFrame() bool {
     return false; // Starfish presents video independently of the graphics plane.
 }
 
-/// Pipeline state and errors arrive here.
+var load_complete = std.atomic.Value(bool).init(false);
+var pipeline_playing = std.atomic.Value(bool).init(false);
+var frame_ready_count = std.atomic.Value(u32).init(0);
+
+/// Pipeline state and errors arrive here. Frame-ready is deliberately counted
+/// rather than printed per frame; the clock diagnostics below report the
+/// timing data in a form that can be compared with the feed positions.
 fn onLoad(kind: i32, num: i64, str: ?[*:0]const u8) callconv(.c) void {
-    std.debug.print("SMP event: type={d} value={d} text={s}\n", .{
-        kind, num, if (str) |t| std.mem.sliceTo(t, 0) else "",
+    const event_text = if (smp.eventHasText(kind))
+        if (str) |t| std.mem.sliceTo(t, 0) else ""
+    else
+        "";
+    switch (kind) {
+        0x0 => {
+            if (frame_ready_count.fetchAdd(1, .monotonic) == 0)
+                std.debug.print("Starfish first FRAME_READY value={d}\n", .{num});
+            return;
+        },
+        0x16 => load_complete.store(true, .release),
+        0x17 => {
+            load_complete.store(false, .release);
+            pipeline_playing.store(false, .release);
+        },
+        0x1a => pipeline_playing.store(true, .release),
+        0x1b => pipeline_playing.store(false, .release),
+        0x12, 0x13 => {
+            var detail: [96]u8 = undefined;
+            const message = if (event_text.len > 0)
+                event_text
+            else
+                std.fmt.bufPrint(&detail, "Starfish pipeline error {d}", .{num}) catch "Starfish pipeline error";
+            setError(message);
+            running.store(false, .release);
+        },
+        else => {},
+    }
+    std.debug.print("SMP event: type={d} desc={s} value={d} text={s}\n", .{
+        kind, smp.event_desc(kind), num, event_text,
     });
 }
 fn codecName(kind: VideoType) []const u8 {
@@ -194,6 +232,7 @@ fn feed() void {
             audio_stream = -1;
         } else {
             audio = .{ .sample_rate = sample_rate, .channels = 2 };
+            audio_rate = rate;
         }
     }
     read_video = video_stream;
@@ -202,6 +241,9 @@ fn feed() void {
     var fps_num: c_int = 0;
     var fps_den: c_int = 0;
     _ = jf_demux_video_fps(demux, video_stream, &fps_num, &fps_den);
+    load_complete.store(false, .release);
+    pipeline_playing.store(false, .release);
+    frame_ready_count.store(0, .release);
     smp.load(app_id, std.mem.sliceTo(window_id, 0), .{
         .width = width,
         .height = height,
@@ -213,9 +255,23 @@ fn feed() void {
         running.store(false, .release);
         return;
     };
-    // Play before feeding: a merely loaded pipeline does not reliably accept
-    // buffers. The cushion comes from priming, not from withholding this.
-    if (!smp.play()) std.debug.print("SMP Play failed: {s}\n", .{smp.lastError()});
+    // Load returning only means that the request was accepted. Feeding and
+    // Play belong after the asynchronous LOADCOMPLETED transition.
+    while (running.load(.acquire) and !load_complete.load(.acquire))
+        sleepNs(10 * std.time.ns_per_ms);
+    if (!running.load(.acquire)) return;
+    // The load payload describes the timeline, but libpf does not activate it
+    // until CustomPipeline receives a segment event. Its public
+    // setTimeToDecode wrapper rejects this LOADED state, so use the underlying
+    // pipeline transition exposed by the SDK, as spool-mpv does.
+    if (!pipelineBeginSegment(0)) {
+        std.debug.print("Starfish segment setup failed: {s}\n", .{smp.segmentError()});
+        setError("Starfish could not establish the initial media segment");
+        running.store(false, .release);
+        return;
+    }
+    std.debug.print("Starfish segment established at 0ns\n", .{});
+    resetSegmentTimeline();
     setState(.playing);
     while (running.load(.acquire)) {
         segment_mutex.lockUncancelable(io);
@@ -246,12 +302,10 @@ fn feed() void {
 /// segments, so the reader and both feed threads are already joined and the
 /// queues and clock are ours alone.
 fn seekTo(demux: *anyopaque, target_ms: i32, transcoded: bool) void {
-    // Paused first: setTimeToDecode refuses to run while playing. Both take 0,
-    // not the target -- `pace` rebases every segment to zero, so zero is where
-    // the pipeline's new segment begins.
-    _ = smp.pause();
-    if (!smp.flush(0)) std.debug.print("SMP flush refused\n", .{});
-    if (!smp.setTimeToDecode(0)) std.debug.print("SMP setTimeToDecode refused\n", .{});
+    // The source timestamps are rebased to zero for every segment.
+    _ = pipelinePause();
+    if (!pipelineFlush(0)) std.debug.print("SMP flush refused\n", .{});
+    if (!pipelineBeginSegment(0)) std.debug.print("SMP segment restart refused: {s}\n", .{smp.segmentError()});
     // A live transcode has no byte ranges. av_seek_frame nevertheless reports
     // success for it, but positions FFmpeg at byte zero; always ask Jellyfin
     // to create a new segment at the desired time instead. Static originals
@@ -273,9 +327,8 @@ fn seekTo(demux: *anyopaque, target_ms: i32, transcoded: bool) void {
     stream_base_ms = target_ms;
     // The first packet after the seek re-anchors the clock.
     clock_ready.store(false, .release);
-    primed.store(false, .release);
+    resetSegmentTimeline();
     position_ms.store(target_ms, .monotonic);
-    _ = smp.play();
 }
 
 /// Ask the server for the same stream from `target_ms` on. Jellyfin's
@@ -321,7 +374,7 @@ fn reopenAt(demux: *anyopaque, target_ms: i32, transcoded: bool) bool {
     // The decoder went with the old source.
     if (read_audio >= 0) {
         var rate: c_int = 0;
-        if (jf_demux_audio_open(demux, read_audio, &rate) == 0) read_audio = -1;
+        if (jf_demux_audio_open(demux, read_audio, &rate) == 0) read_audio = -1 else audio_rate = rate;
     }
     return true;
 }
@@ -355,32 +408,99 @@ fn runSegment(demux: *anyopaque) void {
     while (video_queue.pop(io)) |chunk| {
         defer std.heap.c_allocator.free(chunk.bytes);
         if (!flowing()) break;
-        const pts = pace(chunk.pts);
+        const pts = pace(.video, chunk.pts);
         if (!feedRetrying(.video, chunk.bytes, pts)) {
             if (flowing()) setError(smp.lastError());
             break;
         }
-        position_ms.store(stream_base_ms + @as(i32, @intCast(@divTrunc(pts, std.time.ns_per_ms))), .monotonic);
-        // A second of video is in: start the clock, and from here the pacing
-        // keeps that same second as the cushion.
-        if (!primed.load(.acquire) and pts >= prime_ns) {
-            clock_ns = nowNs();
-            primed.store(true, .release);
+        if (first_video_feed.swap(false, .acq_rel)) {
+            std.debug.print("Starfish first video feed: raw={d:.3}s pts={d:.3}s bytes={d}\n", .{
+                @as(f64, @floatFromInt(chunk.pts)) / std.time.ns_per_s,
+                @as(f64, @floatFromInt(pts)) / std.time.ns_per_s,
+                chunk.bytes.len,
+            });
         }
+        _ = fed_video_ms.fetchMax(nsToMs(pts), .release);
+        maybeStartPipeline();
     }
 }
 
 /// Audio runs on the same clock as video, so the two stay aligned without
 /// sharing a thread.
+///
+/// The PCM sink plays what it is handed back to back. A gap between two
+/// chunks -- a dropped packet, a decoder that produced nothing, audio that
+/// simply starts after the first video frame -- is therefore not heard as a
+/// gap: everything after it plays that much early against the picture, and
+/// stays that way. So timestamps come from our own running sample count and
+/// any hole is filled with silence rather than closed up.
 fn feedAudio() void {
+    var cursor: i64 = -1; // next sample to feed, -1 before the first chunk
     while (audio_queue.pop(io)) |chunk| {
         defer std.heap.c_allocator.free(chunk.bytes);
         if (!flowing()) break;
-        const pts = pace(chunk.pts);
-        // A chunk the sink will not take costs a gap in the sound, not the
-        // whole playback, so a lost race here is not fatal.
-        _ = feedRetrying(.audio, chunk.bytes, pts);
+        const want = samplesAt(pace(.audio, chunk.pts));
+        cursor = alignCursor(cursor, want, audio_rate);
+        while (cursor < want) {
+            const run = @min(want - cursor, pcm_access_unit_samples);
+            // A chunk the sink will not take costs a gap in the sound, not the
+            // whole playback, so a lost race here is not fatal.
+            if (!feedRetrying(.audio, silence[0..@intCast(run * pcm_frame)], nsAt(cursor))) return;
+            cursor += run;
+            _ = fed_audio_ms.fetchMax(nsToMs(nsAt(cursor)), .release);
+            maybeStartPipeline();
+            waitForVideoPreroll();
+        }
+        var offset: usize = 0;
+        while (offset < chunk.bytes.len) {
+            const bytes = @min(chunk.bytes.len - offset, pcm_access_unit_samples * pcm_frame);
+            // The decoder always emits complete stereo S16 frames.
+            const samples: i64 = @intCast(bytes / pcm_frame);
+            const pts = nsAt(cursor);
+            if (!feedRetrying(.audio, chunk.bytes[offset..][0..bytes], pts)) return;
+            cursor += samples;
+            offset += bytes;
+            if (first_audio_feed.swap(false, .acq_rel)) {
+                std.debug.print("Starfish first audio feed: raw={d:.3}s pts={d:.3}s end={d:.3}s bytes={d}\n", .{
+                    @as(f64, @floatFromInt(chunk.pts)) / std.time.ns_per_s,
+                    @as(f64, @floatFromInt(pts)) / std.time.ns_per_s,
+                    @as(f64, @floatFromInt(nsAt(cursor))) / std.time.ns_per_s,
+                    bytes,
+                });
+            }
+            _ = fed_audio_ms.fetchMax(nsToMs(nsAt(cursor)), .release);
+            maybeStartPipeline();
+            waitForVideoPreroll();
+        }
     }
+}
+
+/// Interleaved stereo S16, which is all jf_demux_audio_decode produces.
+const pcm_frame = 4;
+var silence: [pcm_access_unit_samples * pcm_frame]u8 = @splat(0);
+/// Sample rate of that PCM, for turning sample counts into timestamps.
+var audio_rate: i64 = 48000;
+fn samplesAt(pts: i64) i64 {
+    return @intCast(@divTrunc(@as(i128, pts) * audio_rate, std.time.ns_per_s));
+}
+fn nsAt(samples: i64) i64 {
+    return @intCast(@divTrunc(@as(i128, samples) * std.time.ns_per_s, audio_rate));
+}
+
+/// Where the next chunk belongs in the PCM stream. Within a second of where
+/// the last one ended, the count carries on (silence covers a gap, an overlap
+/// is played late rather than dropped); past that it is a discontinuity, and
+/// the stream restarts at the chunk's own timestamp.
+fn alignCursor(cursor: i64, want: i64, rate: i64) i64 {
+    if (cursor < 0 or @abs(want - cursor) > rate) return want;
+    return cursor;
+}
+
+test "the PCM cursor bridges gaps but restarts on a discontinuity" {
+    try std.testing.expectEqual(@as(i64, 4800), alignCursor(-1, 4800, 48000)); // first chunk
+    try std.testing.expectEqual(@as(i64, 4800), alignCursor(4800, 5280, 48000)); // 10ms gap: pad
+    try std.testing.expectEqual(@as(i64, 4800), alignCursor(4800, 4320, 48000)); // overlap: keep
+    try std.testing.expectEqual(@as(i64, 96000), alignCursor(4800, 96000, 48000)); // seek: restart
 }
 
 /// Demux ahead of playback, decoding audio on the way, until a queue is full.
@@ -396,7 +516,7 @@ fn read(demux: *anyopaque) void {
         if (audio) {
             var pcm: ?[*]u8 = null;
             var pcm_size: c_int = 0;
-            if (jf_demux_audio_decode(demux, &pcm, &pcm_size) == 0) continue;
+            if (jf_demux_audio_decode(demux, &pcm, &pcm_size, &pts) == 0) continue;
             bytes = (pcm orelse continue)[0..@intCast(pcm_size)];
         }
         // The clock origin belongs here, not in the feed threads: the reader
@@ -416,32 +536,247 @@ fn read(demux: *anyopaque) void {
     audio_queue.close(io);
 }
 
-// One clock for both feed threads. Plain values: 64-bit atomics do not exist
-// on this target, so a flag with release/acquire ordering hands them over.
+// Container PTS are rebased to one segment timeline before either feed thread
+// sees them. The release/acquire flag publishes the 64-bit origin on armv7.
 var clock_pts: i64 = 0;
-var clock_ns: u64 = 0;
 var clock_ready = std.atomic.Value(bool).init(false);
-/// False until the pipeline has a cushion. Until then both lanes feed flat
-/// out -- an empty pipeline shows one frame and then stalls.
-var primed = std.atomic.Value(bool).init(false);
 
-/// Sleep until this packet is due, and return its stream-relative timestamp.
-fn pace(packet_pts: i64) i64 {
-    // Stream-relative, not container-absolute: we call Play(), so the pipeline
-    // has a base time and container timestamps start wherever they like.
-    // Clamped because a stream can hand us a packet older than its first.
-    const pts = @max(0, packet_pts - clock_pts);
-    if (!primed.load(.acquire)) return pts; // priming: as fast as it will take
-    const due = clock_ns + @as(u64, @intCast(pts));
-    const now = nowNs() + prime_ns;
-    // JF_NOPACE=1 feeds flat out: correct speed then means the pipeline is
-    // clocking on the PTS itself, and this pacing can go.
-    if (due > now and c.getenv("JF_NOPACE") == null) sleepPaced(due - now);
-    return pts;
+var paused = std.atomic.Value(bool).init(false);
+var play_requested = std.atomic.Value(bool).init(false);
+var fed_video_ms = std.atomic.Value(i32).init(std.math.minInt(i32));
+var fed_audio_ms = std.atomic.Value(i32).init(std.math.minInt(i32));
+var first_video_feed = std.atomic.Value(bool).init(true);
+var first_audio_feed = std.atomic.Value(bool).init(true);
+
+// These are queue bounds, not sync corrections. They match the proven mpv
+// backend: enough video for decoder continuity, and a shorter PCM queue so
+// stale audio cannot accumulate across pause or seek.
+const video_feed_ahead_ns = 1600 * std.time.ns_per_ms;
+const audio_feed_ahead_ns = 400 * std.time.ns_per_ms;
+const audio_start_preroll_ms = 40;
+// Starfish's PCM path expects short, regularly timestamped access units. This
+// is also the unit used by ao_starfish; source PCM packets can be hundreds of
+// milliseconds long and must not be handed to the sink as one access unit.
+const pcm_access_unit_samples = 1024;
+const clock_sample_period_ns = 20 * std.time.ns_per_ms;
+const clock_slow_query_ns = 50 * std.time.ns_per_ms;
+const clock_freshness_ns = 250 * std.time.ns_per_ms;
+const clock_stability_ns = 250 * std.time.ns_per_ms;
+const clock_backward_tolerance_ns = 100 * std.time.ns_per_ms;
+const clock_fed_video_slack_ms = 500;
+const playback_rate_millis = 1000;
+
+const ClockState = struct {
+    sample_valid: bool = false,
+    sample_pts_ns: i64 = 0,
+    sample_host_ns: i64 = 0,
+    last_poll_host_ns: i64 = 0,
+    last_attempt_ns: i64 = 0,
+    probe_pts_ns: i64 = 0,
+    probe_host_ns: i64 = 0,
+    ready: bool = false,
+    last_log_ns: i64 = 0,
+    last_reject_log_ns: i64 = 0,
+
+    fn reset(self: *@This()) void {
+        self.* = .{};
+    }
+
+    /// Accept a frame-quantized getCurrentPlaytime sample. Repeated values keep
+    /// the original anchor; when PTS advances, the flip is bracketed halfway
+    /// between the previous and current polls.
+    fn accept(self: *@This(), raw_pts_ns: i64, poll_host_ns: i64) bool {
+        var pts_ns = raw_pts_ns;
+        var anchor_ns = poll_host_ns;
+        const was_ready = self.ready;
+        if (self.sample_valid) {
+            if (pts_ns + clock_backward_tolerance_ns < self.sample_pts_ns) return false;
+            pts_ns = @max(pts_ns, self.sample_pts_ns);
+            if (pts_ns == self.sample_pts_ns) {
+                self.last_poll_host_ns = poll_host_ns;
+                return false;
+            }
+            if (self.last_poll_host_ns > 0 and poll_host_ns > self.last_poll_host_ns and
+                poll_host_ns - self.last_poll_host_ns <= 2 * clock_sample_period_ns)
+            {
+                anchor_ns = self.last_poll_host_ns + @divTrunc(poll_host_ns - self.last_poll_host_ns, 2);
+            }
+        }
+
+        self.sample_valid = true;
+        self.sample_pts_ns = pts_ns;
+        self.sample_host_ns = anchor_ns;
+        self.last_poll_host_ns = poll_host_ns;
+        if (self.probe_host_ns == 0) {
+            self.probe_pts_ns = pts_ns;
+            self.probe_host_ns = anchor_ns;
+        } else if (!self.ready and anchor_ns - self.probe_host_ns >= clock_stability_ns) {
+            const wall = anchor_ns - self.probe_host_ns;
+            const delta = pts_ns - self.probe_pts_ns;
+            const rate_millis = @divTrunc(@as(i128, delta) * 1000, wall);
+            if (delta >= 0 and rate_millis >= 800 and rate_millis <= 1200) {
+                self.ready = true;
+            } else {
+                self.probe_pts_ns = pts_ns;
+                self.probe_host_ns = anchor_ns;
+            }
+        }
+        return !was_ready and self.ready;
+    }
+
+    fn project(self: *const @This(), now: i64, frozen: bool) ?i64 {
+        if (!self.sample_valid or self.sample_host_ns <= 0) return null;
+        if (frozen) return self.sample_pts_ns;
+        const age = now - self.sample_host_ns;
+        if (age < 0 or age > clock_freshness_ns) return null;
+        return self.sample_pts_ns + @as(i64, @intCast(@divTrunc(@as(i128, age) * playback_rate_millis, 1000)));
+    }
+};
+
+test "Starfish clock keeps the first poll anchor for a quantized frame" {
+    var clock: ClockState = .{};
+    const second: i64 = std.time.ns_per_s;
+    try std.testing.expect(!clock.accept(0, second));
+    try std.testing.expect(!clock.accept(0, second + 20 * std.time.ns_per_ms));
+    try std.testing.expectEqual(second, clock.sample_host_ns);
+    try std.testing.expectEqual(@as(?i64, 30 * std.time.ns_per_ms), clock.project(second + 30 * std.time.ns_per_ms, false));
 }
 
-/// Content buffered before Play(), and the cushion kept afterwards.
-const prime_ns = 1000 * std.time.ns_per_ms;
+test "Starfish clock becomes usable only after stable forward progress" {
+    var clock: ClockState = .{};
+    const second: i64 = std.time.ns_per_s;
+    try std.testing.expect(!clock.accept(0, second));
+    try std.testing.expect(!clock.accept(100 * std.time.ns_per_ms, second + 100 * std.time.ns_per_ms));
+    try std.testing.expect(clock.accept(260 * std.time.ns_per_ms, second + 260 * std.time.ns_per_ms));
+    try std.testing.expect(clock.ready);
+    try std.testing.expectEqual(@as(?i64, null), clock.project(second + 260 * std.time.ns_per_ms + clock_freshness_ns + 1, false));
+}
+
+var clock_mutex: std.Io.Mutex = .init;
+var display_clock: ClockState = .{};
+
+fn shouldLogClockRejection(now: i64) bool {
+    clock_mutex.lockUncancelable(io);
+    defer clock_mutex.unlock(io);
+    if (display_clock.last_reject_log_ns != 0 and now - display_clock.last_reject_log_ns < std.time.ns_per_s)
+        return false;
+    display_clock.last_reject_log_ns = now;
+    return true;
+}
+
+fn resetSegmentTimeline() void {
+    play_requested.store(false, .release);
+    pipeline_playing.store(false, .release);
+    fed_video_ms.store(std.math.minInt(i32), .release);
+    fed_audio_ms.store(std.math.minInt(i32), .release);
+    first_video_feed.store(true, .release);
+    first_audio_feed.store(true, .release);
+    clock_mutex.lockUncancelable(io);
+    display_clock.reset();
+    clock_mutex.unlock(io);
+}
+
+fn maybeStartPipeline() void {
+    if (paused.load(.acquire) or play_requested.load(.acquire)) return;
+    if (fed_video_ms.load(.acquire) < 0) return;
+    if (read_audio >= 0 and fed_audio_ms.load(.acquire) < audio_start_preroll_ms) return;
+    if (play_requested.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
+    std.debug.print("Starfish preroll ready: video={d}ms audio={d}ms; Play\n", .{
+        fed_video_ms.load(.acquire), fed_audio_ms.load(.acquire),
+    });
+    if (!pipelinePlay()) {
+        play_requested.store(false, .release);
+        setError("Starfish Play failed after preroll");
+        running.store(false, .release);
+    }
+}
+
+/// Once the timestamped PCM preroll exists, give the video feeder the SDK
+/// until it has established the other side of the timeline. Without this,
+/// one large decoded PCM packet can win the feed lock repeatedly and enqueue
+/// hundreds of milliseconds before the first video access unit.
+fn waitForVideoPreroll() void {
+    while (flowing() and !play_requested.load(.acquire) and
+        fed_audio_ms.load(.acquire) >= audio_start_preroll_ms)
+    {
+        maybeStartPipeline();
+        if (!play_requested.load(.acquire)) sleepPaced(2 * std.time.ns_per_ms);
+    }
+}
+
+fn sampleClock() ?i64 {
+    const now: i64 = @intCast(nowNs());
+    clock_mutex.lockUncancelable(io);
+    if (!pipeline_playing.load(.acquire)) {
+        const held = display_clock.project(now, true);
+        clock_mutex.unlock(io);
+        return held;
+    }
+    if (display_clock.last_attempt_ns > 0 and now - display_clock.last_attempt_ns < clock_sample_period_ns) {
+        const projected = display_clock.project(now, paused.load(.acquire));
+        clock_mutex.unlock(io);
+        return projected;
+    }
+    display_clock.last_attempt_ns = now;
+    clock_mutex.unlock(io);
+
+    const sample = pipelinePlaytimeSample() orelse return null;
+    if (sample.duration_ns > clock_slow_query_ns) {
+        if (shouldLogClockRejection(now))
+            std.debug.print("Starfish clock rejected slow query={d:.1}ms\n", .{@as(f64, @floatFromInt(sample.duration_ns)) / std.time.ns_per_ms});
+        return null;
+    }
+    const fed_ceiling_ms = fed_video_ms.load(.acquire);
+    if (fed_ceiling_ms >= 0 and nsToMs(sample.pts_ns) > fed_ceiling_ms + clock_fed_video_slack_ms) {
+        if (shouldLogClockRejection(now))
+            std.debug.print("Starfish clock rejected ahead-of-feed pts={d}ms fed_video={d}ms\n", .{ nsToMs(sample.pts_ns), fed_ceiling_ms });
+        return null;
+    }
+
+    clock_mutex.lockUncancelable(io);
+    const became_ready = display_clock.accept(sample.pts_ns, sample.host_ns);
+    const projected = display_clock.project(@intCast(nowNs()), paused.load(.acquire));
+    const should_log = became_ready or display_clock.last_log_ns == 0 or now - display_clock.last_log_ns >= std.time.ns_per_s;
+    if (should_log) display_clock.last_log_ns = now;
+    const ready = display_clock.ready;
+    clock_mutex.unlock(io);
+
+    if (projected) |pts| {
+        const pts_ms = nsToMs(pts);
+        const fed_v = fed_video_ms.load(.acquire);
+        const fed_a = fed_audio_ms.load(.acquire);
+        if (ready) position_ms.store(stream_base_ms + pts_ms, .monotonic);
+        if (should_log) std.debug.print(
+            "Starfish clock: pts={d:.3}s projected={d:.3}s query={d:.1}ms stable={} feed_lead_v={d}ms feed_lead_a={d}ms frames={d}\n",
+            .{
+                @as(f64, @floatFromInt(sample.pts_ns)) / std.time.ns_per_s,
+                @as(f64, @floatFromInt(pts)) / std.time.ns_per_s,
+                @as(f64, @floatFromInt(sample.duration_ns)) / std.time.ns_per_ms,
+                ready,
+                if (fed_v >= 0) fed_v - pts_ms else -1,
+                if (fed_a >= 0) fed_a - pts_ms else -1,
+                frame_ready_count.load(.monotonic),
+            },
+        );
+    }
+    return projected;
+}
+
+/// Pace each source queue from Starfish's displayed-frame clock. Before the
+/// first live sample, zero is the segment anchor and the same bounded preroll
+/// rules apply; no host-time guess becomes part of the media timeline.
+fn pace(lane: Lane, packet_pts: i64) i64 {
+    const pts = @max(0, packet_pts - clock_pts);
+    if (!play_requested.load(.acquire)) return pts;
+    const feed_ahead: i64 = if (lane == .audio) audio_feed_ahead_ns else video_feed_ahead_ns;
+    while (flowing()) {
+        const clock = sampleClock() orelse 0;
+        const limit = clock + feed_ahead;
+        if (pts <= limit) break;
+        sleepPaced(@intCast(@min(pts - limit, clock_sample_period_ns)));
+    }
+    return pts;
+}
 
 var video_queue: Queue = .{};
 var audio_queue: Queue = .{};
@@ -452,15 +787,72 @@ fn nowNs() u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
+fn nsToMs(ns: i64) i32 {
+    return @intCast(std.math.clamp(@divTrunc(ns, std.time.ns_per_ms), std.math.minInt(i32), std.math.maxInt(i32)));
+}
+
+const PipelineClockSample = struct {
+    pts_ns: i64,
+    host_ns: i64,
+    duration_ns: i64,
+};
+
+fn pipelinePlaytimeSample() ?PipelineClockSample {
+    pipeline_mutex.lockUncancelable(io);
+    defer pipeline_mutex.unlock(io);
+    const before: i64 = @intCast(nowNs());
+    const pts = smp.playtime();
+    const after: i64 = @intCast(nowNs());
+    if (pts < 0) return null;
+    return .{
+        .pts_ns = pts,
+        .host_ns = before + @divTrunc(after - before, 2),
+        .duration_ns = after - before,
+    };
+}
+
+fn pipelinePlay() bool {
+    pipeline_mutex.lockUncancelable(io);
+    defer pipeline_mutex.unlock(io);
+    if (!smp.play()) return false;
+    if (!smp.setPlayRate(playback_rate_millis, true))
+        std.debug.print("SMP SetPlayRate failed\n", .{});
+    return true;
+}
+
+fn pipelinePause() bool {
+    pipeline_mutex.lockUncancelable(io);
+    defer pipeline_mutex.unlock(io);
+    return smp.pause();
+}
+
+fn pipelineFlush(target: i64) bool {
+    pipeline_mutex.lockUncancelable(io);
+    defer pipeline_mutex.unlock(io);
+    return smp.flush(target);
+}
+
+fn pipelineBeginSegment(target: i64) bool {
+    pipeline_mutex.lockUncancelable(io);
+    defer pipeline_mutex.unlock(io);
+    return smp.beginSegment(target);
+}
+
+fn pipelineFeed(lane: Lane, bytes: []const u8, pts: i64) smp.Status {
+    pipeline_mutex.lockUncancelable(io);
+    defer pipeline_mutex.unlock(io);
+    return switch (lane) {
+        .video => smp.feedVideo(bytes, pts),
+        .audio => smp.feedAudio(bytes, pts),
+    };
+}
+
 /// Feed one chunk, waiting out backpressure. A full pipeline answers
 /// BufferFull and keeps nothing, so the chunk has to be offered again.
 fn feedRetrying(lane: Lane, bytes: []const u8, pts: i64) bool {
-    var tries: u32 = 0;
-    while (flowing()) : (tries += 1) {
-        const status = switch (lane) {
-            .video => smp.feedVideo(bytes, pts),
-            .audio => smp.feedAudio(bytes, pts),
-        };
+    var stalled: u32 = 0;
+    while (flowing()) {
+        const status = pipelineFeed(lane, bytes, pts);
         switch (status) {
             .ok => return true,
             .failed => {
@@ -470,7 +862,11 @@ fn feedRetrying(lane: Lane, bytes: []const u8, pts: i64) bool {
                 return false;
             },
             .buffer_full => {
-                if (tries > 600) return false; // 3s: something is wedged
+                // While paused the pipeline consumes nothing, so waiting it
+                // out is the whole point; while playing, backpressure this
+                // long is something wedged.
+                stalled = if (paused.load(.acquire)) 0 else stalled + 1;
+                if (stalled > 2000) return false; // 10s
                 sleepPaced(5 * std.time.ns_per_ms);
             },
         }
@@ -493,6 +889,14 @@ fn sleepPaced(ns: u64) void {
     }
 }
 
+fn sleepNs(ns: u64) void {
+    const ts = linux.timespec{
+        .sec = @intCast(ns / std.time.ns_per_s),
+        .nsec = @intCast(ns % std.time.ns_per_s),
+    };
+    _ = linux.nanosleep(&ts, null);
+}
+
 fn interruptSegment() void {
     segment_mutex.lockUncancelable(io);
     defer segment_mutex.unlock(io);
@@ -506,10 +910,7 @@ fn interruptSegmentLocked() void {
     interrupted.set(io);
 }
 
-/// Where the feed has got to, in stream milliseconds. This is the *fed*
-/// position, which runs prime_ns ahead of what is on screen -- close enough to
-/// seek relative to, and the only position we have that does not depend on the
-/// pipeline reporting one.
+/// Displayed media position, updated from projected getCurrentPlaytime samples.
 var position_ms = std.atomic.Value(i32).init(0);
 /// Where in the item the current source starts. Zero for a stream opened from
 /// the beginning, the seek target for one the server re-cut at an offset.
@@ -521,7 +922,7 @@ pub fn position() i32 {
     return position_ms.load(.monotonic);
 }
 
-/// Jump `delta_seconds` from where the feed is. The segment loop performs the
+/// Jump `delta_seconds` from the displayed position. The segment loop performs the
 /// seek once both feed threads have parked, so this only has to ask.
 pub fn seek(delta_seconds: i32) void {
     segment_mutex.lockUncancelable(io);
@@ -554,7 +955,7 @@ pub fn play(stream_uri: []const u8, transcode_uri: []const u8, width: u32, heigh
     @memcpy(fallback[0..fallback_len], transcode_uri[0..fallback_len]);
     fallback[fallback_len] = 0;
     clock_ready.store(false, .release);
-    primed.store(false, .release);
+    paused.store(false, .release);
     seek_pending.store(false, .release);
     position_ms.store(0, .monotonic);
     stream_base_ms = 0;
@@ -563,10 +964,19 @@ pub fn play(stream_uri: []const u8, transcode_uri: []const u8, width: u32, heigh
     session = try std.Thread.spawn(.{}, feed, .{});
 }
 pub fn pause() void {
-    _ = smp.pause();
+    if (paused.load(.acquire)) return;
+    paused.store(true, .release);
+    _ = pipelinePause();
 }
 pub fn resumePlayback() void {
-    _ = smp.play();
+    if (paused.load(.acquire)) {
+        paused.store(false, .release);
+    }
+    if (play_requested.load(.acquire)) {
+        _ = pipelinePlay();
+    } else {
+        maybeStartPipeline();
+    }
 }
 pub fn stop() void {
     running.store(false, .release);

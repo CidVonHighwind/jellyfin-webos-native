@@ -2124,7 +2124,9 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test {
+    _ = @import("jellyfin/demux_test.zig");
     _ = @import("jellyfin/packet_queue.zig");
+    _ = @import("jellyfin/player.zig");
     _ = @import("jellyfin/starfish.zig");
     _ = @import("luna.zig");
 }
