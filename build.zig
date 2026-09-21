@@ -23,6 +23,7 @@ const App = struct { name: []const u8, src: []const u8, shaders: bool = false, u
 
 const apps = [_]App{
     .{ .name = "gltri", .src = "src/gltri.zig", .shaders = true },
+    .{ .name = "xmb", .src = "src/xmb.zig", .shaders = true },
     .{ .name = "jellyfin", .src = "src/jellyfin.zig", .shaders = true, .ui = true },
 };
 
@@ -276,6 +277,8 @@ const Shader = struct {
 };
 
 const triangle_shaders = [_]Shader{
+    .{ .import = "xmb_vs", .src = "src/shaders/xmb.slang", .entry = "vsMain", .stage = "vertex", .short = "vert" },
+    .{ .import = "xmb_fs", .src = "src/shaders/xmb.slang", .entry = "fsMain", .stage = "fragment", .short = "frag" },
     .{ .import = "tri_vs", .src = "src/shaders/tri.slang", .entry = "vsMain", .stage = "vertex", .short = "vert" },
     .{ .import = "tri_fs", .src = "src/shaders/tri.slang", .entry = "fsMain", .stage = "fragment", .short = "frag" },
     .{ .import = "text_vs", .src = "src/shaders/text.slang", .entry = "vsText", .stage = "vertex", .short = "vert" },

@@ -1,11 +1,5 @@
-//! 1000 rotating triangles in one instanced draw call, with CPU and GPU frame
-//! times in the bottom-right corner.
-//!
-//! Per-vertex attribute:   position
-//! Per-instance attributes: offset, direction, speed, phase, size
-//! Uniforms: time, aspect
-//! Every instance scales with sin(time + phase) * size and spins at its own
-//! speed, so no two triangles peak at the same moment or the same size.
+//! Full-screen XMB wave and starfield, with CPU and GPU frame times in the
+//! bottom-right corner.
 //!
 //! Shaders are written in Slang (src/shaders/*.slang) and compiled to GLSL ES
 //! by the build -- see build.zig and docs/opengl.md.
@@ -16,13 +10,10 @@ const sdl = @import("sdl.zig");
 const luna = @import("luna.zig");
 const txt = @import("text.zig");
 
-const tri_vs = @embedFile("tri_vs");
-const tri_fs = @embedFile("tri_fs");
+const xmb_vs = @embedFile("xmb_vs");
+const xmb_fs = @embedFile("xmb_fs");
 const text_vs = @embedFile("text_vs");
 const text_fs = @embedFile("text_fs");
-
-const INSTANCES = 3000;
-const TRI_RADIUS = 0.045;
 
 // ------------------------------------------------------------------- GL bits
 
@@ -88,8 +79,6 @@ var glGenVertexArrays: *const fn (i32, [*]u32) callconv(.c) void = undefined;
 var glBindVertexArray: *const fn (u32) callconv(.c) void = undefined;
 var glVertexAttribPointer: *const fn (u32, i32, u32, u8, i32, usize) callconv(.c) void = undefined;
 var glEnableVertexAttribArray: *const fn (u32) callconv(.c) void = undefined;
-var glVertexAttribDivisor: *const fn (u32, u32) callconv(.c) void = undefined;
-var glDrawArraysInstanced: *const fn (u32, i32, i32, i32) callconv(.c) void = undefined;
 var glDrawArrays: *const fn (u32, i32, i32) callconv(.c) void = undefined;
 var glGenTextures: *const fn (i32, [*]u32) callconv(.c) void = undefined;
 var glBindTexture: *const fn (u32, u32) callconv(.c) void = undefined;
@@ -135,8 +124,6 @@ fn loadGl() void {
     glBindVertexArray = gl.proc(@TypeOf(glBindVertexArray), "glBindVertexArray");
     glVertexAttribPointer = gl.proc(@TypeOf(glVertexAttribPointer), "glVertexAttribPointer");
     glEnableVertexAttribArray = gl.proc(@TypeOf(glEnableVertexAttribArray), "glEnableVertexAttribArray");
-    glVertexAttribDivisor = gl.proc(@TypeOf(glVertexAttribDivisor), "glVertexAttribDivisor");
-    glDrawArraysInstanced = gl.proc(@TypeOf(glDrawArraysInstanced), "glDrawArraysInstanced");
     glDrawArrays = gl.proc(@TypeOf(glDrawArrays), "glDrawArrays");
     glGenTextures = gl.proc(@TypeOf(glGenTextures), "glGenTextures");
     glBindTexture = gl.proc(@TypeOf(glBindTexture), "glBindTexture");
@@ -226,7 +213,7 @@ fn smooth(prev: f64, sample: f64) f64 {
 
 /// Read the frame back and print it as coarse ASCII, so the render can be
 /// checked without looking at a screen:
-///   GLTRI_DUMP=1 zig build run-host -Dapp=gltri
+///   XMB_DUMP=1 zig build -Dapp=xmb run-host
 const fb_size = 1920 * 1080 * 4;
 
 fn dumpFrame(gpa: std.mem.Allocator) void {
@@ -278,7 +265,7 @@ fn dumpFrame(gpa: std.mem.Allocator) void {
     std.debug.print("overlay: {d} white pixels\n", .{white});
 }
 
-/// The triangle probe has no navigation state: Back is simply its close key,
+/// The shader demo has no navigation state: Back is simply its close key,
 /// matching the lifecycle close request from SAM.
 fn onEvent(event: sdl.AppEvent) void {
     switch (event) {
@@ -291,9 +278,9 @@ fn onEvent(event: sdl.AppEvent) void {
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
-    const appid = std.c.getenv("APPID") orelse @as([*:0]const u8, "dev.hookedbehemoth.gltri");
+    const appid = std.c.getenv("APPID") orelse @as([*:0]const u8, "dev.hookedbehemoth.xmb");
     sdl.on_event = onEvent;
-    try sdl.init(appid, "1000 triangles", 0, 0);
+    try sdl.init(appid, "XMB", 0, 0);
     defer sdl.deinit();
     // SAM lifecycle messages arrive on Luna's worker thread; SDL's posted
     // events bring them safely back to this render thread.
@@ -305,78 +292,35 @@ pub fn main(init: std.process.Init) !void {
     const w: i32 = @intCast(gl.width);
     const h: i32 = @intCast(gl.height);
     glViewport(0, 0, w, h);
-    glClearColor(0.04, 0.04, 0.06, 1.0);
+    glClearColor(0.0, 0.0, 0.0, 1.0);
 
-    const tri_prog = program(tri_vs, tri_fs);
+    const xmb_prog = program(xmb_vs, xmb_fs);
     const text_prog = program(text_vs, text_fs);
 
-    // One equilateral triangle, reused by every instance.
-    const verts = [_]f32{
-        0.0,                 TRI_RADIUS,
-        -TRI_RADIUS * 0.866, -TRI_RADIUS * 0.5,
-        TRI_RADIUS * 0.866,  -TRI_RADIUS * 0.5,
-    };
-
-    // offset.x, offset.y, direction, speed, phase, size
-    const FLOATS = 6;
-    var instances = gpa.alloc(f32, INSTANCES * FLOATS) catch {
-        std.log.warn("failed to allocate triangle instances", .{});
-        return;
-    };
-    defer gpa.free(instances);
-    var prng = std.Random.DefaultPrng.init(0x7A1B);
-    const rnd = prng.random();
-    for (0..INSTANCES) |i| {
-        const inst = instances[i * FLOATS ..];
-        inst[0] = rnd.float(f32) * 2.0 - 1.0; // offset.x
-        inst[1] = rnd.float(f32) * 2.0 - 1.0; // offset.y
-        inst[2] = rnd.float(f32) * std.math.tau; // direction
-        inst[3] = 0.35 + rnd.float(f32) * 0.9; // speed
-        inst[4] = rnd.float(f32) * std.math.tau; // phase: when it peaks
-        inst[5] = 0.3 + rnd.float(f32) * 1.2; // size: how big it peaks
-    }
-
+    // Both the XMB and text shaders consume the same (0,0)-(1,1) strip.
     var vao: u32 = 0;
     glGenVertexArrays(1, @ptrCast(&vao));
     glBindVertexArray(vao);
-
-    var bufs: [4]u32 = @splat(0);
-    glGenBuffers(4, &bufs);
-    const vbo = bufs[0];
-    const ibo = bufs[1];
-    const ubo = bufs[2];
-    const quad_vbo = bufs[3];
-
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER, @sizeOf(@TypeOf(verts)), &verts, GL_STATIC_DRAW);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 2, GL_FLOAT, 0, 2 * 4, 0); // position
-
-    glBindBuffer(GL_ARRAY_BUFFER, ibo);
-    glBufferData(GL_ARRAY_BUFFER, @as(isize, @intCast(@sizeOf(f32) * instances.len)), instances.ptr, GL_STATIC_DRAW);
-    // These advance once per instance, not per vertex: { location, floats, byte offset }.
-    inline for (.{ .{ 1, 2, 0 }, .{ 2, 1, 8 }, .{ 3, 1, 12 }, .{ 4, 1, 16 }, .{ 5, 1, 20 } }) |a| {
-        glEnableVertexAttribArray(a[0]);
-        glVertexAttribPointer(a[0], a[1], GL_FLOAT, 0, FLOATS * 4, a[2]);
-        glVertexAttribDivisor(a[0], 1);
-    }
-
-    // std140: two floats, padded to a 16-byte block.
-    var uniforms: [4]f32 = @splat(0);
-    glBindBuffer(GL_UNIFORM_BUFFER, ubo);
-    glBufferData(GL_UNIFORM_BUFFER, @sizeOf(@TypeOf(uniforms)), &uniforms, GL_DYNAMIC_DRAW);
-    uniforms[1] = @as(f32, @floatFromInt(h)) / @as(f32, @floatFromInt(w)); // aspect
-
-    // Overlay: an R8 coverage texture the CPU rewrites every frame, drawn as
-    // one triangle strip.
-    var vao_text: u32 = 0;
-    glGenVertexArrays(1, @ptrCast(&vao_text));
-    glBindVertexArray(vao_text);
+    var quad_vbo: u32 = 0;
+    glGenBuffers(1, @ptrCast(&quad_vbo));
     const quad = [_]f32{ 0, 0, 1, 0, 0, 1, 1, 1 };
     glBindBuffer(GL_ARRAY_BUFFER, quad_vbo);
     glBufferData(GL_ARRAY_BUFFER, @sizeOf(@TypeOf(quad)), &quad, GL_STATIC_DRAW);
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 2, GL_FLOAT, 0, 2 * 4, 0);
+
+    var xmb_ubo: u32 = 0;
+    glGenBuffers(1, @ptrCast(&xmb_ubo));
+
+    // std140 layout: time at byte 0, float2 resolution at byte 8.
+    var uniforms = [4]f32{
+        0.0,
+        0.0,
+        @floatFromInt(w),
+        @floatFromInt(h),
+    };
+    glBindBuffer(GL_UNIFORM_BUFFER, xmb_ubo);
+    glBufferData(GL_UNIFORM_BUFFER, @sizeOf(@TypeOf(uniforms)), &uniforms, GL_DYNAMIC_DRAW);
 
     var text_ubo: u32 = 0;
     glGenBuffers(1, @ptrCast(&text_ubo));
@@ -413,13 +357,13 @@ pub fn main(init: std.process.Init) !void {
     // has finished that frame, so the previous frame's query is the one to read.
     var queries: [2]u32 = @splat(0);
     if (gpu_mode == .query) glGenQueriesEXT.?(2, &queries);
-    std.debug.print("{d} instances at {d}x{d}, output {d}.{d:0>3} Hz, swap interval {d}, GPU timing: {s}\n", .{
-        INSTANCES,              gl.width,         gl.height,          sdl.refresh_mhz / 1000,
+    std.debug.print("XMB at {d}x{d}, output {d}.{d:0>3} Hz, swap interval {d}, GPU timing: {s}\n", .{
+        gl.width,               gl.height,        sdl.refresh_mhz / 1000,
         sdl.refresh_mhz % 1000, gl.swap_interval, @tagName(gpu_mode),
     });
 
     // A couple of frames first, so the timer query has a result to show.
-    var dump_after: u32 = if (std.c.getenv("GLTRI_DUMP") != null) 3 else 0;
+    var dump_after: u32 = if (std.c.getenv("XMB_DUMP") != null) 3 else 0;
 
     const start = nowNs();
     var cpu_ms: f64 = 0;
@@ -442,7 +386,6 @@ pub fn main(init: std.process.Init) !void {
         last_frame = wall_start;
 
         uniforms[0] = @as(f32, @floatFromInt(wall_start - start)) / std.time.ns_per_s;
-        // sin(time) is ~0 at startup, so the dump would be half-empty.
         if (dump_after > 0) uniforms[0] = 1.5;
 
         // The previous frame's GPU result is ready by now; reading the current
@@ -465,12 +408,12 @@ pub fn main(init: std.process.Init) !void {
 
         glClear(GL_COLOR_BUFFER_BIT);
 
-        glUseProgram(tri_prog);
-        glBindBuffer(GL_UNIFORM_BUFFER, ubo);
+        glUseProgram(xmb_prog);
+        glBindBuffer(GL_UNIFORM_BUFFER, xmb_ubo);
         glBufferSubData(GL_UNIFORM_BUFFER, 0, @sizeOf(@TypeOf(uniforms)), &uniforms);
-        glBindBufferBase(GL_UNIFORM_BUFFER, 0, ubo);
+        glBindBufferBase(GL_UNIFORM_BUFFER, 0, xmb_ubo);
         glBindVertexArray(vao);
-        glDrawArraysInstanced(GL_TRIANGLES, 0, 3, INSTANCES);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
         @memset(&overlay_px, 0);
         overlayLine(0, std.fmt.bufPrint(&line, "cpu  {d: >6.2} ms", .{cpu_ms}) catch "cpu ?");
@@ -480,7 +423,7 @@ pub fn main(init: std.process.Init) !void {
             if (gpu_mode == .finish) "*" else " ", gpu_ms,
         }) catch "gpu ?");
         overlayLine(2, std.fmt.bufPrint(&line, "frame{d: >6.2} ms", .{frame_ms}) catch "frame ?");
-        overlayLine(4, std.fmt.bufPrint(&line, "{d} tris", .{INSTANCES}) catch "?");
+        overlayLine(4, "xmb shader");
         // Both numbers on purpose: what the output says it runs at, and what
         // we are actually presenting. On a variable-refresh output they differ.
         overlayLine(3, std.fmt.bufPrint(&line, "{d: >5.1}/{d: >5.1} Hz", .{
@@ -499,7 +442,7 @@ pub fn main(init: std.process.Init) !void {
         glBindTexture(GL_TEXTURE_2D, overlay_tex);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, OVERLAY_W, OVERLAY_H, GL_RED, GL_UNSIGNED_BYTE, &overlay_px);
         glBindBufferBase(GL_UNIFORM_BUFFER, 0, text_ubo);
-        glBindVertexArray(vao_text);
+        glBindVertexArray(vao);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
         switch (gpu_mode) {
