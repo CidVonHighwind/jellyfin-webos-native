@@ -5,7 +5,8 @@
 //! Zig currently lowers FP arithmetic to helper calls for this target even with
 //! the correct CPU selected. The FP-heavy UI glyph kernel is isolated behind a
 //! pointer/integer ABI and compiled for VFP; see docs/device.md.
-//! All device libraries are dlopen'd at runtime, so nothing here needs a sysroot.
+//! Device APIs are dlopen'd at runtime. Jellyfin is the exception: it links a
+//! deliberately small FFmpeg build and ships those libraries beside the app.
 //!
 //!   zig build                        build gltri and Jellyfin into zig-out/bin
 //!   zig build run   -Dapp=jellyfin   deploy one app and run it on the TV
@@ -26,6 +27,43 @@ const apps = [_]App{
     .{ .name = "xmb", .src = "src/xmb.zig", .shaders = true },
     .{ .name = "jellyfin", .src = "src/jellyfin.zig", .shaders = true, .ui = true },
 };
+
+const default_ffmpeg_root = "/opt/arm-webos-linux-gnueabi_sdk-buildroot/arm-webos-linux-gnueabi/sysroot/usr/local/ffmpeg";
+const ffmpeg_sonames = [_][]const u8{
+    "libavformat.so.63",
+    "libavcodec.so.63",
+    "libavutil.so.61",
+    "libswresample.so.7",
+};
+
+fn ffmpegLibPaths(b: *std.Build, root: []const u8) [ffmpeg_sonames.len][]const u8 {
+    var paths: [ffmpeg_sonames.len][]const u8 = undefined;
+    for (&paths, ffmpeg_sonames) |*path, soname|
+        path.* = b.pathJoin(&.{ root, "lib", soname });
+    return paths;
+}
+
+fn addJellyfinNativeDeps(
+    b: *std.Build,
+    module: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    ffmpeg_root: []const u8,
+) void {
+    module.addCSourceFile(.{ .file = b.path("src/jellyfin/demux.c"), .flags = &.{} });
+    module.addCSourceFile(.{ .file = b.path("src/jellyfin/starfish_bridge.c"), .flags = &.{} });
+
+    const device = target.result.cpu.arch == .arm and target.result.os.tag == .linux;
+    if (device) {
+        module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ ffmpeg_root, "include" }) });
+        module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ ffmpeg_root, "lib" }) });
+        module.addRPathSpecial("$ORIGIN/lib");
+        inline for (.{ "avformat", "avcodec", "swresample", "avutil" }) |name|
+            module.linkSystemLibrary(name, .{ .use_pkg_config = .no });
+    } else {
+        inline for (.{ "libavformat", "libavcodec", "libswresample", "libavutil" }) |name|
+            module.linkSystemLibrary(name, .{});
+    }
+}
 
 /// Sourced by every remote step. Defaults keep a fresh clone working.
 const env_preamble =
@@ -52,6 +90,8 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSmall });
     const selected = b.option([]const u8, "app", "Which app for run/package/install-app") orelse "jellyfin";
     const strip_mod = b.option(bool, "strip", "Strip the executable") orelse false;
+    const ffmpeg_root = b.option([]const u8, "ffmpeg-root", "Target FFmpeg prefix") orelse default_ffmpeg_root;
+    const ffmpeg_libs = ffmpegLibPaths(b, ffmpeg_root);
 
     var exes = std.StringHashMap(*std.Build.Step.Compile).init(b.allocator);
     for (apps) |app| {
@@ -65,16 +105,8 @@ pub fn build(b: *std.Build) void {
                 .strip = strip_mod,
             }),
         });
-        if (std.mem.eql(u8, app.name, "jellyfin")) {
-            exe.root_module.addCSourceFile(.{
-                .file = b.path("src/jellyfin/demux.c"),
-                .flags = &.{"-I/usr/include/ffmpeg4.4"},
-            });
-            exe.root_module.addCSourceFile(.{
-                .file = b.path("src/jellyfin/starfish_bridge.c"),
-                .flags = &.{},
-            });
-        }
+        if (std.mem.eql(u8, app.name, "jellyfin"))
+            addJellyfinNativeDeps(b, exe.root_module, target, ffmpeg_root);
         addAssets(b, exe, app);
         if (app.ui) addUiDeps(b, exe.root_module, target, optimize);
         b.installArtifact(exe);
@@ -104,23 +136,34 @@ pub fn build(b: *std.Build) void {
     // ---- deploy: both apps to $WEBOS_TMP ----
     const deploy = sh(b, env_preamble ++
         \\shift
-        \\scp -q "$@" "$T:$TMP/"
+        \\while [ "$1" != "--ffmpeg" ]; do scp -q "$1" "$T:$TMP/"; shift; done
+        \\shift
+        \\ssh "$T" "mkdir -p '$TMP/lib'"
+        \\scp -q "$@" "$T:$TMP/lib/"
         \\echo "deployed to $T:$TMP/"
     , &.{"deploy"});
     for (apps) |app| deploy.addFileArg(exes.get(app.name).?.getEmittedBin());
+    deploy.addArg("--ffmpeg");
+    for (ffmpeg_libs) |lib| deploy.addFileArg(.{ .cwd_relative = lib });
     b.step("deploy", "scp gltri and Jellyfin to the TV's temp dir").dependOn(&deploy.step);
 
     // ---- run: deploy one app, then execute it with the compositor's env ----
     // A Wayland client needs LSM's environment; an SSH session does not have it.
     const run = sh(b, env_preamble ++
-        \\app="$1"; bin="$2"
+        \\app="$1"; bin="$2"; shift 2
         \\# An interactive app outlives an interrupted ssh session and then holds
         \\# the binary open, so scp fails with a bare "Failure". Clear it first.
         \\ssh "$T" "killall '$app' 2>/dev/null; true"
         \\scp -q "$bin" "$T:$TMP/$app"
+        \\if [ "$#" -gt 0 ]; then
+        \\  ssh "$T" "mkdir -p '$TMP/lib'"
+        \\  scp -q "$@" "$T:$TMP/lib/"
+        \\fi
         \\exec ssh "$T" "XDG_RUNTIME_DIR=/tmp/xdg WAYLAND_DISPLAY=wayland-0 $TMP/$app"
     , &.{selected});
     run.addFileArg(chosen.getEmittedBin());
+    if (std.mem.eql(u8, selected, "jellyfin"))
+        for (ffmpeg_libs) |lib| run.addFileArg(.{ .cwd_relative = lib });
     // Interactive apps print as they go; without this the build swallows it all
     // and only replays it if the command fails.
     run.stdio = .inherit;
@@ -143,6 +186,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     addAssets(b, host_exe, chosen_app);
+    if (std.mem.eql(u8, selected, "jellyfin"))
+        addJellyfinNativeDeps(b, host_exe.root_module, b.resolveTargetQuery(.{}), ffmpeg_root);
     if (chosen_app.ui) addUiDeps(b, host_exe.root_module, b.resolveTargetQuery(.{}), optimize);
     const run_host = b.addRunArtifact(host_exe);
     // Same reason as `run`: an interactive app's output is the point, and the
@@ -159,14 +204,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    ui_tests.root_module.addCSourceFile(.{
-        .file = b.path("src/jellyfin/demux.c"),
-        .flags = &.{"-I/usr/include/ffmpeg4.4"},
-    });
-    ui_tests.root_module.addCSourceFile(.{
-        .file = b.path("src/jellyfin/starfish_bridge.c"),
-        .flags = &.{},
-    });
+    addJellyfinNativeDeps(b, ui_tests.root_module, b.resolveTargetQuery(.{}), ffmpeg_root);
     for (apps) |app| if (std.mem.eql(u8, app.name, "jellyfin")) addAssets(b, ui_tests, app);
     addUiDeps(b, ui_tests.root_module, b.resolveTargetQuery(.{}), optimize);
     b.step("test", "Run Jellyfin navigation, artwork and shared geometry tests on the host").dependOn(&b.addRunArtifact(ui_tests).step);
@@ -176,6 +214,8 @@ pub fn build(b: *std.Build) void {
     pkg.addFileArg(chosen.getEmittedBin());
     pkg.addArg(b.pathFromRoot("appinfo.json"));
     pkg.addArg(b.pathFromRoot("zig-out"));
+    if (std.mem.eql(u8, selected, "jellyfin"))
+        for (ffmpeg_libs) |lib| pkg.addFileArg(.{ .cwd_relative = lib });
     const pkg_step = b.step("package", "Build an installable .ipk for -Dapp");
     pkg_step.dependOn(&pkg.step);
 
@@ -350,6 +390,7 @@ fn sh(b: *std.Build, script: []const u8, args: []const []const u8) *std.Build.St
 const ipk_script =
     \\set -e
     \\app="$1"; bin="$2"; appinfo="$3"; out="$4"
+    \\shift 4
     \\ver=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$appinfo")
     \\[ -n "$ver" ] || { echo "appinfo.json: missing version" >&2; exit 1; }
     \\# One id per app: NDL (and anything else on the Luna bus) refuses to
@@ -359,6 +400,12 @@ const ipk_script =
     \\mkdir -p "$work/data/usr/palm/applications/$id" "$work/control"
     \\sed "s/APP/$app/g" "$appinfo" > "$work/data/usr/palm/applications/$id/appinfo.json"
     \\install -m 755 "$bin" "$work/data/usr/palm/applications/$id/$app"
+    \\if [ "$#" -gt 0 ]; then
+    \\  mkdir -p "$work/data/usr/palm/applications/$id/lib"
+    \\  for lib in "$@"; do
+    \\    install -m 755 "$lib" "$work/data/usr/palm/applications/$id/lib/$(basename "$lib")"
+    \\  done
+    \\fi
     \\for extra in icon.png largeIcon.png splash.png; do
     \\  [ -f "assets/$extra" ] && cp "assets/$extra" "$work/data/usr/palm/applications/$id/" || true
     \\done

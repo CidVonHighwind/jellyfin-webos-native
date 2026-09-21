@@ -119,10 +119,10 @@ fn codecName(kind: VideoType) []const u8 {
 }
 fn videoType(codec: c_int) ?VideoType {
     return switch (codec) {
-        27 => .h264,
-        173 => .h265,
-        167 => .vp9,
-        32797 => .av1,
+        1 => .h264,
+        2 => .h265,
+        3 => .vp9,
+        4 => .av1,
         else => null,
     };
 }

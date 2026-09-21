@@ -100,9 +100,10 @@ zig build-exe wlbox.zig   -target arm-linux-gnueabi.2.31 -lc -O ReleaseSmall
 - Pin glibc **2.31** (`-target …gnueabi.2.31`). Older than the TV's 2.35, so
   forward-compatible; building against 2.35+ risks symbol versions the TV lacks.
 - `-lc` is only needed for `dlopen`. `fbflash` needs no libc and links fully static.
-- **All device libraries are `dlopen`'d at runtime**, never linked. So the build
-  needs no headers, no sysroot and no `.so` copied from the TV. This is
-  deliberate — keep it that way.
+- Device API libraries are `dlopen`'d at runtime, so they need no target
+  headers. Jellyfin's FFmpeg is the deliberate exception: one known build is
+  linked normally and shipped in the app's `lib/` directory, avoiding an ABI
+  shim for the different FFmpeg versions installed by webOS releases.
 
 ## Deploy and run
 

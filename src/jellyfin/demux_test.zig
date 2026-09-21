@@ -14,11 +14,12 @@ test "decoded Opus timestamps account for pre-skip, including after reopen" {
     try temp.dir.writeFile(io, .{ .sub_path = "audio.mka", .data = @embedFile("testdata/opus-preskip.mka") });
     const path = try temp.dir.realPathFileAlloc(io, "audio.mka", std.testing.allocator);
     defer std.testing.allocator.free(path);
-    // Same optional FFmpeg 4.4 runtime libraries as the TV backend.
-    const demux = jf_demux_open(path.ptr) orelse return error.SkipZigTest;
+    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    defer std.testing.allocator.free(path_z);
+    const demux = jf_demux_open(path_z.ptr) orelse return error.DemuxOpenFailed;
     defer jf_demux_close(demux);
     for (0..2) |pass| {
-        if (pass != 0) try std.testing.expect(jf_demux_reopen(demux, path.ptr) != 0);
+        if (pass != 0) try std.testing.expect(jf_demux_reopen(demux, path_z.ptr) != 0);
         var rate: c_int = 0;
         try std.testing.expect(jf_demux_audio_open(demux, 0, &rate) != 0);
         try std.testing.expectEqual(@as(c_int, 48000), rate);

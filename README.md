@@ -6,8 +6,9 @@ Native Zig applications for LG webOS TVs. The project contains two programs:
 - `gltri` — an OpenGL ES triangle renderer and timing probe.
 
 Both use the same SDL2 platform layer for webOS windowing, input, and OpenGL
-context creation. Device libraries are loaded at runtime, so cross-compiling
-requires neither the webOS SDK nor a target sysroot.
+context creation. Device APIs are loaded at runtime. Jellyfin directly links a
+small target FFmpeg build for container demuxing and audio decode, and packages
+those shared libraries with the app.
 
 ## Requirements
 
@@ -15,6 +16,10 @@ requires neither the webOS SDK nor a target sysroot.
 - `ssh`, `scp`, `tar`, `sed`, and coreutils for device operations
 - `slangc` to compile the embedded OpenGL ES shaders
 - `glslangValidator` is optional shader validation
+- FFmpeg 63 headers and shared libraries for host tests (`pkg-config` names
+  `libavformat`, `libavcodec`, `libavutil`, and `libswresample`)
+- A target FFmpeg prefix for Jellyfin builds. It defaults to the openlgtv
+  buildroot path used by this checkout; override it with `-Dffmpeg-root=/path`.
 
 The pure-Zig TrueType reader and skyline atlas packer required by Jellyfin are
 vendored under `src/vendor`; no sibling checkout is required.
