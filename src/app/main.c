@@ -2349,7 +2349,9 @@ static void draw_grid(loom_context *ctx, float width, float height, float scale)
     grid_scroll = list.scroll;
     loom_label(ctx, (loom_rect){margin, 40 * scale - grid_scroll, width - margin * 2, 50 * scale},
                NULL, grid_title, TEXT, 32 * scale);
-    const loom_rect content = grid_rect;
+    /* Grid padding reserves room for the first and last fully visible rows. It is not a
+     * scissor: neighbouring rows extend into that margin and disappear at the viewport fade. */
+    const loom_rect content = ctx->viewport;
 
     /* Selection padding is not a scissor: include the rows that extend into it. */
     const size_t first = dec(list.first);
@@ -2379,12 +2381,11 @@ static void draw_grid(loom_context *ctx, float width, float height, float scale)
     static const loom_color fade = {9, 13, 22, 255};
     const float fade_height = 72 * scale;
     if (list.scroll > 0)
-        loom_fade(ctx, (loom_rect){grid_rect.x, grid_rect.y, grid_rect.w, fade_height},
-                  &grid_rect, fade, LOOM_FADE_TOP);
+        loom_fade(ctx, (loom_rect){0, 0, width, fade_height}, &ctx->viewport, fade,
+                  LOOM_FADE_TOP);
     if (list.scroll < loom_virtual_list_max_scroll(&list))
-        loom_fade(ctx, (loom_rect){grid_rect.x, grid_rect.y + grid_rect.h - fade_height,
-                                   grid_rect.w, fade_height},
-                  &grid_rect, fade, LOOM_FADE_BOTTOM);
+        loom_fade(ctx, (loom_rect){0, height - fade_height, width, fade_height}, &ctx->viewport,
+                  fade, LOOM_FADE_BOTTOM);
 
     const loom_rect track = {grid_rect.x + grid_rect.w, grid_rect.y, 4 * scale, grid_rect.h};
     const float max_scroll = loom_virtual_list_max_scroll(&list);
