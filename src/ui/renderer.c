@@ -187,7 +187,7 @@ jf_renderer *jf_renderer_create(const uint8_t *media, uint32_t media_width, uint
     r->media_texture = media != NULL ? make_texture(media_width, media_height, media) : r->texture;
 
     const unsigned char *const fragments[KIND_COUNT] = {ui_fill, ui_round, ui_border, ui_glyph,
-                                                        ui_image};
+                                                        ui_image, ui_fade};
     for (int i = 0; i < KIND_COUNT; i++)
         r->programs[i] = make_program(fragments[i]);
 
