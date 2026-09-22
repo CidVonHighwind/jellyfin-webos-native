@@ -44,8 +44,8 @@ typedef struct {
 } jf_credentials;
 
 void jf_store_save(const jf_credentials *credentials);
-/* False when there is nothing usable stored. A file written before the password field
- * existed still loads; the missing field simply comes back empty. */
+/* False when no server has been selected. The access token may be empty after sign-out;
+ * callers can retain the server and ask for credentials again. */
 bool jf_store_load(jf_credentials *out);
 void jf_store_forget(void);
 

@@ -140,6 +140,7 @@ void jf_stream_url(const jf_session *session, const char *id, char *out, size_t 
 
 typedef enum {
     JF_JOB_DISCOVER,
+    JF_JOB_PROBE,
     JF_JOB_LOGIN,
     JF_JOB_QUICK_INITIATE,
     JF_JOB_QUICK_POLL,
@@ -153,6 +154,8 @@ typedef enum {
     JF_JOB_SEASON_STATUS,
     JF_JOB_EPISODES,
     JF_JOB_POSTER,
+    JF_JOB_PLAYBACK_STARTED,
+    JF_JOB_PLAYBACK_PROGRESS,
 } jf_job;
 
 typedef enum { JF_IMAGE_PRIMARY, JF_IMAGE_BACKDROP } jf_image_kind;
@@ -176,6 +179,7 @@ typedef struct {
     /* Season id or password, per job. */
     char b[512];
     uint32_t start, limit;
+    uint64_t position_ticks;
     jf_image_kind image_kind;
     /* Opaque to the fetcher: the UI uses it to match a result to the row, grid slot or
      * poster tile that asked for it. */
@@ -190,6 +194,7 @@ typedef struct {
     jf_quick_connect quick;
     jf_discovered *servers;
     size_t server_count;
+    jf_discovered server;
     jf_image image;
     bool has_image;
     char error[128];

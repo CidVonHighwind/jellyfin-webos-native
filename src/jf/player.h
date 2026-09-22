@@ -10,7 +10,7 @@
 typedef enum { JF_IDLE, JF_LOADING, JF_PLAYING, JF_FAILED } jf_player_state;
 
 bool jf_player_play(const char *stream_uri, const char *transcode_uri,
-                    uint32_t width, uint32_t height);
+                    uint32_t width, uint32_t height, int start_position_ms);
 void jf_player_pause(void);
 void jf_player_resume(void);
 void jf_player_stop(void);

@@ -808,7 +808,7 @@ done:
 /* -------------------------------------------------------------------- public */
 
 bool jf_player_play(const char *stream_uri, const char *transcode_uri,
-                    uint32_t width, uint32_t height)
+                    uint32_t width, uint32_t height, int start_position_ms)
 {
     if (atomic_load(&running))
         return false;
@@ -841,9 +841,10 @@ bool jf_player_play(const char *stream_uri, const char *transcode_uri,
     }
     atomic_store(&clock_origin_ready, false);
     atomic_store(&paused, false);
-    atomic_store(&seek_pending, false);
-    atomic_store(&position_ms, 0);
-    atomic_store(&stream_base_ms, 0);
+    seek_to_ms = start_position_ms > 0 ? start_position_ms : 0;
+    atomic_store(&seek_pending, seek_to_ms > 0);
+    atomic_store(&position_ms, seek_to_ms);
+    atomic_store(&stream_base_ms, seek_to_ms);
     atomic_store(&running, true);
     if (pthread_create(&session_thread, NULL, session, NULL) != 0) {
         atomic_store(&running, false);

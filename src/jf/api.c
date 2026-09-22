@@ -114,7 +114,7 @@ bool jf_session_load(jf_session *session)
     snprintf(session->user_id, sizeof(session->user_id), "%s", credentials.user_id);
     snprintf(session->user_name, sizeof(session->user_name), "%s", credentials.user_name);
     snprintf(session->password, sizeof(session->password), "%s", credentials.password);
-    return true;
+    return session->token[0] != '\0';
 }
 
 void jf_api_init(void)
@@ -159,7 +159,14 @@ void jf_url_escape(char *out, size_t out_len, const char *value)
 
 /* -------------------------------------------------------------------- http */
 
-typedef enum { HTTP_OK, HTTP_REQUEST_FAILED, HTTP_UNAUTHORIZED, HTTP_STATUS } http_result;
+typedef enum {
+    HTTP_OK,
+    HTTP_REQUEST_FAILED,
+    HTTP_UNAUTHORIZED,
+    HTTP_CLIENT_ERROR,
+    HTTP_SERVER_ERROR,
+    HTTP_STATUS,
+} http_result;
 
 typedef struct {
     uint8_t *bytes;
@@ -187,6 +194,8 @@ static size_t collect(char *data, size_t size, size_t count, void *user)
     return chunk;
 }
 
+static const char *json_string(jf_arena *arena, json_object *object, const char *key);
+
 /* One request. The body is copied into `arena`; `payload` carries the JSON for a POST
  * (an empty string still means POST, as Quick Connect's Initiate requires). */
 static http_result send_request(CURL *curl, jf_arena *arena, const jf_session *session,
@@ -203,12 +212,15 @@ static http_result send_request(CURL *curl, jf_arena *arena, const jf_session *s
         headers = curl_slist_append(headers, "Content-Type: application/json");
 
     response body = {NULL, 0, 0};
+    fprintf(stderr, "HTTP %s %s\n", method, url);
     curl_easy_reset(curl);
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, collect);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 8L);
+    curl_easy_setopt(curl, CURLOPT_POSTREDIR, CURL_REDIR_POST_ALL);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
@@ -224,16 +236,20 @@ static http_result send_request(CURL *curl, jf_arena *arena, const jf_session *s
     curl_slist_free_all(headers);
 
     if (code != CURLE_OK) {
-        fprintf(stderr, "%s %s: %s\n", method, url, curl_easy_strerror(code));
+        fprintf(stderr, "HTTP %s %s: %s\n", method, url, curl_easy_strerror(code));
         free(body.bytes);
         return HTTP_REQUEST_FAILED;
     }
-    if (status != 200) {
-        fprintf(stderr, "%s %s: HTTP %ld\n", method, url, status);
+    if (status < 200 || status >= 300) {
+        fprintf(stderr, "HTTP %s %s -> %ld\n", method, url, status);
         free(body.bytes);
-        /* The only failure worth forgetting credentials over - a 500 or a timeout says
-         * nothing about whether they are valid. */
-        return (status == 401 || status == 403) ? HTTP_UNAUTHORIZED : HTTP_STATUS;
+        if (status == 401 || status == 403)
+            return HTTP_UNAUTHORIZED;
+        if (status >= 400 && status < 500)
+            return HTTP_CLIENT_ERROR;
+        if (status >= 500 && status < 600)
+            return HTTP_SERVER_ERROR;
+        return HTTP_STATUS;
     }
 
     /* Into the arena, so the caller frees nothing. */
@@ -248,6 +264,32 @@ static http_result send_request(CURL *curl, jf_arena *arena, const jf_session *s
     free(body.bytes);
     *out_body = copy;
     *out_size = body.size;
+    return HTTP_OK;
+}
+
+static http_result probe_server(CURL *curl, jf_arena *arena, const jf_session *session,
+                                const char *address, jf_discovered *out)
+{
+    jf_session probe = *session;
+    snprintf(probe.url, sizeof(probe.url), "%s", address);
+    char base[512];
+    char url[1024];
+    snprintf(url, sizeof(url), "%s/System/Info/Public",
+             jf_session_base(&probe, base, sizeof(base)));
+    uint8_t *body = NULL;
+    size_t size = 0;
+    const http_result result = send_request(curl, arena, &probe, "GET", url, NULL, &body, &size);
+    if (result != HTTP_OK)
+        return result;
+    json_object *root = json_tokener_parse((const char *)body);
+    if (root == NULL)
+        return HTTP_STATUS;
+    out->address = jf_arena_strdup(arena, probe.url);
+    out->name = json_string(arena, root, "ServerName");
+    out->id = json_string(arena, root, "Id");
+    if (out->name == NULL || out->name[0] == '\0')
+        out->name = out->address;
+    json_object_put(root);
     return HTTP_OK;
 }
 
@@ -611,6 +653,9 @@ static http_result execute(CURL *curl, const jf_session *session, jf_task *task)
     case JF_JOB_DISCOVER:
         return discover(arena, &task->servers, &task->server_count) ? HTTP_OK : HTTP_REQUEST_FAILED;
 
+    case JF_JOB_PROBE:
+        return probe_server(curl, arena, session, task->a, &task->server);
+
     case JF_JOB_LOGIN: {
         char user[520], password[520];
         json_quote(user, sizeof(user), task->a);
@@ -648,7 +693,7 @@ static http_result execute(CURL *curl, const jf_session *session, jf_task *task)
     }
 
     case JF_JOB_VIEWS:
-        snprintf(url, sizeof(url), "%s/UserViews?userId=%s",
+        snprintf(url, sizeof(url), "%s/UserViews?userId=%s&limit=256",
                  jf_session_base(session, base, sizeof(base)), session->user_id);
         return get_list(curl, arena, session, url, &task->list);
 
@@ -668,7 +713,7 @@ static http_result execute(CURL *curl, const jf_session *session, jf_task *task)
         char parent[256];
         jf_url_escape(parent, sizeof(parent), task->a);
         snprintf(url, sizeof(url),
-                 "%s/Items?userId=%s&parentId=%s&startIndex=%u&limit=%u&recursive=true"
+                 "%s/Users/%s/Items?parentId=%s&startIndex=%u&limit=%u&recursive=true"
                  "&sortBy=SortName&sortOrder=Ascending&includeItemTypes=Movie,Series"
                  "&fields=Overview,ChildCount&imageTypeLimit=1&enableImageTypes=Primary",
                  jf_session_base(session, base, sizeof(base)), session->user_id, parent,
@@ -718,6 +763,18 @@ static http_result execute(CURL *curl, const jf_session *session, jf_task *task)
                          task->image_kind, &task->image);
         task->has_image = result == HTTP_OK;
         return result;
+
+    case JF_JOB_PLAYBACK_STARTED:
+    case JF_JOB_PLAYBACK_PROGRESS: {
+        char id[520];
+        json_quote(id, sizeof(id), task->a);
+        snprintf(payload, sizeof(payload), "{\"ItemId\":%s,\"PositionTicks\":%llu}", id,
+                 (unsigned long long)task->position_ticks);
+        snprintf(url, sizeof(url), "%s/Sessions/Playing%s",
+                 jf_session_base(session, base, sizeof(base)),
+                 task->job == JF_JOB_PLAYBACK_PROGRESS ? "/Progress" : "");
+        return send_request(curl, arena, session, "POST", url, payload, &body, &size);
+    }
     }
     return HTTP_STATUS;
 }
@@ -728,6 +785,8 @@ static const char *result_name(http_result result)
 {
     switch (result) {
     case HTTP_UNAUTHORIZED: return "Unauthorized";
+    case HTTP_CLIENT_ERROR: return "ClientError";
+    case HTTP_SERVER_ERROR: return "ServerError";
     case HTTP_REQUEST_FAILED: return "RequestFailed";
     default: return "HttpStatus";
     }

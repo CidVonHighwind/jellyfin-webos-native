@@ -20,10 +20,11 @@ static jf_player_state state = JF_IDLE;
 static const char *error_text = "";
 
 bool jf_player_play(const char *stream_uri, const char *transcode_uri, uint32_t width,
-                    uint32_t height)
+                    uint32_t height, int start_position_ms)
 {
     (void)width;
     (void)height;
+    (void)start_position_ms;
     fprintf(stderr, "no player in this build\n  stream:    %s\n  transcode: %s\n", stream_uri,
             transcode_uri);
     error_text = "this build has no player; see README.md";

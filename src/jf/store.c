@@ -138,7 +138,7 @@ bool jf_store_load(jf_credentials *out)
         snprintf(fields[i], sizes[i], "%s", cursor);
         cursor = newline != NULL ? newline + 1 : NULL;
     }
-    return out->server[0] != '\0' && out->token[0] != '\0';
+    return out->server[0] != '\0';
 }
 
 void jf_store_forget(void)

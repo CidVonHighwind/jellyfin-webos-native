@@ -122,6 +122,7 @@ typedef struct {
     uint32_t requested_width, requested_height;
     uint32_t texture;
     uint32_t width, height;
+    uint64_t loaded_at;
     /* Frame this slot was last asked for. 0 means never. */
     uint64_t used;
     bool loading;
@@ -133,6 +134,19 @@ static uint64_t frame_index;
  * frame; the fetcher has 32 slots shared with page requests, so let the visible ones
  * trickle in over a few frames instead of starving it. */
 static unsigned poster_requests;
+
+static bool artwork_loading(const char *id, const char *tag, jf_image_kind kind,
+                            uint32_t width, uint32_t height)
+{
+    for (size_t i = 0; i < CACHE_SIZE; i++) {
+        const poster_slot *slot = &slots[i];
+        if (strcmp(slot->id, id != NULL ? id : "") == 0 &&
+            strcmp(slot->tag, tag != NULL ? tag : "") == 0 && slot->kind == kind &&
+            slot->requested_width == width && slot->requested_height == height)
+            return slot->loading;
+    }
+    return false;
+}
 
 /* The cached artwork for `id`, or NULL while it is still being fetched. Calling this is
  * also what keeps a slot alive, so it must be called every frame for every visible card. */
@@ -181,6 +195,34 @@ static const poster_slot *artwork(const char *id, const char *tag, jf_image_kind
     }
 
     const uint32_t index = (uint32_t)(victim - slots);
+    /* Disk artwork is decoded and uploaded in this frame. A cache hit must not spend a
+     * frame as an empty placeholder just because the normal network path is asynchronous. */
+    char path[768];
+    if (jf_store_image_path(path, sizeof(path), id, tag, width, height)) {
+        size_t size = 0;
+        uint8_t *bytes = jf_store_read_image(path, &size);
+        jf_image image = {0};
+        if (bytes != NULL && jf_image_decode(bytes, size, &image)) {
+            jf_renderer_destroy_texture(renderer, victim->texture);
+            memset(victim, 0, sizeof(*victim));
+            victim->texture = jf_renderer_create_texture(renderer, image.width, image.height,
+                                                          image.rgb);
+            victim->width = image.width;
+            victim->height = image.height;
+            victim->used = frame_index;
+            victim->loaded_at = now_ns();
+            victim->kind = kind;
+            victim->requested_width = width;
+            victim->requested_height = height;
+            set_text(victim->id, sizeof(victim->id), id);
+            set_text(victim->tag, sizeof(victim->tag), tag);
+            jf_image_free(&image);
+            free(bytes);
+            return victim;
+        }
+        jf_image_free(&image);
+        free(bytes);
+    }
     jf_task *task = jf_fetcher_submit(&fetcher, JF_JOB_POSTER, index);
     if (task == NULL)
         return NULL;
@@ -207,6 +249,23 @@ static const poster_slot *artwork(const char *id, const char *tag, jf_image_kind
 static const poster_slot *poster(const char *id, const char *tag)
 {
     return artwork(id, tag, JF_IMAGE_PRIMARY, POSTER_W, POSTER_H);
+}
+
+/* The renderer's primitive is a rounded rectangle, so an eight-dot spinner is cheaper
+ * than a separate texture or shader program. Its highlighted dot advances with time. */
+static void draw_spinner(loom_context *ctx, float x, float y, float radius, const loom_rect *clip,
+                         float scale)
+{
+    jf_window_frame_requested = true;
+    const unsigned phase = (unsigned)(now_ns() / 90000000ull) % 8;
+    for (unsigned i = 0; i < 8; i++) {
+        const float angle = ((float)i / 8.0f) * 6.2831853f - 1.5707963f;
+        const float dot = 7.0f * scale;
+        loom_color color = {DIM[0], DIM[1], DIM[2], i == phase ? 255 : 72};
+        loom_fill(ctx, (loom_rect){x + cosf(angle) * radius - dot / 2,
+                                   y + sinf(angle) * radius - dot / 2, dot, dot},
+                  clip, color, dot / 2);
+    }
 }
 
 /* Texture coordinates that fill `rect` with the image, cropping the long axis instead of
@@ -256,6 +315,7 @@ typedef struct {
     char kind[16];
     char runtime[24];
     float progress;
+    uint64_t playback_position_ticks;
     bool played;
     uint32_t remaining;
     bool has_remaining;
@@ -340,6 +400,7 @@ static card card_from(const jf_item *item)
     memset(&out, 0, sizeof(out));
     out.present = true;
     out.progress = jf_item_progress(item);
+    out.playback_position_ticks = item->playback_position_ticks;
     out.played = jf_item_finished(item);
     const char *type = item->type != NULL ? item->type : "";
 
@@ -416,15 +477,18 @@ typedef enum {
     SCREEN_AUTH,
     SCREEN_QUICK,
     SCREEN_HOME,
+    SCREEN_CATEGORIES,
     SCREEN_GRID,
     SCREEN_DETAILS,
     SCREEN_SEASON,
     SCREEN_PLAYBACK,
+    SCREEN_SETTINGS,
 } screen_id;
 
 typedef enum { EDIT_NONE, EDIT_URL, EDIT_USERNAME, EDIT_PASSWORD } edit_field;
 
 #define ROW_CAPACITY 24
+#define CATEGORY_CAPACITY 256
 #define SEASONS_CAPACITY 128
 #define EPISODES_CAPACITY 512
 #define ROW_COUNT 3
@@ -457,6 +521,8 @@ static item_row rows[ROW_COUNT] = {
     {"Up Next", false, NULL, ROW_CAPACITY, 0, false},
     {"Libraries", true, NULL, ROW_CAPACITY, 0, false},
 };
+static card category_cards[CATEGORY_CAPACITY];
+static item_row categories_row = {"All categories", true, NULL, CATEGORY_CAPACITY, 0, false};
 
 /* Back cancels the UI's interest in pending sign-in / Quick Connect replies. */
 static uint32_t auth_generation;
@@ -469,6 +535,9 @@ static float home_scroll;
 static loom_rect home_rect;
 static float home_row_height = 470;
 static bool home_reveal;
+static size_t category_selected;
+static float category_scroll;
+static loom_rect category_rect;
 
 /* Where Back goes, as a stack rather than a rule per screen.
  *
@@ -501,6 +570,9 @@ static struct {
 } discovered[DISCOVERED_CAPACITY];
 static size_t discovered_count;
 static bool discovering;
+static uint64_t discovery_until;
+static bool connecting;
+static char server_name[128];
 
 /* Quick Connect. */
 static char quick_code[16];
@@ -514,6 +586,7 @@ static uint64_t quick_poll_at;
 static char grid_parent[40];
 static char grid_title[96];
 static uint32_t grid_total;
+static bool grid_loading;
 static card grid_cards[WINDOW_SIZE];
 /* Absolute item index currently stored in each window entry. Without it a stale card from
  * a page that scrolled away would be drawn as if it were the item that now occupies the
@@ -543,7 +616,10 @@ static bool episode_jump;
 static bool select_unfinished_season;
 static bool select_unfinished_episode;
 static char playback_title[160];
+static char playback_item_id[40];
 static bool playback_paused;
+static uint64_t playback_started_at;
+static uint64_t playback_progress_at;
 /* The player chrome is deliberately transient: it never covers a scene for more than
  * three seconds unless playback is paused. */
 static uint64_t playback_controls_until;
@@ -562,6 +638,12 @@ static float cursor_x = -1;
 static float cursor_y = -1;
 static bool cursor_present;
 static bool pointer_press;
+
+/* A sidebar is an overlay: categories return to the existing home screen, while Settings
+ * replaces the content screen but keeps the same left-edge entry point. */
+static bool sidebar_open;
+static size_t sidebar_focus;
+static screen_id sidebar_return_screen;
 
 static char status_text[200];
 static bool status_error;
@@ -603,8 +685,8 @@ static unsigned status_requests;
 
 static bool is_auth_job(jf_job job)
 {
-    return job == JF_JOB_LOGIN || job == JF_JOB_QUICK_INITIATE || job == JF_JOB_QUICK_POLL ||
-           job == JF_JOB_QUICK_AUTHENTICATE;
+    return job == JF_JOB_PROBE || job == JF_JOB_LOGIN || job == JF_JOB_QUICK_INITIATE ||
+           job == JF_JOB_QUICK_POLL || job == JF_JOB_QUICK_AUTHENTICATE;
 }
 
 static jf_task *request(jf_job job, uint32_t tag)
@@ -623,9 +705,18 @@ static void load_home(void)
 {
     for (size_t i = 0; i < ROW_COUNT; i++)
         rows[i].loading = true;
+    categories_row.loading = true;
     simple(JF_JOB_RESUME);
     simple(JF_JOB_NEXT_UP);
     simple(JF_JOB_VIEWS);
+}
+
+static void restart_discovery(void)
+{
+    discovered_count = 0;
+    discovering = true;
+    discovery_until = now_ns() + 30000000000ull;
+    simple(JF_JOB_DISCOVER);
 }
 
 /* Ask for the page containing `index`, unless that page is already in the window or
@@ -651,6 +742,7 @@ static void open_grid(const card *source)
     set_text(grid_parent, sizeof(grid_parent), source->id);
     set_text(grid_title, sizeof(grid_title), source->title);
     grid_total = 0;
+    grid_loading = true;
     grid_selected = 0;
     grid_scroll = 0;
     memset(grid_cards, 0, sizeof(grid_cards));
@@ -730,12 +822,14 @@ static stack_entry here(void)
                  : screen == SCREEN_SEASON ? season_detail
                                            : detail;
     entry.series = detail;
-    entry.selected = screen == SCREEN_GRID ? grid_selected
-                     : screen == SCREEN_SEASON ? episode_selected
-                                               : 0;
-    entry.scroll = screen == SCREEN_HOME ? home_scroll
-                   : screen == SCREEN_SEASON ? episode_scroll
-                                             : grid_scroll;
+    entry.selected = screen == SCREEN_GRID       ? grid_selected
+                     : screen == SCREEN_CATEGORIES ? category_selected
+                     : screen == SCREEN_SEASON   ? episode_selected
+                                                  : 0;
+    entry.scroll = screen == SCREEN_HOME       ? home_scroll
+                   : screen == SCREEN_CATEGORIES ? category_scroll
+                   : screen == SCREEN_SEASON   ? episode_scroll
+                                                : grid_scroll;
     entry.focus = focus;
     entry.row_focus = row_focus;
     memcpy(entry.col_focus, col_focus, sizeof(col_focus));
@@ -766,6 +860,11 @@ static void pop(void)
     case SCREEN_HOME:
         screen = SCREEN_HOME;
         home_scroll = entry.scroll;
+        break;
+    case SCREEN_CATEGORIES:
+        screen = SCREEN_CATEGORIES;
+        category_selected = entry.selected;
+        category_scroll = entry.scroll;
         break;
     case SCREEN_GRID:
         /* Returning to the grid we are still holding pages for is free; a different
@@ -848,6 +947,7 @@ static const uint32_t *remaining_seasons(const card *source)
 /* Re-authentications attempted since the last success. Bounded, or a server that rejects
  * a valid-looking password turns into a login loop. */
 static unsigned relogin_attempts;
+static void use_server(const char *address, const char *name);
 
 static void signed_in(const jf_auth *auth, const char *used_password)
 {
@@ -902,18 +1002,23 @@ static void sign_out(void)
 {
     memset(series_status, 0, sizeof(series_status));
     auth_generation++;
-    jf_store_forget();
     session.token[0] = '\0';
     session.user_id[0] = '\0';
+    session.user_name[0] = '\0';
     session.password[0] = '\0';
+    username[0] = '\0';
+    password[0] = '\0';
     relogin_attempts = 0;
     jf_fetcher_set_session(&fetcher, &session);
+    jf_session_save(&session);
     for (size_t i = 0; i < ROW_COUNT; i++)
         rows[i].count = 0;
+    categories_row.count = 0;
     depth = 0;
     screen = SCREEN_AUTH;
     focus = 0;
-    set_status("Signed out");
+    status_text[0] = '\0';
+    status_error = false;
 }
 
 /* ------------------------------------------------------------ task results */
@@ -922,6 +1027,7 @@ static const char *job_name(jf_job job)
 {
     switch (job) {
     case JF_JOB_DISCOVER: return "discover";
+    case JF_JOB_PROBE: return "probe";
     case JF_JOB_LOGIN: return "login";
     case JF_JOB_QUICK_INITIATE: return "quick_initiate";
     case JF_JOB_QUICK_POLL: return "quick_poll";
@@ -935,6 +1041,8 @@ static const char *job_name(jf_job job)
     case JF_JOB_SEASON_STATUS: return "season_status";
     case JF_JOB_EPISODES: return "episodes";
     case JF_JOB_POSTER: return "poster";
+    case JF_JOB_PLAYBACK_STARTED: return "playback_started";
+    case JF_JOB_PLAYBACK_PROGRESS: return "playback_progress";
     }
     return "?";
 }
@@ -958,11 +1066,31 @@ static void on_failure(jf_task *task)
         break;
     }
     case JF_JOB_DISCOVER:
-        discovering = false;
         set_error("Discovery failed: %s", task->error);
+        discovering = false;
+        break;
+    case JF_JOB_PROBE:
+        connecting = false;
+        if (strcmp(task->error, "ServerError") == 0)
+            set_error("Internal server error at %s", server_url);
+        else if (strcmp(task->error, "ClientError") == 0 ||
+                 strcmp(task->error, "Unauthorized") == 0)
+            set_error("Failed to connect to %s", server_url);
+        else
+            set_error("Failed to connect: %s", task->error);
         break;
     case JF_JOB_CHILDREN:
         grid_requested[task->tag % WINDOW_PAGES] = UINT32_MAX;
+        grid_loading = false;
+        if (strcmp(task->error, "ClientError") == 0 || strcmp(task->error, "Unauthorized") == 0 ||
+            strcmp(task->error, "ServerError") == 0) {
+            screen = SCREEN_AUTH;
+            focus = 0;
+            set_error("%s for %s at %s", strcmp(task->error, "ServerError") == 0
+                                           ? "Internal server error"
+                                           : "Request failed",
+                      session.user_name, session.url);
+        }
         break;
     /* A rejected token is the one failure with a recovery: the stored credentials are
      * stale, so drop them rather than loop on 401s. Anything else - a server restarting, a
@@ -976,16 +1104,46 @@ static void on_failure(jf_task *task)
                 sign_out();
             return;
         }
+        if (strcmp(task->error, "ClientError") == 0 || strcmp(task->error, "ServerError") == 0) {
+            screen = SCREEN_AUTH;
+            focus = 0;
+            set_error("%s for %s at %s", strcmp(task->error, "ServerError") == 0
+                                           ? "Internal server error"
+                                           : "Request failed",
+                      session.user_name, session.url);
+            return;
+        }
         set_error("%s failed: %s", job_name(task->job), task->error);
         break;
     case JF_JOB_QUICK_POLL:
         break;
     case JF_JOB_LOGIN:
-        set_error("Sign-in failed: %s", task->error);
+        if (strcmp(task->error, "ServerError") == 0)
+            set_error("Internal server error");
+        else if (strcmp(task->error, "ClientError") == 0 ||
+                 strcmp(task->error, "Unauthorized") == 0)
+            set_error("Failed for %s at %s", username, session.url);
+        else
+            set_error("Sign-in failed: %s", task->error);
         /* A stored password the server no longer accepts: forget it rather than retry it
          * on every screen. */
         if (relogin_attempts != 0)
             sign_out();
+        break;
+    case JF_JOB_ITEM:
+    case JF_JOB_SEASONS:
+    case JF_JOB_EPISODES:
+        if (strcmp(task->error, "ClientError") == 0 || strcmp(task->error, "Unauthorized") == 0 ||
+            strcmp(task->error, "ServerError") == 0) {
+            screen = SCREEN_AUTH;
+            focus = 0;
+            set_error("%s for %s at %s", strcmp(task->error, "ServerError") == 0
+                                           ? "Internal server error"
+                                           : "Request failed",
+                      session.user_name, session.url);
+            return;
+        }
+        set_error("%s failed: %s", job_name(task->job), task->error);
         break;
     default:
         set_error("%s failed: %s", job_name(task->job), task->error);
@@ -1003,17 +1161,29 @@ static void consume(jf_task *task)
     }
     switch (task->job) {
     case JF_JOB_DISCOVER:
-        discovering = false;
-        discovered_count = min_size(task->server_count, DISCOVERED_CAPACITY);
-        for (size_t i = 0; i < discovered_count; i++) {
-            set_text(discovered[i].name, sizeof(discovered[i].name), task->servers[i].name);
-            set_text(discovered[i].address, sizeof(discovered[i].address),
-                     task->servers[i].address);
+        for (size_t incoming = 0;
+             incoming < task->server_count && discovered_count < DISCOVERED_CAPACITY; incoming++) {
+            bool seen = false;
+            for (size_t index = 0; index < discovered_count; index++)
+                seen = seen || strcmp(discovered[index].address, task->servers[incoming].address) == 0;
+            if (seen)
+                continue;
+            set_text(discovered[discovered_count].name, sizeof(discovered[0].name),
+                     task->servers[incoming].name);
+            set_text(discovered[discovered_count].address, sizeof(discovered[0].address),
+                     task->servers[incoming].address);
+            discovered_count++;
         }
-        if (discovered_count == 0)
-            set_status("No server answered the broadcast; enter an address");
-        else
-            set_status("Found %zu server(s)", discovered_count);
+        if (now_ns() < discovery_until) {
+            simple(JF_JOB_DISCOVER);
+        } else {
+            discovering = false;
+        }
+        break;
+
+    case JF_JOB_PROBE:
+        connecting = false;
+        use_server(task->server.address, task->server.name);
         break;
 
     case JF_JOB_LOGIN:
@@ -1051,19 +1221,21 @@ static void consume(jf_task *task)
     case JF_JOB_VIEWS: {
         /* Music and playlists have no poster grid worth opening from here, and the scope
          * for this client is video. */
-        jf_item keep[ROW_CAPACITY];
+        jf_item keep[CATEGORY_CAPACITY];
         size_t count = 0;
-        for (size_t i = 0; i < task->list.count && count < ROW_CAPACITY; i++) {
+        for (size_t i = 0; i < task->list.count && count < CATEGORY_CAPACITY; i++) {
             const char *kind = task->list.items[i].collection_type;
             if (kind != NULL && (strcmp(kind, "music") == 0 || strcmp(kind, "playlists") == 0))
                 continue;
             keep[count++] = task->list.items[i];
         }
         row_fill(&rows[ROW_LIBRARIES], keep, count);
+        row_fill(&categories_row, keep, count);
         break;
     }
 
     case JF_JOB_CHILDREN: {
+        grid_loading = false;
         grid_total = task->list.total_record_count;
         const uint32_t start = task->tag * PAGE_SIZE;
         for (size_t offset = 0; offset < task->list.count; offset++) {
@@ -1126,11 +1298,17 @@ static void consume(jf_task *task)
                                                        task->image.height, task->image.rgb);
             slot->width = task->image.width;
             slot->height = task->image.height;
+            slot->loaded_at = now_ns();
             slot->loading = false;
         }
         break;
+    case JF_JOB_PLAYBACK_STARTED:
+    case JF_JOB_PLAYBACK_PROGRESS:
+        break;
     }
 }
+
+static void report_playback(jf_job job);
 
 static void pump(void)
 {
@@ -1149,6 +1327,11 @@ static void pump(void)
             set_text(task->a, sizeof(task->a), quick_secret);
             jf_fetcher_start(&fetcher, task);
         }
+    }
+    if (screen == SCREEN_PLAYBACK && !playback_paused && playback_item_id[0] != '\0' &&
+        jf_player_state_get() == JF_PLAYING && now_ns() >= playback_progress_at) {
+        report_playback(JF_JOB_PLAYBACK_PROGRESS);
+        playback_progress_at = now_ns() + 15000000000ull;
     }
 }
 
@@ -1238,26 +1421,63 @@ static const card *grid_card(size_t index)
     return grid_cards[ring].present ? &grid_cards[ring] : NULL;
 }
 
-static void use_server(const char *address)
+static void use_server(const char *address, const char *name)
 {
     auth_generation++;
     set_text(server_url, sizeof(server_url), address);
     set_text(session.url, sizeof(session.url), address);
+    set_text(server_name, sizeof(server_name), name != NULL && name[0] != '\0' ? name : address);
     jf_fetcher_set_session(&fetcher, &session);
     screen = SCREEN_AUTH;
     focus = 0;
-    set_status("Sign in to %s", address);
+    status_text[0] = '\0';
+    status_error = false;
 }
 
 static void activate(void);
 
+static void open_sidebar(void)
+{
+    end_edit();
+    sidebar_open = true;
+    sidebar_focus = 0;
+    sidebar_return_screen = screen;
+}
+
+static void activate_sidebar(void)
+{
+    sidebar_open = false;
+    if (sidebar_focus == 0) {
+        screen = SCREEN_CATEGORIES;
+        focus = 0;
+        category_selected = 0;
+        category_scroll = 0;
+        if (!categories_row.loading && categories_row.count == 0)
+            load_home();
+        return;
+    }
+    screen = SCREEN_SETTINGS;
+    focus = 0;
+}
+
 static void go_back(void)
 {
+    if (sidebar_open) {
+        sidebar_open = false;
+        return;
+    }
     if (screen == SCREEN_PLAYBACK) {
+        report_playback(JF_JOB_PLAYBACK_PROGRESS);
         jf_player_stop();
         playback_paused = false;
+        playback_item_id[0] = '\0';
         screen = SCREEN_DETAILS;
         set_status("Stopped playback");
+        return;
+    }
+    if (screen == SCREEN_SERVER && connecting) {
+        auth_generation++;
+        connecting = false;
         return;
     }
     if (active_field != EDIT_NONE) {
@@ -1278,6 +1498,13 @@ static void go_back(void)
         quick_secret[0] = '\0';
         screen = SCREEN_AUTH;
         focus = 0;
+        break;
+    case SCREEN_SETTINGS:
+        screen = sidebar_return_screen;
+        focus = 0;
+        break;
+    case SCREEN_CATEGORIES:
+        screen = SCREEN_HOME;
         break;
     default:
         pop();
@@ -1310,7 +1537,20 @@ static const struct {
 #define PLAYBACK_BUTTON_COUNT (sizeof(playback_buttons) / sizeof(playback_buttons[0]))
 #define PLAY_PAUSE_INDEX 3
 
-static void start_playback(const char *id, const char *title)
+static void report_playback(jf_job job)
+{
+    if (playback_item_id[0] == '\0')
+        return;
+    jf_task *task = request(job, 0);
+    if (task == NULL)
+        return;
+    set_text(task->a, sizeof(task->a), playback_item_id);
+    const int position_ms = jf_player_position();
+    task->position_ticks = (uint64_t)(position_ms > 0 ? position_ms : 0) * 10000ull;
+    jf_fetcher_start(&fetcher, task);
+}
+
+static void start_playback(const char *id, const char *title, uint64_t resume_ticks)
 {
     char stream[1024];
     jf_stream_url(&session, id, stream, sizeof(stream));
@@ -1322,16 +1562,21 @@ static void start_playback(const char *id, const char *title)
      * comfortably above a long reverse-proxy address plus access token. */
     char transcode[2048];
     jf_transcode_url(&session, id, transcode, sizeof(transcode));
-    if (!jf_player_play(stream, transcode, gl_width, gl_height)) {
+    const uint64_t resume_ms = resume_ticks / 10000ull;
+    const int start_ms = resume_ms > INT32_MAX ? INT32_MAX : (int)resume_ms;
+    if (!jf_player_play(stream, transcode, gl_width, gl_height, start_ms)) {
         set_error("Playback failed: %s", jf_player_error());
         return;
     }
     set_text(playback_title, sizeof(playback_title), title);
+    set_text(playback_item_id, sizeof(playback_item_id), id);
     playback_paused = false;
+    playback_started_at = now_ns();
+    playback_progress_at = playback_started_at + 15000000000ull;
     focus = PLAY_PAUSE_INDEX;
     playback_controls_until = now_ns() + PLAYBACK_CONTROLS_NS;
     screen = SCREEN_PLAYBACK;
-    set_status("Playing");
+    report_playback(JF_JOB_PLAYBACK_STARTED);
 }
 
 static void toggle_playback(void)
@@ -1367,26 +1612,29 @@ static void activate_playback(void)
 
 static void activate_server(void)
 {
-    if (focus < discovered_count) {
-        use_server(discovered[focus].address);
-        return;
-    }
-    if (focus == discovered_count) {
+    if (focus == 0) {
         begin_edit(EDIT_URL, url_rect);
         return;
     }
-    if (focus == discovered_count + 1) {
+    if (focus == 1) {
         if (server_url[0] == '\0') {
             set_error("Enter a server URL first");
             return;
         }
-        use_server(server_url);
+        jf_task *task = request(JF_JOB_PROBE, 0);
+        if (task == NULL)
+            return;
+        set_text(task->a, sizeof(task->a), server_url);
+        connecting = true;
+        jf_fetcher_start(&fetcher, task);
         return;
     }
-    discovering = true;
-    discovered_count = 0;
-    simple(JF_JOB_DISCOVER);
-    set_status("Broadcasting on UDP 7359...");
+    const size_t index = focus - 2;
+    if (index < discovered_count) {
+        use_server(discovered[index].address, discovered[index].name);
+    } else if (index == discovered_count) {
+        restart_discovery();
+    }
 }
 
 static void activate_details(void)
@@ -1399,7 +1647,7 @@ static void activate_details(void)
         return;
     }
     if (focus == 0)
-        start_playback(detail.id, detail.title);
+        start_playback(detail.id, detail.title, detail.playback_position_ticks);
 }
 
 static void activate(void)
@@ -1448,6 +1696,13 @@ static void activate(void)
             open_details(&chosen);
         break;
     }
+    case SCREEN_CATEGORIES:
+        if (category_selected < categories_row.count) {
+            const card chosen = categories_row.cards[category_selected];
+            push();
+            open_grid(&chosen);
+        }
+        break;
     case SCREEN_GRID: {
         const card *chosen = grid_card(grid_selected);
         if (chosen != NULL) {
@@ -1463,10 +1718,14 @@ static void activate(void)
     case SCREEN_SEASON:
         if (episode_selected < episodes_row.count)
             start_playback(episodes_row.cards[episode_selected].id,
-                           episodes_row.cards[episode_selected].episode_title);
+                           episodes_row.cards[episode_selected].episode_title,
+                           episodes_row.cards[episode_selected].playback_position_ticks);
         break;
     case SCREEN_PLAYBACK:
         activate_playback();
+        break;
+    case SCREEN_SETTINGS:
+        sign_out();
         break;
     }
 }
@@ -1480,6 +1739,8 @@ static size_t focus_count(void)
     case SCREEN_AUTH: return 4;
     case SCREEN_QUICK: return 1;
     case SCREEN_PLAYBACK: return PLAYBACK_BUTTON_COUNT;
+    case SCREEN_SETTINGS: return 1;
+    case SCREEN_CATEGORIES: return categories_row.count;
     case SCREEN_DETAILS:
         return card_is(&detail, "Series") ? (seasons_row.count > 0 ? seasons_row.count : 1) : 1;
     default: return 1;
@@ -1534,9 +1795,51 @@ static void move_home(direction where)
 
 static void move(direction where)
 {
+    if (sidebar_open) {
+        if (where == DIR_UP)
+            sidebar_focus = dec(sidebar_focus);
+        else if (where == DIR_DOWN)
+            sidebar_focus = min_size(sidebar_focus + 1, 1);
+        else if (where == DIR_LEFT)
+            sidebar_open = false;
+        else if (where == DIR_RIGHT)
+            activate_sidebar();
+        return;
+    }
+    if (where == DIR_LEFT) {
+        bool at_left = screen == SCREEN_SERVER || screen == SCREEN_AUTH || screen == SCREEN_QUICK ||
+                       screen == SCREEN_DETAILS || screen == SCREEN_SETTINGS ||
+                       (screen == SCREEN_HOME && col_focus[row_focus] == 0) ||
+                       (screen == SCREEN_CATEGORIES && category_selected == 0) ||
+                       (screen == SCREEN_GRID && grid_columns != 0 &&
+                        grid_selected % grid_columns == 0) ||
+                       (screen == SCREEN_SEASON && episode_selected == 0) ||
+                       (screen == SCREEN_PLAYBACK && focus == 0);
+        if (at_left) {
+            open_sidebar();
+            return;
+        }
+    }
     switch (screen) {
     case SCREEN_HOME:
         move_home(where);
+        break;
+    case SCREEN_CATEGORIES:
+        if (where == DIR_UP)
+            category_selected = dec(category_selected);
+        else if (where == DIR_DOWN)
+            category_selected = min_size(category_selected + 1,
+                                         dec(categories_row.count));
+        break;
+    case SCREEN_AUTH:
+        if (where == DIR_UP)
+            focus = dec(focus);
+        else if (where == DIR_DOWN)
+            focus = min_size(focus + 1, focus_count() - 1);
+        else if (where == DIR_LEFT && focus == 3)
+            focus = 2;
+        else if (where == DIR_RIGHT && focus == 2)
+            focus = 3;
         break;
     case SCREEN_GRID:
         move_grid(where);
@@ -1579,7 +1882,12 @@ static void navigate(uint32_t code)
     case 106: move(DIR_RIGHT); break;
     case 28:
     case 96:
-    case 352: activate(); break;
+    case 352:
+        if (sidebar_open)
+            activate_sidebar();
+        else
+            activate();
+        break;
     default: break;
     }
 }
@@ -1667,6 +1975,9 @@ static void on_event(const jf_event *event)
             home_scroll += delta;
             home_reveal = false;
             break;
+        case SCREEN_CATEGORIES:
+            category_scroll += delta;
+            break;
         case SCREEN_GRID:
             grid_scroll += delta;
             break;
@@ -1701,16 +2012,11 @@ static bool hovered(loom_rect rect)
 static void draw_heading_and_status(loom_context *ctx, float width, float height, float scale)
 {
     const float margin = 64 * scale;
-    const char *heading = screen == SCREEN_SERVER  ? "Choose a server"
-                          : screen == SCREEN_AUTH  ? "Sign in"
-                          : screen == SCREEN_QUICK ? "Quick Connect"
-                                                   : "";
+    const char *heading = screen == SCREEN_QUICK ? "Quick Connect" : "";
     if (heading[0] != '\0')
         loom_label(ctx, (loom_rect){margin, 40 * scale, width - margin * 2, 50 * scale}, NULL,
                    heading, TEXT, 32 * scale);
-    if (status_text[0] != '\0' &&
-        (status_error || screen == SCREEN_SERVER || screen == SCREEN_AUTH ||
-         screen == SCREEN_QUICK))
+    if (status_text[0] != '\0' && status_error)
         loom_label(ctx, (loom_rect){margin, height - 46 * scale, width - margin * 2, 32 * scale},
                    NULL, status_text, status_error ? RED : DIM, 19 * scale);
 }
@@ -1732,14 +2038,29 @@ static void draw_button(loom_context *ctx, loom_rect rect, const char *label, si
     }
 }
 
+static void draw_action_button(loom_context *ctx, loom_rect rect, const char *label, size_t index,
+                               float scale)
+{
+    const bool hot = hovered(rect);
+    loom_fill(ctx, rect, NULL, hot ? SELECTED : ACCENT, 12 * scale);
+    loom_stroke(ctx, rect, NULL, focus == index ? WHITE : ACCENT,
+                focus == index ? 4 * scale : 2 * scale, 12 * scale);
+    loom_label(ctx,
+               (loom_rect){rect.x + 24 * scale, rect.y + (rect.h - 30 * scale) / 2,
+                           rect.w - 48 * scale, 38 * scale},
+               &rect, label, WHITE, 25 * scale);
+    if (hot && pointer_press) {
+        focus = index;
+        activate();
+    }
+}
+
 static void draw_field(loom_context *ctx, loom_rect rect, const char *label, edit_field which,
                        size_t index, float scale)
 {
     const bool hot = hovered(rect);
     const bool editing = active_field == which;
     const bool lit = focus == index || editing;
-    loom_label(ctx, (loom_rect){rect.x, rect.y - 36 * scale, rect.w, 30 * scale}, NULL, label,
-               DIM, 20 * scale);
     loom_fill(ctx, rect, NULL, editing ? SELECTED : hot ? HOT : CARD, 10 * scale);
     loom_stroke(ctx, rect, NULL, lit ? ACCENT : BORDER, lit ? 4 * scale : 2 * scale, 10 * scale);
 
@@ -1756,7 +2077,7 @@ static void draw_field(loom_context *ctx, loom_rect rect, const char *label, edi
     loom_label(ctx,
                (loom_rect){rect.x + 22 * scale, rect.y + 17 * scale, rect.w - 44 * scale,
                            38 * scale},
-               &rect, empty ? "Press OK to type" : contents, empty ? DIM : TEXT, 24 * scale);
+               &rect, empty ? label : contents, empty ? DIM : TEXT, 24 * scale);
     if (hot && pointer_press) {
         focus = index;
         begin_edit(which, rect);
@@ -1846,18 +2167,17 @@ static bool draw_card(loom_context *ctx, loom_rect rect, loom_rect clip, const c
         loom_textured(ctx, art, &clip, slot->texture, uv, WHITE, 10 * scale);
     } else {
         loom_fill(ctx, art, &clip, hot ? HOT : CARD, 10 * scale);
-        const loom_rect inner = loom_intersect(art, clip);
-        loom_label(ctx,
-                   (loom_rect){art.x + 14 * scale, art.y + art.h / 2 - 16 * scale,
-                               art.w - 28 * scale, 32 * scale},
-                   &inner, source->present ? source->title : "", DIM, 19 * scale);
+        if (artwork_loading(source->poster_id, source->poster_tag, JF_IMAGE_PRIMARY, POSTER_W,
+                            POSTER_H))
+            draw_spinner(ctx, art.x + art.w / 2, art.y + art.h / 2, 18 * scale, &clip, scale);
     }
     if (focused)
         loom_stroke(ctx, loom_inset(art, -4 * scale), &clip, ACCENT, 4 * scale, 12 * scale);
     draw_watch_badge(ctx, art, clip, source, scale);
 
     if (source->progress > 1) {
-        const loom_rect bar = {art.x, art.y + art.h - 8 * scale, art.w, 6 * scale};
+        const loom_rect bar = {art.x + 5 * scale, art.y + art.h - 10 * scale,
+                               art.w - 10 * scale, 6 * scale};
         loom_fill(ctx, bar, &clip, BORDER, 3 * scale);
         loom_fill(ctx,
                   (loom_rect){bar.x, bar.y, bar.w * minf(source->progress, 100) / 100, bar.h},
@@ -1939,52 +2259,56 @@ static void draw_wrapped(loom_context *ctx, loom_rect rect, const char *text, fl
 
 static void draw_server(loom_context *ctx, float width, float scale)
 {
-    const loom_rect panel = {270 * scale, 150 * scale, width - 540 * scale, 800 * scale};
+    const loom_rect panel = {390 * scale, 80 * scale, width - 780 * scale, 920 * scale};
     loom_fill(ctx, panel, NULL, PANEL, 18 * scale);
     loom_stroke(ctx, panel, NULL, BORDER, 2 * scale, 18 * scale);
     const float x = panel.x + 54 * scale;
     const float w = panel.w - 108 * scale;
-    loom_label(ctx, (loom_rect){x, panel.y + 34 * scale, w, 44 * scale}, &panel,
-               discovering ? "Searching the network..." : "Discovered on this network", TEXT,
-               28 * scale);
+    url_rect = (loom_rect){x, panel.y + 48 * scale, w, 70 * scale};
+    draw_field(ctx, url_rect, "Server URL", EDIT_URL, 0, scale);
+    draw_action_button(ctx, (loom_rect){x, panel.y + 142 * scale, w, 70 * scale}, "Connect",
+                       1, scale);
 
-    float y = panel.y + 92 * scale;
+    float y = panel.y + 236 * scale;
     for (size_t index = 0; index < discovered_count; index++) {
-        const loom_rect rect = {x, y, w, 92 * scale};
+        const loom_rect rect = {x, y, w, 70 * scale};
         const bool hot = hovered(rect);
         loom_fill(ctx, rect, &panel, hot ? HOT : CARD, 13 * scale);
-        loom_stroke(ctx, rect, &panel, focus == index ? ACCENT : BORDER,
-                    focus == index ? 4 * scale : 2 * scale, 13 * scale);
+        loom_stroke(ctx, rect, &panel, focus == index + 2 ? ACCENT : BORDER,
+                    focus == index + 2 ? 4 * scale : 2 * scale, 13 * scale);
         loom_fill(ctx,
-                  (loom_rect){rect.x + 22 * scale, rect.y + 24 * scale, 44 * scale, 44 * scale},
+                  (loom_rect){rect.x + 18 * scale, rect.y + 14 * scale, 40 * scale, 40 * scale},
                   &rect, ACCENT, 22 * scale);
         loom_label(ctx,
-                   (loom_rect){rect.x + 90 * scale, rect.y + 14 * scale, w - 120 * scale,
-                               36 * scale},
+                   (loom_rect){rect.x + 78 * scale, rect.y + 7 * scale, w - 96 * scale,
+                               30 * scale},
                    &rect, discovered[index].name, TEXT, 26 * scale);
         loom_label(ctx,
-                   (loom_rect){rect.x + 90 * scale, rect.y + 52 * scale, w - 120 * scale,
-                               30 * scale},
+                   (loom_rect){rect.x + 78 * scale, rect.y + 38 * scale, w - 96 * scale,
+                               24 * scale},
                    &rect, discovered[index].address, DIM, 20 * scale);
         if (hot && pointer_press) {
-            focus = index;
+            focus = index + 2;
             activate();
         }
-        y += 104 * scale;
+        y += 80 * scale;
     }
-    if (discovered_count == 0)
-        loom_label(ctx, (loom_rect){x, y + 10 * scale, w, 34 * scale}, &panel,
-                   discovering ? "..." : "Nothing found yet.", DIM, 21 * scale);
-
-    y = panel.y + 470 * scale;
-    loom_label(ctx, (loom_rect){x, y - 86 * scale, w, 34 * scale}, &panel,
-               "or enter a server address", DIM, 22 * scale);
-    url_rect = (loom_rect){x, y, w, 70 * scale};
-    draw_field(ctx, url_rect, "Server URL", EDIT_URL, discovered_count, scale);
-    draw_button(ctx, (loom_rect){x, y + 110 * scale, 300 * scale, 70 * scale}, "Connect",
-                discovered_count + 1, scale);
-    draw_button(ctx, (loom_rect){x + 330 * scale, y + 110 * scale, 300 * scale, 70 * scale},
-                "Search again", discovered_count + 2, scale);
+    draw_button(ctx, (loom_rect){x, y + 8 * scale, w, 62 * scale}, "Search again",
+                discovered_count + 2, scale);
+    if (discovering || connecting)
+        draw_spinner(ctx, panel.x + panel.w - 46 * scale, panel.y + panel.h - 46 * scale,
+                     18 * scale, &panel, scale);
+    if (connecting) {
+        const loom_rect modal = {width / 2 - 190 * scale, 440 * scale, 380 * scale,
+                                 150 * scale};
+        loom_fill(ctx, modal, NULL, CARD, 16 * scale);
+        loom_stroke(ctx, modal, NULL, ACCENT, 2 * scale, 16 * scale);
+        draw_spinner(ctx, modal.x + 48 * scale, modal.y + modal.h / 2, 16 * scale, &modal,
+                     scale);
+        loom_label(ctx, (loom_rect){modal.x + 90 * scale, modal.y + 54 * scale,
+                                    modal.w - 116 * scale, 42 * scale},
+                   &modal, "Connecting...", TEXT, 26 * scale);
+    }
 }
 
 static void draw_auth(loom_context *ctx, float width, float scale)
@@ -1994,18 +2318,20 @@ static void draw_auth(loom_context *ctx, float width, float scale)
     loom_stroke(ctx, panel, NULL, BORDER, 2 * scale, 18 * scale);
     const float x = panel.x + 64 * scale;
     const float w = panel.w - 128 * scale;
-    loom_label(ctx, (loom_rect){x, panel.y + 42 * scale, w, 40 * scale}, &panel, session.url,
-               TEXT, 26 * scale);
+    loom_label(ctx, (loom_rect){x, panel.y + 38 * scale, w, 50 * scale}, &panel, server_name,
+               TEXT, 34 * scale);
+    loom_label(ctx, (loom_rect){x, panel.y + 92 * scale, w, 32 * scale}, &panel, session.url,
+               DIM, 20 * scale);
     username_rect = (loom_rect){x, panel.y + 180 * scale, w, 70 * scale};
     password_rect = (loom_rect){x, panel.y + 320 * scale, w, 70 * scale};
     draw_field(ctx, username_rect, "Username", EDIT_USERNAME, 0, scale);
     draw_field(ctx, password_rect, "Password", EDIT_PASSWORD, 1, scale);
-    draw_button(ctx, (loom_rect){x, panel.y + 450 * scale, 280 * scale, 72 * scale}, "Sign in",
-                2, scale);
-    draw_button(ctx, (loom_rect){x + 310 * scale, panel.y + 450 * scale, 330 * scale, 72 * scale},
-                "Quick Connect", 3, scale);
-    loom_label(ctx, (loom_rect){x, panel.y + 570 * scale, w, 34 * scale}, &panel,
-               "The access token is stored on this device, not the password.", DIM, 19 * scale);
+    draw_action_button(ctx, (loom_rect){x, panel.y + 450 * scale, 280 * scale, 72 * scale},
+                       "Sign in", 2, scale);
+    draw_action_button(ctx,
+                       (loom_rect){x + 310 * scale, panel.y + 450 * scale, 330 * scale,
+                                   72 * scale},
+                       "Quick Connect", 3, scale);
 }
 
 static void draw_quick(loom_context *ctx, float width, float scale)
@@ -2052,8 +2378,12 @@ static void draw_row(loom_context *ctx, const item_row *row, size_t id, float to
     const loom_rect strip = {margin, top + 46 * scale, width - margin * 2, card_h};
 
     if (row->count == 0) {
-        loom_label(ctx, (loom_rect){margin, strip.y + 30 * scale, 700 * scale, 32 * scale},
-                   &clip, row->loading ? "Loading..." : "Nothing here", DIM, 20 * scale);
+        if (row->loading)
+            draw_spinner(ctx, strip.x + 30 * scale, strip.y + 30 * scale, 14 * scale, &clip,
+                         scale);
+        else
+            loom_label(ctx, (loom_rect){margin, strip.y + 30 * scale, 700 * scale, 32 * scale},
+                       &clip, "Nothing here", DIM, 20 * scale);
         return;
     }
 
@@ -2079,6 +2409,10 @@ static void draw_row(loom_context *ctx, const item_row *row, size_t id, float to
 
 static void draw_home(loom_context *ctx, float width, float height, float scale)
 {
+    if (rows[ROW_LIBRARIES].loading) {
+        draw_spinner(ctx, width / 2, height / 2, 26 * scale, NULL, scale);
+        return;
+    }
     home_row_height = 470 * scale;
     home_rect = (loom_rect){0, 64 * scale, width, height - 128 * scale};
     loom_virtual_list list =
@@ -2092,6 +2426,77 @@ static void draw_home(loom_context *ctx, float width, float height, float scale)
     for (size_t id = 0; id < ROW_COUNT; id++)
         draw_row(ctx, &rows[id], id, loom_virtual_list_item(&list, id).y, width, ctx->viewport,
                  scale);
+    const float max_scroll = loom_virtual_list_max_scroll(&list);
+    const float fade = 72 * scale;
+    for (unsigned step = 0; step < 8; step++) {
+        const uint8_t alpha = (uint8_t)((8 - step) * 200 / 8);
+        loom_color shade = {BG[0], BG[1], BG[2], alpha};
+        if (list.scroll > 0)
+            loom_fill(ctx, (loom_rect){home_rect.x, home_rect.y + step * fade / 8, home_rect.w,
+                                       fade / 8 + 1},
+                      &home_rect, shade, 0);
+        if (list.scroll < max_scroll)
+            loom_fill(ctx, (loom_rect){home_rect.x, home_rect.y + home_rect.h - (step + 1) * fade / 8,
+                                       home_rect.w, fade / 8 + 1},
+                      &home_rect, shade, 0);
+    }
+}
+
+static void draw_categories(loom_context *ctx, float width, float height, float scale)
+{
+    const item_row *categories = &categories_row;
+    loom_label(ctx, (loom_rect){64 * scale, 42 * scale, width - 128 * scale, 48 * scale}, NULL,
+               "All categories", TEXT, 32 * scale);
+    if (categories->loading) {
+        draw_spinner(ctx, width / 2, height / 2, 24 * scale, NULL, scale);
+        return;
+    }
+    if (categories->count == 0) {
+        loom_label(ctx, (loom_rect){64 * scale, 140 * scale, width - 128 * scale, 36 * scale},
+                   NULL, "No categories", DIM, 23 * scale);
+        return;
+    }
+    category_rect = (loom_rect){64 * scale, 118 * scale, width - 128 * scale, height - 182 * scale};
+    const float row_height = 102 * scale;
+    loom_virtual_list list =
+        loom_virtual_list_init(category_rect, categories->count, row_height, category_scroll);
+    list = loom_virtual_list_init(category_rect, categories->count, row_height,
+                                  loom_virtual_list_reveal(&list, category_selected));
+    category_scroll = list.scroll;
+    const loom_rect clip = category_rect;
+    for (size_t index = list.first; index < list.last; index++) {
+        const loom_rect raw = loom_virtual_list_item(&list, index);
+        const loom_rect row = {raw.x, raw.y + 6 * scale, raw.w, raw.h - 12 * scale};
+        const bool focused = index == category_selected;
+        const bool hot = hovered(row);
+        loom_fill(ctx, row, &clip, hot ? HOT : CARD, 12 * scale);
+        loom_stroke(ctx, row, &clip, focused ? ACCENT : BORDER, focused ? 4 * scale : 2 * scale,
+                    12 * scale);
+        loom_label(ctx, (loom_rect){row.x + 28 * scale, row.y + 18 * scale, row.w - 56 * scale,
+                                    34 * scale},
+                   &clip, categories->cards[index].title, TEXT, 26 * scale);
+        loom_label(ctx, (loom_rect){row.x + 28 * scale, row.y + 52 * scale, row.w - 56 * scale,
+                                    24 * scale},
+                   &clip, categories->cards[index].subtitle, DIM, 18 * scale);
+        if (hot && pointer_press) {
+            category_selected = index;
+            activate();
+            return;
+        }
+    }
+    const float max_scroll = loom_virtual_list_max_scroll(&list);
+    const float fade = 60 * scale;
+    for (unsigned step = 0; step < 8; step++) {
+        const uint8_t alpha = (uint8_t)((8 - step) * 200 / 8);
+        loom_color shade = {BG[0], BG[1], BG[2], alpha};
+        if (list.scroll > 0)
+            loom_fill(ctx, (loom_rect){clip.x, clip.y + step * fade / 8, clip.w, fade / 8 + 1},
+                      &clip, shade, 0);
+        if (list.scroll < max_scroll)
+            loom_fill(ctx, (loom_rect){clip.x, clip.y + clip.h - (step + 1) * fade / 8, clip.w,
+                                       fade / 8 + 1},
+                      &clip, shade, 0);
+    }
 }
 
 static void draw_grid(loom_context *ctx, float width, float height, float scale)
@@ -2108,8 +2513,11 @@ static void draw_grid(loom_context *ctx, float width, float height, float scale)
     if (grid_total == 0) {
         loom_label(ctx, (loom_rect){margin, 40 * scale, width - margin * 2, 50 * scale}, NULL,
                    grid_title, TEXT, 32 * scale);
-        loom_label(ctx, (loom_rect){margin, grid_rect.y + 40 * scale, 800 * scale, 36 * scale},
-                   NULL, "Loading library...", DIM, 24 * scale);
+        if (grid_loading)
+            draw_spinner(ctx, width / 2, height / 2, 24 * scale, NULL, scale);
+        else
+            loom_label(ctx, (loom_rect){margin, grid_rect.y + 40 * scale, 800 * scale, 36 * scale},
+                       NULL, "Nothing here", DIM, 24 * scale);
         return;
     }
 
@@ -2170,10 +2578,9 @@ static void draw_details(loom_context *ctx, float width, float scale)
         loom_textured(ctx, art, NULL, slot->texture, uv, WHITE, 16 * scale);
     } else {
         loom_fill(ctx, art, NULL, CARD, 16 * scale);
-        loom_label(ctx,
-                   (loom_rect){art.x + 20 * scale, art.y + art.h / 2, art.w - 40 * scale,
-                               32 * scale},
-                   &art, "No artwork", DIM, 20 * scale);
+        if (artwork_loading(detail.poster_id, detail.poster_tag, JF_IMAGE_PRIMARY, POSTER_W,
+                            POSTER_H))
+            draw_spinner(ctx, art.x + art.w / 2, art.y + art.h / 2, 20 * scale, &art, scale);
     }
     draw_watch_badge(ctx, art, ctx->viewport, &detail, scale);
 
@@ -2229,6 +2636,9 @@ static void draw_season(loom_context *ctx, float width, float height, float scal
         loom_textured(ctx, art, NULL, slot->texture, uv, WHITE, 12 * scale);
     } else {
         loom_fill(ctx, art, NULL, CARD, 12 * scale);
+        if (artwork_loading(season_detail.poster_id, season_detail.poster_tag, JF_IMAGE_PRIMARY,
+                            POSTER_W, POSTER_H))
+            draw_spinner(ctx, art.x + art.w / 2, art.y + art.h / 2, 20 * scale, &art, scale);
     }
     draw_watch_badge(ctx, art, ctx->viewport, &season_detail, scale);
 
@@ -2290,6 +2700,10 @@ static void draw_season(loom_context *ctx, float width, float height, float scal
             loom_textured(ctx, thumb, &clip, still->texture, uv, WHITE, 7 * scale);
         } else {
             loom_fill(ctx, thumb, &clip, CARD, 7 * scale);
+            if (artwork_loading(source->id, source->thumbnail_tag, JF_IMAGE_PRIMARY, 384,
+                                216))
+                draw_spinner(ctx, thumb.x + thumb.w / 2, thumb.y + thumb.h / 2, 13 * scale,
+                             &clip, scale);
         }
         draw_watch_badge(ctx, thumb, clip, source, scale);
 
@@ -2300,7 +2714,8 @@ static void draw_season(loom_context *ctx, float width, float height, float scal
         draw_metadata(ctx, (loom_rect){text_x, row.y + 90 * scale, text_w, 32 * scale}, &clip,
                       source->runtime, source->rating, 21 * scale, TEXT);
         if (source->progress > 1) {
-            const loom_rect bar = {thumb.x, thumb.y + thumb.h - 5 * scale, thumb.w, 5 * scale};
+            const loom_rect bar = {thumb.x + 4 * scale, thumb.y + thumb.h - 7 * scale,
+                                   thumb.w - 8 * scale, 5 * scale};
             loom_fill(ctx,
                       (loom_rect){bar.x, bar.y, bar.w * minf(source->progress, 100) / 100, bar.h},
                       &clip, ACCENT, 2 * scale);
@@ -2310,6 +2725,20 @@ static void draw_season(loom_context *ctx, float width, float height, float scal
             activate();
             return;
         }
+    }
+    const float max_scroll = loom_virtual_list_max_scroll(&list);
+    const float fade = 54 * scale;
+    for (unsigned step = 0; step < 8; step++) {
+        const uint8_t alpha = (uint8_t)((8 - step) * 200 / 8);
+        loom_color shade = {BG[0], BG[1], BG[2], alpha};
+        if (list.scroll > 0)
+            loom_fill(ctx, (loom_rect){content.x, content.y + step * fade / 8, content.w,
+                                       fade / 8 + 1},
+                      &content, shade, 0);
+        if (list.scroll < max_scroll)
+            loom_fill(ctx, (loom_rect){content.x, content.y + content.h - (step + 1) * fade / 8,
+                                       content.w, fade / 8 + 1},
+                      &content, shade, 0);
     }
 }
 
@@ -2353,6 +2782,42 @@ static void draw_playback(loom_context *ctx, float width, float height, float sc
     }
 }
 
+static void draw_settings(loom_context *ctx, float width, float scale)
+{
+    const loom_rect panel = {560 * scale, 260 * scale, width - 1120 * scale, 320 * scale};
+    loom_fill(ctx, panel, NULL, PANEL, 18 * scale);
+    loom_stroke(ctx, panel, NULL, BORDER, 2 * scale, 18 * scale);
+    loom_label(ctx, (loom_rect){panel.x + 48 * scale, panel.y + 42 * scale,
+                                panel.w - 96 * scale, 44 * scale},
+               &panel, "Settings", TEXT, 32 * scale);
+    draw_button(ctx, (loom_rect){panel.x + 48 * scale, panel.y + 126 * scale,
+                                 panel.w - 96 * scale, 72 * scale},
+                "Sign out", 0, scale);
+}
+
+static void draw_sidebar(loom_context *ctx, float height, float scale)
+{
+    const loom_rect panel = {0, 0, 354 * scale, height};
+    loom_fill(ctx, panel, NULL, PANEL, 0);
+    loom_stroke(ctx, panel, NULL, BORDER, 2 * scale, 0);
+    static const char *const entries[] = {"All categories", "Settings"};
+    for (size_t index = 0; index < sizeof(entries) / sizeof(entries[0]); index++) {
+        const loom_rect row = {26 * scale, (100 + index * 82) * scale,
+                               panel.w - 52 * scale, 62 * scale};
+        const bool hot = hovered(row);
+        loom_fill(ctx, row, &panel, hot ? HOT : CARD, 10 * scale);
+        loom_stroke(ctx, row, &panel, sidebar_focus == index ? ACCENT : BORDER,
+                    sidebar_focus == index ? 3 * scale : 1 * scale, 10 * scale);
+        loom_label(ctx, (loom_rect){row.x + 22 * scale, row.y + 16 * scale,
+                                    row.w - 44 * scale, 32 * scale},
+                   &row, entries[index], TEXT, 22 * scale);
+        if (hot && pointer_press) {
+            sidebar_focus = index;
+            activate_sidebar();
+        }
+    }
+}
+
 static void build_ui(loom_context *ctx)
 {
     const float width = (float)gl_width;
@@ -2376,8 +2841,18 @@ static void build_ui(loom_context *ctx)
             static const loom_color scrim = {5, 9, 16, 185};
             float uv[4];
             cover_uv(slot, background, uv);
-            loom_textured(ctx, background, NULL, slot->texture, uv, WHITE, 0);
+            loom_color tint = {255, 255, 255, 255};
+            if (slot->loaded_at != 0) {
+                const uint64_t elapsed = now_ns() - slot->loaded_at;
+                tint[3] = (uint8_t)min_size(255, elapsed * 255 / 250000000ull);
+                if (tint[3] != 255)
+                    jf_window_frame_requested = true;
+            }
+            loom_textured(ctx, background, NULL, slot->texture, uv, tint, 0);
             loom_fill(ctx, background, NULL, scrim, 0);
+        } else if (artwork_loading(detail.backdrop_id, detail.backdrop_tag, JF_IMAGE_BACKDROP,
+                                   1920, 1080)) {
+            draw_spinner(ctx, width / 2, height / 2, 26 * scale, NULL, scale);
         }
     }
     draw_heading_and_status(ctx, width, height, scale);
@@ -2386,11 +2861,15 @@ static void build_ui(loom_context *ctx)
     case SCREEN_AUTH: draw_auth(ctx, width, scale); break;
     case SCREEN_QUICK: draw_quick(ctx, width, scale); break;
     case SCREEN_HOME: draw_home(ctx, width, height, scale); break;
+    case SCREEN_CATEGORIES: draw_categories(ctx, width, height, scale); break;
     case SCREEN_GRID: draw_grid(ctx, width, height, scale); break;
     case SCREEN_DETAILS: draw_details(ctx, width, scale); break;
     case SCREEN_SEASON: draw_season(ctx, width, height, scale); break;
     case SCREEN_PLAYBACK: draw_playback(ctx, width, height, scale); break;
+    case SCREEN_SETTINGS: draw_settings(ctx, width, scale); break;
     }
+    if (sidebar_open)
+        draw_sidebar(ctx, height, scale);
     /* Pointer activation happens during layout; rebuild its resulting screen. */
     if (pointer_press)
         jf_window_frame_requested = true;
@@ -2579,6 +3058,7 @@ int main(void)
 {
     for (size_t i = 0; i < ROW_COUNT; i++)
         rows[i].cards = home_cards[i];
+    categories_row.cards = category_cards;
     seasons_row.cards = seasons_cards;
     episodes_row.cards = episodes_cards;
 
@@ -2589,6 +3069,10 @@ int main(void)
      * nobody is reading. */
     load_debug_env();
     const bool restored = jf_session_load(&session);
+    if (session.url[0] != '\0') {
+        set_text(server_url, sizeof(server_url), session.url);
+        set_text(server_name, sizeof(server_name), session.url);
+    }
 
     jf_window_set_handler(on_event);
     const char *appid = getenv("APPID");
@@ -2630,6 +3114,7 @@ int main(void)
         if (address != NULL) {
             set_text(server_url, sizeof(server_url), address);
             set_text(session.url, sizeof(session.url), address);
+            set_text(server_name, sizeof(server_name), address);
             jf_fetcher_set_session(&fetcher, &session);
         }
         const char *user = getenv("JELLYFIN_USER");
@@ -2638,8 +3123,11 @@ int main(void)
         const char *secret = getenv("JELLYFIN_PASSWORD");
         if (secret != NULL)
             set_text(password, sizeof(password), secret);
-        discovering = true;
-        simple(JF_JOB_DISCOVER);
+        if (session.url[0] != '\0') {
+            screen = SCREEN_AUTH;
+        } else {
+            restart_discovery();
+        }
     }
 
     const char *capture_path = getenv("UI_CAPTURE");
