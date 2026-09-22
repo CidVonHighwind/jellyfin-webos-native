@@ -2258,13 +2258,16 @@ static void draw_row(loom_context *ctx, const item_row *row, size_t id, float to
         return;
     }
 
-    /* Keep the focused card on screen by shifting the whole strip left. */
+    /* Keep one prior poster partly onscreen once a row has moved right. The carousel then
+     * visibly continues through the left screen edge instead of snapping to the content
+     * margin, where the viewport fade can correctly consume it. */
     size_t visible = (size_t)(strip.w / (card_w + gap));
     if (visible < 1)
         visible = 1;
-    const size_t first = col_focus[id] >= visible ? col_focus[id] - visible + 1 : 0;
+    const size_t first = col_focus[id] > 0 ? col_focus[id] - 1 : 0;
+    const float leading_peek = col_focus[id] > 0 ? (card_w + gap) * 0.62f : 0;
     for (size_t index = first; index < row->count; index++) {
-        const float x = strip.x + (float)(index - first) * (card_w + gap);
+        const float x = strip.x - leading_peek + (float)(index - first) * (card_w + gap);
         if (x >= width)
             break;
         const loom_rect rect = {x, strip.y, card_w, card_h};
