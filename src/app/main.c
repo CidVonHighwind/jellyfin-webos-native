@@ -404,11 +404,9 @@ static card card_from(const jf_item *item)
     out.played = jf_item_finished(item);
     const char *type = item->type != NULL ? item->type : "";
 
-    if (strcmp(type, "Season") == 0) {
-        out.has_remaining = true;
-        out.remaining = out.played ? 0
-                        : item->has_unplayed_item_count ? item->unplayed_item_count
-                                                        : item->child_count;
+    if (strcmp(type, "Season") == 0 || strcmp(type, "Series") == 0) {
+        out.has_remaining = item->has_unplayed_item_count;
+        out.remaining = out.played ? 0 : item->unplayed_item_count;
     }
     set_text(out.id, sizeof(out.id), item->id);
     set_text(out.poster_id, sizeof(out.poster_id), jf_item_poster_id(item));
@@ -459,15 +457,6 @@ static size_t first_unfinished(const card *cards, size_t count)
         if (!cards[i].played)
             return i;
     return 0;
-}
-
-static uint32_t unfinished_seasons(const jf_item *items, size_t count)
-{
-    uint32_t total = 0;
-    for (size_t i = 0; i < count; i++)
-        if (!jf_item_finished(&items[i]))
-            total++;
-    return total;
 }
 
 /* ---------------------------------------------------------------- app state */
@@ -667,19 +656,6 @@ static void set_error(const char *pattern, ...)
     va_end(args);
     status_error = true;
 }
-
-/* Series UserData counts episodes, so fetch seasons to count unfinished seasons. */
-typedef struct {
-    char id[40];
-    uint32_t count;
-    bool have_count;
-    bool loading;
-    uint64_t used;
-    bool failed;
-} series_status_entry;
-
-static series_status_entry series_status[128];
-static unsigned status_requests;
 
 /* --------------------------------------------------------------- requests */
 
@@ -896,52 +872,6 @@ static void pop(void)
     }
 }
 
-/* How many seasons of this show are unwatched, fetching that count if it is not known
- * yet. NULL while it is still on its way. */
-static const uint32_t *remaining_seasons(const card *source)
-{
-    static uint32_t zero = 0;
-    if (source->played)
-        return &zero;
-    if (strcmp(source->id, detail.id) == 0 && !seasons_row.loading &&
-        (screen == SCREEN_DETAILS || screen == SCREEN_SEASON)) {
-        static uint32_t live;
-        live = 0;
-        for (size_t i = 0; i < seasons_row.count; i++)
-            if (!seasons_row.cards[i].played)
-                live++;
-        return &live;
-    }
-    size_t victim = 0;
-    uint64_t oldest = UINT64_MAX;
-    for (size_t i = 0; i < sizeof(series_status) / sizeof(series_status[0]); i++) {
-        series_status_entry *entry = &series_status[i];
-        if (strcmp(entry->id, source->id) == 0) {
-            entry->used = frame_index;
-            return entry->have_count ? &entry->count : NULL;
-        }
-        if (!entry->loading && entry->used < oldest) {
-            oldest = entry->used;
-            victim = i;
-        }
-    }
-    /* Leave task slots available for opening a show or season while scrolling. */
-    if (status_requests >= 2 || oldest == UINT64_MAX || jf_fetcher_pending(&fetcher) >= 24)
-        return NULL;
-    jf_task *task = request(JF_JOB_SEASON_STATUS, (uint32_t)victim);
-    if (task == NULL)
-        return NULL;
-    series_status_entry *entry = &series_status[victim];
-    memset(entry, 0, sizeof(*entry));
-    entry->loading = true;
-    entry->used = frame_index;
-    set_text(entry->id, sizeof(entry->id), source->id);
-    set_text(task->a, sizeof(task->a), source->id);
-    jf_fetcher_start(&fetcher, task);
-    status_requests++;
-    return NULL;
-}
-
 /* ------------------------------------------------------------ sign-in flow */
 
 /* Re-authentications attempted since the last success. Bounded, or a server that rejects
@@ -1000,7 +930,6 @@ static bool reauthenticate(void)
 
 static void sign_out(void)
 {
-    memset(series_status, 0, sizeof(series_status));
     auth_generation++;
     session.token[0] = '\0';
     session.user_id[0] = '\0';
@@ -1038,7 +967,6 @@ static const char *job_name(jf_job job)
     case JF_JOB_CHILDREN: return "children";
     case JF_JOB_ITEM: return "item";
     case JF_JOB_SEASONS: return "seasons";
-    case JF_JOB_SEASON_STATUS: return "season_status";
     case JF_JOB_EPISODES: return "episodes";
     case JF_JOB_POSTER: return "poster";
     case JF_JOB_PLAYBACK_STARTED: return "playback_started";
@@ -1057,14 +985,6 @@ static void on_failure(jf_task *task)
     case JF_JOB_POSTER:
         slots[task->tag].loading = false;
         break;
-    case JF_JOB_SEASON_STATUS: {
-        series_status_entry *entry = &series_status[task->tag];
-        if (strcmp(entry->id, task->a) == 0) {
-            entry->loading = false;
-            entry->failed = true;
-        }
-        break;
-    }
     case JF_JOB_DISCOVER:
         set_error("Discovery failed: %s", task->error);
         discovering = false;
@@ -1262,22 +1182,7 @@ static void consume(jf_task *task)
             focus = first_unfinished(seasons_row.cards, seasons_row.count);
             select_unfinished_season = false;
         }
-        for (size_t i = 0; i < sizeof(series_status) / sizeof(series_status[0]); i++)
-            if (strcmp(series_status[i].id, task->a) == 0) {
-                series_status[i].count = unfinished_seasons(task->list.items, task->list.count);
-                series_status[i].have_count = true;
-            }
         break;
-
-    case JF_JOB_SEASON_STATUS: {
-        series_status_entry *entry = &series_status[task->tag];
-        if (strcmp(task->a, entry->id) != 0)
-            return;
-        entry->count = unfinished_seasons(task->list.items, task->list.count);
-        entry->have_count = true;
-        entry->loading = false;
-        break;
-    }
 
     case JF_JOB_EPISODES:
         if (strcmp(task->b, season_detail.id) != 0)
@@ -2126,14 +2031,7 @@ static void draw_watch_badge(loom_context *ctx, loom_rect art, loom_rect clip, c
         return;
     uint32_t count = 0;
     if (!episode) {
-        if (card_is(source, "Series")) {
-            const uint32_t *remaining = remaining_seasons(source);
-            if (remaining == NULL)
-                return;
-            count = *remaining;
-        } else {
-            count = source->has_remaining ? source->remaining : 0;
-        }
+        count = source->has_remaining ? source->remaining : 0;
         if (count == 0)
             return;
     }
@@ -2825,7 +2723,6 @@ static void build_ui(loom_context *ctx)
     const float scale = minf(width / 1920.0f, height / 1080.0f);
     scratch_used = 0;
     poster_requests = 0;
-    status_requests = 0;
     frame_index++;
 
     loom_begin(ctx, width, height);

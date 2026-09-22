@@ -737,8 +737,7 @@ static http_result execute(CURL *curl, const jf_session *session, jf_task *task)
         return HTTP_OK;
     }
 
-    case JF_JOB_SEASONS:
-    case JF_JOB_SEASON_STATUS: {
+    case JF_JOB_SEASONS: {
         char series[256];
         jf_url_escape(series, sizeof(series), task->a);
         snprintf(url, sizeof(url),
