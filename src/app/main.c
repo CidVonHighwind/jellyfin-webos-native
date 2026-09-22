@@ -2258,13 +2258,14 @@ static void draw_row(loom_context *ctx, const item_row *row, size_t id, float to
         return;
     }
 
-    /* Keep the focused poster under the same cursor position. Once a row moves right, its
-     * predecessor starts one complete slot to the left and exits through the viewport fade. */
+    /* The cursor moves across the fully visible cards first. Only when it reaches the last
+     * full slot does the strip translate: one predecessor then starts beyond the left edge
+     * and exits through the viewport fade. */
     size_t visible = (size_t)(strip.w / (card_w + gap));
     if (visible < 1)
         visible = 1;
-    const size_t first = col_focus[id] > 0 ? col_focus[id] - 1 : 0;
-    const float leading_offset = col_focus[id] > 0 ? card_w + gap : 0;
+    const size_t first = col_focus[id] >= visible ? col_focus[id] - visible : 0;
+    const float leading_offset = col_focus[id] >= visible ? card_w + gap : 0;
     for (size_t index = first; index < row->count; index++) {
         const float x = strip.x - leading_offset + (float)(index - first) * (card_w + gap);
         if (x >= width)
@@ -2280,7 +2281,7 @@ static void draw_row(loom_context *ctx, const item_row *row, size_t id, float to
     }
     static const loom_color fade = {9, 13, 22, 255};
     const float fade_width = 86 * scale;
-    if (col_focus[id] > 0)
+    if (col_focus[id] >= visible)
         loom_fade(ctx, (loom_rect){0, strip.y, fade_width, strip.h}, &ctx->viewport, fade,
                   LOOM_FADE_LEFT);
     if (first + visible < row->count)
