@@ -122,7 +122,6 @@ typedef struct {
     uint32_t requested_width, requested_height;
     uint32_t texture;
     uint32_t width, height;
-    uint64_t loaded_at;
     /* Frame this slot was last asked for. 0 means never. */
     uint64_t used;
     bool loading;
@@ -210,7 +209,6 @@ static const poster_slot *artwork(const char *id, const char *tag, jf_image_kind
             victim->width = image.width;
             victim->height = image.height;
             victim->used = frame_index;
-            victim->loaded_at = now_ns();
             victim->kind = kind;
             victim->requested_width = width;
             victim->requested_height = height;
@@ -587,6 +585,10 @@ static float grid_row_height = 360;
 /* Details and season screens. */
 static card detail;
 static char detail_extra[96];
+/* Backdrops live longer than a details screen. Track their transition here rather than on
+ * the cache slot, so returning to a detail also fades an already-resident texture in. */
+static uint32_t backdrop_texture;
+static uint64_t backdrop_fade_started_at;
 static card seasons_cards[SEASONS_CAPACITY];
 static card episodes_cards[EPISODES_CAPACITY];
 static item_row seasons_row = {"Seasons", false, NULL, SEASONS_CAPACITY, 0, false};
@@ -731,6 +733,8 @@ static void open_details(const card *source)
 {
     select_unfinished_season = true;
     detail = *source;
+    backdrop_texture = 0;
+    backdrop_fade_started_at = 0;
     detail_extra[0] = '\0';
     seasons_row.count = 0;
     seasons_row.loading = false;
@@ -1193,7 +1197,6 @@ static void consume(jf_task *task)
                                                        task->image.height, task->image.rgb);
             slot->width = task->image.width;
             slot->height = task->image.height;
-            slot->loaded_at = now_ns();
             slot->loading = false;
         }
         break;
@@ -2683,8 +2686,12 @@ static void build_ui(loom_context *ctx)
             float uv[4];
             cover_uv(slot, background, uv);
             loom_color tint = {255, 255, 255, 255};
-            if (slot->loaded_at != 0) {
-                const uint64_t elapsed = now_ns() - slot->loaded_at;
+            if (backdrop_texture != slot->texture) {
+                backdrop_texture = slot->texture;
+                backdrop_fade_started_at = now_ns();
+            }
+            if (backdrop_fade_started_at != 0) {
+                const uint64_t elapsed = now_ns() - backdrop_fade_started_at;
                 tint[3] = (uint8_t)min_size(255, elapsed * 255 / 250000000ull);
                 if (tint[3] != 255)
                     jf_window_frame_requested = true;
