@@ -42,14 +42,20 @@ The ABI still matters, but only for **compatibility**:
 - Mixing ABIs silently corrupts float arguments across library calls, so
   `gnueabihf` is not an option even if you patch the interpreter path.
 
-### The real trap: Zig's gnueabi disables FP codegen
+### The float trap, and why this project is C
 
-Zig's `gnueabi` target sets LLVM `float-abi=soft`, which not only uses core
-registers for arguments but **stops emitting FPU instructions entirely**, turning
-every operation into an `__aeabi_dmul` / `__aeabi_dadd` library call. That is a
-genuine, large penalty — and it is a toolchain artefact, not a device limit.
+Soft-float here is an *argument-passing* convention. The FPU is real and fast;
+what matters is whether the compiler will emit instructions for it.
 
-Measured on the TV with `fptest.zig` (20M iterations, 2 flops each):
+GCC's `-mfloat-abi=softfp` does exactly the right thing: base-ABI argument
+passing, VFP/NEON for the arithmetic. That is what `CMakeLists.txt` sets,
+alongside `-mcpu=cortex-a55 -mfpu=neon-vfpv4`, and there is nothing further to
+arrange.
+
+Zig's `gnueabi` target cannot express that. It sets LLVM `float-abi=soft`, which
+not only uses core registers for arguments but **stops emitting FPU instructions
+entirely**, turning every operation into an `__aeabi_dmul` / `__aeabi_dadd`
+library call. Measured on the TV (20M iterations, 2 flops each):
 
 | | throughput |
 |---|---|
@@ -62,48 +68,33 @@ Measured on the TV with `fptest.zig` (20M iterations, 2 flops each):
 hardware FP is better still. Setting `-mcpu=cortex_a55` does *not* fix it, and
 neither does subtracting the `soft_float` CPU feature; the triple's ABI decides.
 
-### Working around it
-
-1. **Ignore it** for FP-light code. Wayland uses fixed-point integers; the Vulkan
-   plumbing passes floats inside structs (memory, not registers). Our current
-   apps do no meaningful FP.
-2. **Inline VFP asm** for a hot kernel — see `vfpChain` in `fptest.zig`. Argument
-   passing stays base-ABI, so this is safe to mix.
-3. **Write the kernel in C and compile with `zig cc -mfloat-abi=softfp`.** Clang
-   *can* express softfp even though the Zig target triple cannot. Verified:
-
-   ```
-   zig cc -target arm-linux-gnueabi -mcpu=cortex_a55 -mfloat-abi=softfp -O2 -c k.c
-     → vmul.f64 emitted, Tag_ABI_VFP_args absent (base registers)
-   ```
-
-   Hardware FP *and* device-compatible argument passing. This is the clean
-   escape hatch for anything FP-heavy.
-4. **Isolate a Zig hard-float kernel behind a pointer/integer-only boundary.**
-   `uidemo` does this for MSDF generation: the final process remains `gnueabi`,
-   while a private `gnueabihf` static object uses VFP internally. No float may
-   cross that boundary by value, and the kernel must not call a base-ABI function
-   with float arguments. This brought on-TV renderer initialization to about
-   250 ms.
-5. **Put it on the GPU** — for genuinely heavy math, Vulkan compute beats any of
-   the above.
+The Zig version of this project worked around that by compiling its glyph
+rasteriser as a separate `gnueabihf` module behind a pointer-and-integer-only
+boundary — a second build target, a vendored TrueType reader, and a rule that no
+float may cross the ABI seam by value. With GCC, none of it is needed: the
+rasteriser is FreeType and the boundary is gone.
 
 ## Building
 
-Zig cross-compiles this with no toolchain installed. See `../build.sh`:
+The [openlgtv buildroot NDK](https://github.com/openlgtv/buildroot-nc4) ships
+the cross toolchain, a sysroot with the TV's own libraries, and the CMake
+toolchain file this project defers to:
 
 ```sh
-zig build-exe fbflash.zig -target arm-linux-gnueabi          -O ReleaseSmall  # static, no libc
-zig build-exe wlbox.zig   -target arm-linux-gnueabi.2.31 -lc -O ReleaseSmall
+cmake --preset webos     # WEBOS_SDK=/path/to/ndk to move it off /opt
+cmake --build build
 ```
 
-- Pin glibc **2.31** (`-target …gnueabi.2.31`). Older than the TV's 2.35, so
+Its glibc is older than the TV's 2.35, so
   forward-compatible; building against 2.35+ risks symbol versions the TV lacks.
-- `-lc` is only needed for `dlopen`. `fbflash` needs no libc and links fully static.
-- Device API libraries are `dlopen`'d at runtime, so they need no target
-  headers. Jellyfin's FFmpeg is the deliberate exception: one known build is
-  linked normally and shipped in the app's `lib/` directory, avoiding an ABI
-  shim for the different FFmpeg versions installed by webOS releases.
+- The NDK's sysroot carries the TV's own libraries and headers, so SDL2, EGL,
+  GLESv2, libpng, FreeType, ALSA, libcurl, libhelpers and libplayerAPIs are all
+  linked normally rather than `dlopen`'d by hand.
+- FFmpeg is the exception on the other side: no webOS release ships one a native
+  app may link, so Jellyfin links one known build and ships it in the app's
+  `lib/` directory, avoiding an ABI shim per firmware.
+- json-c comes from the NDK's static `libjson-c.a`, so nothing has to be bundled
+  or assumed present for it either.
 
 ## Deploy and run
 

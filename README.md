@@ -1,49 +1,138 @@
 # webos-native
 
-Native Zig applications for LG webOS TVs. The project contains two programs:
+Native C applications for LG webOS TVs. The project contains three programs:
 
 - `jellyfin` — a native Jellyfin client.
-- `gltri` — an OpenGL ES triangle renderer and timing probe.
+- `xmb` — a full-screen shader and a frame-time overlay.
+- `gltri` — 3000 instanced triangles and the same overlay.
 
-Both use the same SDL2 platform layer for webOS windowing, input, and OpenGL
-context creation. Device APIs are loaded at runtime. Jellyfin directly links a
-small target FFmpeg build for container demuxing and audio decode, and packages
-those shared libraries with the app.
+All three use the same SDL2 platform layer for webOS windowing, input and OpenGL
+ES context creation. Jellyfin links a deliberately small target FFmpeg build for
+container demuxing and audio decode, and packages those shared libraries with
+the app; everything else it needs is already on the TV.
+
+One translation unit is C++: `src/jf/smp_shim.cpp`, a try/catch façade over
+`StarfishMediaAPIs`. Nothing else in the program touches C++.
 
 ## Requirements
 
-- Zig 0.16.0
-- `ssh`, `scp`, `tar`, `sed`, and coreutils for device operations
-- `slangc` to compile the embedded OpenGL ES shaders
-- `glslangValidator` is optional shader validation
-- FFmpeg 63 headers and shared libraries for host tests (`pkg-config` names
-  `libavformat`, `libavcodec`, `libavutil`, and `libswresample`)
-- A target FFmpeg prefix for Jellyfin builds. It defaults to the openlgtv
-  buildroot path used by this checkout; override it with `-Dffmpeg-root=/path`.
+- The [openlgtv buildroot NDK](https://github.com/openlgtv/buildroot-nc4) at
+  `/opt/arm-webos-linux-gnueabi_sdk-buildroot`, or anywhere with `WEBOS_SDK`
+  pointing at it
+- CMake 3.21+ and Ninja
+- `ares-package` / `ares-install` from the webOS CLI, for packaging and
+  installing
+- `slangc` to compile the embedded OpenGL ES shaders; `glslangValidator` is
+  optional extra validation
+- A target FFmpeg prefix. It defaults to the buildroot path used by this
+  checkout; override it with `-DFFMPEG_ROOT=/path`.
 
-The pure-Zig TrueType reader and skyline atlas packer required by Jellyfin are
-vendored under `src/vendor`; no sibling checkout is required.
-
-## Setup
-
-```sh
-cp .env.example .env
-```
-
-Set `WEBOS_HOST` in `.env` to the TV's address.
-
-## Commands
+## Build
 
 ```sh
-zig build                              # build both applications
-zig build run -Dapp=jellyfin           # deploy and run on the TV
-zig build run-host -Dapp=gltri         # run locally through SDL
-zig build deploy                       # copy both binaries to the TV
-zig build package -Dapp=jellyfin       # create an .ipk
-zig build install-app -Dapp=jellyfin   # package, copy, and install
-zig build launch -Dapp=jellyfin        # launch the installed app
-zig build test                         # Jellyfin host tests
+cmake --preset webos          # WEBOS_SDK=/path/to/ndk to move the NDK
+cmake --build build
 ```
 
-`GLTRI_DUMP=1 zig build run-host -Dapp=gltri` reads the rendered frame back as
-ASCII for a headless smoke test.
+Every program gets three targets:
+
+```sh
+cmake --build build --target jellyfin-ipk      # -> build/dist/*.ipk
+cmake --build build --target jellyfin-install  # ares-install; honours ARES_DEVICE
+cmake --build build --target jellyfin-verify   # webosbrew-ipk-verify
+```
+
+`-verify` reports, per firmware release, any symbol the ipk needs that the TV
+does not export — which is the objective answer to the glibc- and
+libstdc++-version questions.
+
+## Running locally
+
+Everything except the player builds and runs on a desktop:
+
+```sh
+cmake --preset host
+cmake --build build-host
+./build-host/src/jellyfin    # Escape or Back closes it
+./build-host/src/xmb
+./build-host/src/gltri
+```
+
+`xmb` and `gltri` each read their own frame back as coarse ASCII, plus a count
+of the pure white pixels the overlay is the only source of — a headless check
+that the scene, the text program and the blend all work:
+
+```sh
+XMB_DUMP=1 ./build-host/src/xmb
+GLTRI_DUMP=1 ./build-host/src/gltri
+```
+
+`SWAP_INTERVAL=0` unthrottles them, which is what shows the GPU's real ceiling.
+
+### Playback is the one thing that does not run here
+
+Video on the TV belongs to `libplayerAPIs` and `libpf`, which exist nowhere
+else, so a desktop build gets `jf/player_null.c` instead: discovery, sign-in,
+the home rows, the library grid, artwork, navigation and the
+`UI_SCRIPT`/`UI_CAPTURE` loop all work, and pressing Play refuses and logs the
+stream URL — which can be pasted straight into a player by hand.
+
+The desktop backend is to be **libmpv**, as the Zig version had, rendering into
+this process's own GL context behind the same `jf_player_*` interface Starfish
+sits behind. **Audio stays ALSA there too**: the sink in `jf/audio_alsa.c` and
+the sync rule in `jf/audio_sync.h` are not per-platform, and having one audio
+path on both is worth more than letting mpv own its own.
+
+Open before writing it: whether mpv demuxes the stream itself (and is simply
+pointed at ALSA) or is used as a video decoder alone, with our existing demuxer
+and ALSA sink keeping the audio — the second keeps one audio path but means two
+readers of the same URL.
+
+### Driving it without a remote
+
+`UI_SCRIPT` replays remote presses a few frames apart and `UI_CAPTURE` saves the
+screen it ends on as a PPM. Letters are the four arrows, `o` for OK, `b` for
+Back, `.` waits one more beat:
+
+```sh
+set -a; . ./.env; set +a
+UI_SCRIPT=oddo UI_CAPTURE=/tmp/home.ppm ./build-host/src/jellyfin
+```
+
+`JELLYFIN_ADDRESS` / `JELLYFIN_USER` / `JELLYFIN_PASSWORD` prefill the sign-in
+fields, which is what lets a script get past them.
+
+## Test
+
+The backend-agnostic code — the Starfish payloads, the A/V sync arithmetic, the
+clock projection, the atlas packer and the virtual-list geometry — runs here
+too:
+
+```sh
+ctest --preset host
+```
+
+A machine with no SDL2/EGL/GLES still configures; it just builds the tests and
+skips the two probes.
+
+## Debug switches
+
+SAM launches an app with an environment of its own making, so the switches are
+read from `conf/debug.env` inside the installed app as well as from the
+environment:
+
+```sh
+echo JF_KEYLOG=1 > $APPDIR/dev.hookedbehemoth.jellyfin/conf/debug.env
+```
+
+| variable | effect |
+|---|---|
+| `JF_KEYLOG` | log every key SDL reports |
+| `JF_LUNALOG` | log every Luna lifecycle payload |
+| `JF_ALSA_DEV` | ALSA device for audio output (default `default`) |
+| `JF_NOAUDIO` | play video only |
+| `UI_FONT` | rasterise the UI from this .ttf |
+| `UI_SCRIPT` / `UI_CAPTURE` | replay remote presses, then save a PPM |
+
+An installed app has no terminal, so it redirects stdout and stderr to
+`conf/jellyfin.log`.

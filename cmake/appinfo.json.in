@@ -1,0 +1,13 @@
+{
+  "id": "@IPK_APPID@",
+  "version": "@IPK_VERSION@",
+  "vendor": "webos-native",
+  "type": "native",
+  "main": "@IPK_MAIN@",
+  "title": "@IPK_TITLE@",
+  "icon": "icon.png",
+  "iconColor": "@IPK_COLOR@",
+  "bgColor": "@IPK_COLOR@",
+  "nativeLifeCycleInterfaceVersion": 2,
+  "noSplashOnLaunch": true
+}

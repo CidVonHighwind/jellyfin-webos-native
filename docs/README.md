@@ -11,7 +11,7 @@ marked as unverified.
 | [opengl.md](opengl.md) | OpenGL ES 3.2 capabilities, GPU timing, and the Slang -> GLSL ES pipeline |
 | [fonts.md](fonts.md) | Installed TV fonts and the native UI font selection order |
 | [vulkan.md](vulkan.md) | The Mali ICD, the missing loader, the missing WSI, and how to initialise anyway |
-| [jellyfin.md](jellyfin.md) | **The Jellyfin client**: storage and artwork caching, the libpng-not-libjpeg decision, audio formats for later |
+| [jellyfin.md](jellyfin.md) | **The Jellyfin client**: storage and artwork caching, the libpng-not-libjpeg decision, and playback — Starfish for video, ALSA for audio |
 | [ndl.md](ndl.md) | **NDL: hardware video decode on the video plane** — interface, the four traps, punch-through |
 | [multimedia.md](multimedia.md) | Hardware video decode: NDL_directmedia, GStreamer, device nodes |
 | [codecs.md](codecs.md) | Full codec support: hardware limits, containers, which API to use |
@@ -28,8 +28,9 @@ marked as unverified.
 
 1. **Userland is 32-bit ARM** (`arm-linux-gnueabi`), on a 64-bit kernel.
    `uname -m` says `aarch64` and is misleading. The float ABI is soft *for
-   argument passing only* — the FPU is real and fast, but Zig's `gnueabi` target
-   disables FP codegen and costs 10.5x. See [device.md](device.md).
+   argument passing only* — the FPU is real and fast, and `-mfloat-abi=softfp`
+   gets both. A toolchain that cannot express that costs 10.5x. See
+   [device.md](device.md).
 2. **The framebuffer cannot be written directly.** Scanout is AFBC-compressed and
    owned by `surface-manager`. Wayland is the only route to the screen — and
    that route is a **1080p60 graphics plane**, set per model by configd. 4K120
@@ -43,33 +44,30 @@ marked as unverified.
 
 ## Status
 
-Working and verified on-device:
+The repository now holds three C programs, built with CMake against the openlgtv
+buildroot NDK:
 
-- `fbflash.zig` — framebuffer prober; documents the dead end
-- `wlinfo.zig` — lists the compositor's Wayland globals
-- `wlbox.zig` — **fullscreen red box via `wl_shm` + `wl_webos_shell`** (confirmed visible)
-- `vkinfo.zig` — enumerates the Vulkan ICD
-- `fptest.zig` — float throughput benchmark (settles the soft-float question)
-- `inputlog.zig` — on-screen log of every input event; maps the remote and cursor
-- `glinfo.zig` — EGL/GL ES capabilities
-- `gltri.zig` — **1000 instanced rotating triangles at 60 fps** with CPU/GPU frame times
-- `ndlplay.zig` — **hardware video via NDL**: 4K30 and 1080p120 from storage, and a live TCP stream
-- `uidemo.zig` — **one-batch MSDF UI**, remote focus and a 10,000-row virtual list
-- `jellyfin.zig` — **a real Jellyfin client**: discovery, sign-in, home rows, a virtual library grid with server artwork, shows down to episodes
-
-Build and deploy with `build.zig`; SSH target comes from `.env`:
+- `jellyfin` — **a real Jellyfin client**: discovery, sign-in, home rows, a
+  virtual library grid with server artwork, shows down to episodes, and
+  **playback** — FFmpeg demuxes, Starfish decodes video onto the TV's own plane,
+  and the decoded audio goes to ALSA. See [jellyfin.md](jellyfin.md).
+- `xmb` — a full-screen shader with CPU/GPU frame times
+- `gltri` — **3000 instanced rotating triangles at 60 fps**, same overlay
 
 ```sh
-zig build                     # all apps -> zig-out/bin
-zig build run -Dapp=wlbox     # deploy one app and run it on the TV
-zig build package -Dapp=wlbox # build an .ipk
-zig build info                # show resolved .env
+cmake --preset webos
+cmake --build build
+cmake --build build --target jellyfin-ipk      # -> build/dist/*.ipk
+cmake --build build --target jellyfin-install  # honours ARES_DEVICE
 ```
+
+Everything else in these documents was learned from probes that have since
+served their purpose and been removed — `fbflash`, `wlinfo`, `wlbox`, `vkinfo`,
+`fptest`, `inputlog`, `glinfo`, `ndlplay`, `uidemo`. They are referred to by
+name below because the findings are theirs; the code is in the git history.
 
 Not yet built:
 
 - **the Vulkan triangle** — design in [vulkan.md](vulkan.md#getting-a-triangle-on-screen)
-- **playback in the Jellyfin client** — it resolves a stream URL but decodes
-  nothing; the container demuxer and the audio union are in
-  [jellyfin.md](jellyfin.md#audio-for-later)
+
 (The PC-cursor-as-remote idea was dropped — see [input.md](input.md).)

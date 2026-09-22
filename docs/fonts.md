@@ -1,8 +1,8 @@
 # Fonts on the TV
 
 Inventory taken directly from the configured TV on 2026-09-19. Fonts live in
-`/usr/share/fonts`; `libfreetype.so.6` is installed too, although the UI renderer
-uses the pure-Zig MSDF/TrueType path from `../gallery-glfw` rather than FreeType.
+`/usr/share/fonts`, and the UI renderer rasterises them with the TV's own
+`libfreetype.so.6`.
 
 The native UI face is available in a useful complete family:
 
@@ -22,7 +22,7 @@ include Droid Sans/Serif/Mono/Kufi/Naskh and Droid Sans Fallback, Nanum Gothic,
 Noto Emoji/Color Emoji, Museo Sans, Miso, Tinos, the LG Display families and
 Sandstone Icons.
 
-`uidemo` selects fonts in this order:
+The UI selects fonts in this order:
 
 1. `UI_FONT=/absolute/path.ttf`, when set;
 2. `/usr/share/fonts/LG_Smart_UI-Regular.ttf` on the TV;

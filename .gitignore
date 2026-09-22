@@ -3,7 +3,9 @@ wlinfo
 wlbox
 vkinfo
 fptest
-.zig-cache/
-zig-out/
 .env
 *.ipk
+
+# CMake build trees
+/build/
+/build-host/

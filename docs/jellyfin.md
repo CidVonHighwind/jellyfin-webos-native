@@ -1,6 +1,6 @@
 # Jellyfin client
 
-`src/jellyfin.zig` is a real client for a Jellyfin server: UDP discovery,
+`src/app/main.c` is a real client for a Jellyfin server: UDP discovery,
 sign-in (password or Quick Connect), a stored token, home rows, a virtual
 library grid, and the path down to a single episode. It reuses `uidemo`'s
 renderer unchanged — one instanced batch, rasterised glyphs, the same remote
@@ -11,10 +11,10 @@ Verified against **Jellyfin 10.11.8**, and on the TV at 1920x1080.
 ## Shape
 
 ```
-src/jellyfin.zig          screens, navigation, poster cache
-src/jellyfin/api.zig      endpoints, JSON, credentials, the worker pool
-src/jellyfin/image.zig    PNG decode through the TV's libpng
-src/jellyfin/store.zig    where files go on disk, and the artwork cache
+src/app/main.c            screens, navigation, poster cache
+src/jf/api.c              endpoints, JSON, credentials, the worker pool
+src/jf/image.c            PNG decode through the TV's libpng
+src/jf/store.c            where files go on disk, and the artwork cache
 ```
 
 Requests never touch the render thread. `api.Fetcher` owns a fixed pool of 32
@@ -53,7 +53,7 @@ Two bugs that cost time and are easy to reintroduce:
 
 ## Navigation is a stack, not a rule
 
-Back pops a stack of entries (`Entry` in `jellyfin.zig`). The rule-based version
+Back pops a stack of entries (`stack_entry` in `app/main.c`). The rule-based version
 — "from details, go back to the grid if a grid is loaded" — is wrong in the
 ordinary case: reaching a show from a *home row* and pressing Back returned to
 whichever library grid happened to still be loaded, so
@@ -119,7 +119,8 @@ its files, which are installed owned by uid 1000. Both reference apps ship
 `777`; a package built with a default `mkdir` gets `755` and every write fails
 silently.
 
-`ipk_script` in `build.zig` therefore ships `conf/` and `cache/` at `777`. The
+`WRITABLE_DIRS` in `cmake/WebOSPackage.cmake` therefore ships `conf/` and
+`cache/` at `777`. The
 proof that this is the real mechanism is the ownership of what gets written:
 
 ```
@@ -200,8 +201,7 @@ Both libraries are on the TV:
 /usr/lib/libwebp.so.7    /usr/lib/liblxjpeg.so.2    /lib/libz.so.1
 ```
 
-The client `dlopen`s `libpng16.so.16` like every other device library here, and
-asks Jellyfin for `format=Png`. **JPEG was rejected on ABI grounds, not
+The client links `libpng16` and asks Jellyfin for `format=Png`. **JPEG was rejected on ABI grounds, not
 preference:** the TV ships `libjpeg.so.62` and a current development machine
 ships `libjpeg.so.8`. Those are different ABIs behind the same name, and
 libjpeg's entry points take a `struct jpeg_decompress_struct` whose layout *is*
@@ -210,14 +210,10 @@ and is silently wrong on whichever machine it was not written for.
 `libpng16.so.16` is on both (1.6.39 on the TV, 1.6.58 here).
 
 Within libpng, this uses the **simplified API** (`png_image_begin_read_from_memory`
-/ `png_image_finish_read`), which is why the binding is about forty lines:
-
-- `png_image` is a small struct with an explicit `version` field, which the
-  library checks — so it is safe to declare without libpng's headers.
-- It does not use `setjmp`. The classic `png_create_read_struct` path signals
-  errors by longjmp'ing out of the error callback, and a callback that returns
-  instead makes libpng call `abort()`. Zig has no `setjmp`, so that path is not
-  available at all.
+/ `png_image_finish_read`), which is why `src/jf/image.c` is about forty lines:
+errors come back as a zero return and a message in the struct, where the classic
+`png_create_read_struct` path signals them by longjmp'ing out of an error
+callback — and a callback that returns instead makes libpng call `abort()`.
 
 ### `fillWidth`/`fillHeight` is a hint, not a contract
 
@@ -236,7 +232,7 @@ drawing from. The cache is 48 textures, evicted least-recently-drawn, and
 `coverUv` crops the long axis so a 534x300 library banner and a 200x300 poster
 look right in the same card.
 
-## Playback: resolved, not decoded
+## Playback: Starfish for video, ALSA for audio
 
 The details and episode screens resolve
 
@@ -244,14 +240,99 @@ The details and episode screens resolve
 {server}/Videos/{id}/stream?static=true&api_key={token}
 ```
 
-and show it. Nothing decodes it yet — that is the NDL work below.
+FFmpeg demuxes it in-process. Video access units go to LG's Starfish pipeline
+(`libplayerAPIs`) as a raw elementary stream and are decoded and presented on the
+TV's own video plane, which this process never touches. Audio is decoded to
+48 kHz interleaved stereo S16 and written to ALSA.
 
-## Audio, for later
+```
+src/jf/demux.c        FFmpeg: containers in, Annex-B video and PCM audio out
+src/jf/player.c       the three threads, the segment loop, seek and pause
+src/jf/smp.h          the C API of the pipeline
+src/jf/smp_shim.cpp   the only C++: try/catch around StarfishMediaAPIs
+src/jf/smp_payload.c  the JSON the pipeline actually consumes
+src/jf/smp_segment.c  the libpf entry points StarfishMediaAPIs does not forward
+src/jf/clock.c        where playback is, from the pipeline's own events
+src/jf/audio_alsa.c   the PCM sink, and the whole of A/V sync
+```
 
-Noted now because the decision belongs with the video work, not after it.
+Three threads move one segment of playback: a reader that demuxes ahead and
+decodes audio into two bounded queues, a video thread that feeds Starfish, and
+an audio thread that writes to ALSA. A seek closes the queues, parks all three,
+re-anchors the pipeline and starts a new segment without unloading it.
 
-**What the library actually contains** (600 items sampled of 3026, movies and
-episodes):
+### Audio does not go through the pipeline
+
+Starfish will take PCM, and this client used to hand it PCM. Nearly everything
+that path needed was compensation for a sink that would not say where it was:
+
+- the sound had to be cut into 1024-sample access units;
+- each one needed a timestamp from a sample cursor maintained here, because the
+  sink plays what it is given back to back — so a gap between two chunks is not
+  heard as a gap, it makes everything after it play early against the picture,
+  permanently;
+- every hole therefore had to be filled with silence rather than closed up;
+- the sink only built at a short list of sample rates, and an unlisted rate was
+  taken as "bypass" rather than refused — 48 kHz PCM fed into a sink that came
+  up at 44.1 kHz plays about 9% slow;
+- `Play` had to wait on a PCM preroll before the first video frame existed.
+
+ALSA answers the question that machinery existed to work around:
+`snd_pcm_delay` reports exactly how many frames are still queued, so the
+presentation time of the next sample written is *known*. What is left is one
+rule, in `jf_audio_placement`:
+
+> Video is the master clock. For each chunk, compare the host time it is due
+> against the host time the queue will reach — pad silence if it would arrive
+> early, drop frames from its head if it is already late, and write it
+> unchanged when the error is under 20 ms.
+
+The same correction serves drift, a seek and an underrun, because after a flush
+or an `EPIPE` the queue is simply empty and "when will the queue reach this
+point" answers *now*. The device is `default`, overridable with `JF_ALSA_DEV`.
+
+The load payload therefore declares `needAudio:false` and
+`useCurrentTimeWithSystemClock:true`: with no audio track in the pipeline,
+nothing else establishes a running clock for the video sink.
+
+### Where playback is: `queryPosition`, not `getCurrentPlaytime`
+
+`option.queryPosition` makes Starfish report the presentation timestamp of each
+displayed frame as the numeric value of a `FRAMEREADY` event. That is the whole
+clock — a pts paired with the host time the event arrived, sampled at the moment
+of the flip.
+
+The alternative, polling `getCurrentPlaytime()`, is frame-quantized and
+sometimes slow, and reading it usefully needed a sampling period, a slow-query
+rejection, a half-interval bracket to guess when the frame had *really* flipped,
+and a stability probe before the result could be trusted. An event that arrives
+at the flip needs none of that; `src/jf/clock.c` is forty lines.
+
+### The traps that cost time
+
+- **`Load` returning true only means the request was accepted.** Feeding and
+  `Play` belong after the asynchronous `LOADCOMPLETED` event.
+- **The load payload describes the timeline but does not activate it.** libpf
+  does nothing until `CustomPipeline` receives a segment event, and
+  `StarfishMediaAPIs` does not forward `sendSegmentEvent`. `smp_segment.c`
+  reaches it by mangled name through `libpf-1.0`, following the public `player`
+  member of the instance. `setTimeToDecode`, the public wrapper, rejects the
+  `LOADED` state.
+- **`flush()` with no argument sends no `FLUSH_START`/`FLUSH_STOP` pair** and
+  leaves the sink on the pre-seek segment. `flush(const char *)` parses exactly
+  two keys, `audioFlush` and `offset`, and those reach the pipeline.
+- **A `BufferFull` answer from `Feed` keeps nothing**, so the same buffer has to
+  be offered again.
+- **A live transcode has no byte ranges.** `av_seek_frame` reports success on
+  one anyway and positions FFmpeg at byte zero, so seeking a transcode means
+  asking Jellyfin for a new stream at `StartTimeTicks` instead.
+- **A negative pts is read by libpf as an enormous unsigned one.** The reader
+  sets the segment's time origin, because it sees packets in container order and
+  two feed threads racing for it would send the loser negative.
+
+## What the library contains, and what the TV decodes
+
+Sampled from 600 of 3026 items, movies and episodes:
 
 | | |
 |---|---|
@@ -260,41 +341,11 @@ episodes):
 | audio | `aac` 292, `eac3` 249, `flac` 168, `opus` 141, `ac3` 103, `dts` 32, `truehd` 14, `mp2` 4 |
 | channels | 2ch 621, 6ch 361, 8ch 15 |
 
-**What the TV decodes in hardware** — full table in [codecs.md](codecs.md):
-AAC 6ch, EAC3 **8ch**, AC3 6ch, DTS/DTS-HD/DTS Express 6ch, FLAC 6ch, OPUS 6ch,
-MP1/2/3 2ch, PCM 2ch.
-
-Lining those up:
-
-- Every codec in this library is decodable **except `truehd`** (14 items), which
-  appears nowhere in the LG capability table. Those need transcoding or a
-  fallback to the file's second audio track — most TrueHD tracks ship with an
-  AC3/EAC3 companion.
-- The 8-channel tracks (15 items) are only in range if they are EAC3; 8ch AAC or
-  FLAC exceeds the 6ch hardware limit and needs a downmix.
-- `mp2` only exists in the four `mpeg` files, alongside `mpeg2video` — the one
-  combination worth just transcoding rather than supporting.
-
-**What the decode path needs.** `NDL_directmedia` takes **elementary streams**,
-not containers, so 98% of this library being Matroska means a demuxer either
-way — the container carries the audio/video split, the codec ids and the
-timestamps that `NDL_DirectAudioPlay`'s `pts` argument wants.
-
-`NDL_DIRECTMEDIA_DATA_INFO_T` is `{ int width, height; VideoType type; int
-unknown1; }` followed by a **32-byte audio union that this client currently
-zeroes**, which the implementation accepts as "no audio" (see [ndl.md](ndl.md)).
-The layout of that union is *not* documented here and is the first thing to work
-out. The audio side is then a second push API —
-`NDL_DirectAudioPlay(buffer, size, pts)` with
-`NDL_DirectAudioGetAvailableBufferSize` for flow control, and
-`NDL_DirectAudioSupportMultiChannel` for the 6ch and 8ch tracks above.
-
-Note also that `NDL_directmedia` itself only references **H264, H265, OPUS,
-PCM** internally ([multimedia.md](multimedia.md)). If that is a real limit
-rather than an artefact of the symbol scan, then AAC and EAC3 — 541 of the 600
-sampled tracks — do not go through `NDL_directmedia` at all, and the audio path
-is `NDL_media` or GStreamer instead. **Unverified; test before designing around
-either answer.**
+Audio codecs stopped mattering once decoding moved into FFmpeg: everything above
+decodes in software and is downmixed to stereo by `swresample` before it reaches
+ALSA. Video still has to suit the hardware decoder — full table in
+[codecs.md](codecs.md) — so a source above 8 bits per sample, or H.264 above
+High profile, is swapped for the server's transcode before anything is read.
 
 ## Testing without a remote in your hand
 
@@ -302,7 +353,7 @@ There is no way to click through this app headlessly, so it replays one:
 
 ```sh
 set -a; . ./.env; set +a
-UI_SCRIPT=oddo UI_CAPTURE=/tmp/home.ppm zig build run-host -Dapp=jellyfin
+UI_SCRIPT=oddo UI_CAPTURE=/tmp/home.ppm ./build/src/jellyfin
 ```
 
 `UI_SCRIPT` letters are `u`/`d`/`l`/`r` for the arrows, `o` for OK, `b` for
@@ -337,10 +388,10 @@ The endpoint layer has its own live test, skipped unless the environment names
 a server:
 
 ```sh
-set -a; . ./.env; set +a; zig test -lc src/jellyfin/api.zig
+cmake --preset host && ctest --preset host
 ```
 
-`zig build test` also runs the Back ownership/navigation, artwork metadata,
+`ctest --preset host` also runs the Back ownership/navigation, artwork metadata,
 home scrolling and shared virtual-list regression tests on the host.
 
 ## Credentials
