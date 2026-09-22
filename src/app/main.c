@@ -2294,7 +2294,7 @@ static void draw_home(loom_context *ctx, float width, float height, float scale)
         return;
     }
     home_row_height = 470 * scale;
-    home_rect = (loom_rect){0, 64 * scale, width, height - 128 * scale};
+    home_rect = (loom_rect){0, 0, width, height};
     loom_virtual_list list =
         loom_virtual_list_init(home_rect, ROW_COUNT, home_row_height, home_scroll);
     if (home_reveal) {
@@ -2309,12 +2309,11 @@ static void draw_home(loom_context *ctx, float width, float height, float scale)
     static const loom_color fade = {9, 13, 22, 255};
     const float fade_height = 78 * scale;
     if (list.scroll > 0)
-        loom_fade(ctx, (loom_rect){home_rect.x, home_rect.y, home_rect.w, fade_height},
-                  &home_rect, fade, LOOM_FADE_TOP);
+        loom_fade(ctx, (loom_rect){0, 0, width, fade_height}, &ctx->viewport, fade,
+                  LOOM_FADE_TOP);
     if (list.scroll < loom_virtual_list_max_scroll(&list))
-        loom_fade(ctx, (loom_rect){home_rect.x, home_rect.y + home_rect.h - fade_height,
-                                   home_rect.w, fade_height},
-                  &home_rect, fade, LOOM_FADE_BOTTOM);
+        loom_fade(ctx, (loom_rect){0, height - fade_height, width, fade_height}, &ctx->viewport,
+                  fade, LOOM_FADE_BOTTOM);
 }
 
 static void draw_grid(loom_context *ctx, float width, float height, float scale)
@@ -2322,7 +2321,7 @@ static void draw_grid(loom_context *ctx, float width, float height, float scale)
     const float margin = 64 * scale;
     const float card_w = 200 * scale;
     const float gap = 26 * scale;
-    grid_rect = (loom_rect){margin, 120 * scale, width - margin * 2, height - 190 * scale};
+    grid_rect = (loom_rect){margin, 0, width - margin * 2, height};
     grid_columns = (size_t)((grid_rect.w + gap) / (card_w + gap));
     if (grid_columns < 1)
         grid_columns = 1;
@@ -2375,12 +2374,11 @@ static void draw_grid(loom_context *ctx, float width, float height, float scale)
     static const loom_color fade = {9, 13, 22, 255};
     const float fade_height = 72 * scale;
     if (list.scroll > 0)
-        loom_fade(ctx, (loom_rect){grid_rect.x, grid_rect.y, grid_rect.w, fade_height},
-                  &grid_rect, fade, LOOM_FADE_TOP);
+        loom_fade(ctx, (loom_rect){0, 0, width, fade_height}, &ctx->viewport, fade,
+                  LOOM_FADE_TOP);
     if (list.scroll < loom_virtual_list_max_scroll(&list))
-        loom_fade(ctx, (loom_rect){grid_rect.x, grid_rect.y + grid_rect.h - fade_height,
-                                   grid_rect.w, fade_height},
-                  &grid_rect, fade, LOOM_FADE_BOTTOM);
+        loom_fade(ctx, (loom_rect){0, height - fade_height, width, fade_height}, &ctx->viewport,
+                  fade, LOOM_FADE_BOTTOM);
 
     const loom_rect track = {grid_rect.x + grid_rect.w, grid_rect.y, 4 * scale, grid_rect.h};
     const float max_scroll = loom_virtual_list_max_scroll(&list);
