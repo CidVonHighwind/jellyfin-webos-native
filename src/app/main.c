@@ -466,7 +466,6 @@ typedef enum {
     SCREEN_AUTH,
     SCREEN_QUICK,
     SCREEN_HOME,
-    SCREEN_CATEGORIES,
     SCREEN_GRID,
     SCREEN_DETAILS,
     SCREEN_SEASON,
@@ -524,9 +523,6 @@ static float home_scroll;
 static loom_rect home_rect;
 static float home_row_height = 470;
 static bool home_reveal;
-static size_t category_selected;
-static float category_scroll;
-static loom_rect category_rect;
 
 /* Where Back goes, as a stack rather than a rule per screen.
  *
@@ -628,10 +624,11 @@ static float cursor_y = -1;
 static bool cursor_present;
 static bool pointer_press;
 
-/* A sidebar is an overlay: categories return to the existing home screen, while Settings
- * replaces the content screen but keeps the same left-edge entry point. */
+/* The sidebar is an overlay containing every library category and the one settings row. */
 static bool sidebar_open;
 static size_t sidebar_focus;
+static float sidebar_scroll;
+static bool sidebar_reveal;
 static screen_id sidebar_return_screen;
 
 static char status_text[200];
@@ -798,12 +795,10 @@ static stack_entry here(void)
                  : screen == SCREEN_SEASON ? season_detail
                                            : detail;
     entry.series = detail;
-    entry.selected = screen == SCREEN_GRID       ? grid_selected
-                     : screen == SCREEN_CATEGORIES ? category_selected
-                     : screen == SCREEN_SEASON   ? episode_selected
-                                                  : 0;
+    entry.selected = screen == SCREEN_GRID     ? grid_selected
+                     : screen == SCREEN_SEASON ? episode_selected
+                                               : 0;
     entry.scroll = screen == SCREEN_HOME       ? home_scroll
-                   : screen == SCREEN_CATEGORIES ? category_scroll
                    : screen == SCREEN_SEASON   ? episode_scroll
                                                 : grid_scroll;
     entry.focus = focus;
@@ -836,11 +831,6 @@ static void pop(void)
     case SCREEN_HOME:
         screen = SCREEN_HOME;
         home_scroll = entry.scroll;
-        break;
-    case SCREEN_CATEGORIES:
-        screen = SCREEN_CATEGORIES;
-        category_selected = entry.selected;
-        category_scroll = entry.scroll;
         break;
     case SCREEN_GRID:
         /* Returning to the grid we are still holding pages for is free; a different
@@ -1346,19 +1336,18 @@ static void open_sidebar(void)
     end_edit();
     sidebar_open = true;
     sidebar_focus = 0;
+    sidebar_scroll = 0;
+    sidebar_reveal = true;
     sidebar_return_screen = screen;
 }
 
 static void activate_sidebar(void)
 {
     sidebar_open = false;
-    if (sidebar_focus == 0) {
-        screen = SCREEN_CATEGORIES;
-        focus = 0;
-        category_selected = 0;
-        category_scroll = 0;
-        if (!categories_row.loading && categories_row.count == 0)
-            load_home();
+    if (sidebar_focus < categories_row.count) {
+        const card chosen = categories_row.cards[sidebar_focus];
+        push();
+        open_grid(&chosen);
         return;
     }
     screen = SCREEN_SETTINGS;
@@ -1407,9 +1396,6 @@ static void go_back(void)
     case SCREEN_SETTINGS:
         screen = sidebar_return_screen;
         focus = 0;
-        break;
-    case SCREEN_CATEGORIES:
-        screen = SCREEN_HOME;
         break;
     default:
         pop();
@@ -1601,13 +1587,6 @@ static void activate(void)
             open_details(&chosen);
         break;
     }
-    case SCREEN_CATEGORIES:
-        if (category_selected < categories_row.count) {
-            const card chosen = categories_row.cards[category_selected];
-            push();
-            open_grid(&chosen);
-        }
-        break;
     case SCREEN_GRID: {
         const card *chosen = grid_card(grid_selected);
         if (chosen != NULL) {
@@ -1645,7 +1624,6 @@ static size_t focus_count(void)
     case SCREEN_QUICK: return 1;
     case SCREEN_PLAYBACK: return PLAYBACK_BUTTON_COUNT;
     case SCREEN_SETTINGS: return 1;
-    case SCREEN_CATEGORIES: return categories_row.count;
     case SCREEN_DETAILS:
         return card_is(&detail, "Series") ? (seasons_row.count > 0 ? seasons_row.count : 1) : 1;
     default: return 1;
@@ -1701,11 +1679,13 @@ static void move_home(direction where)
 static void move(direction where)
 {
     if (sidebar_open) {
-        if (where == DIR_UP)
+        if (where == DIR_UP) {
             sidebar_focus = dec(sidebar_focus);
-        else if (where == DIR_DOWN)
-            sidebar_focus = min_size(sidebar_focus + 1, 1);
-        else if (where == DIR_LEFT)
+            sidebar_reveal = true;
+        } else if (where == DIR_DOWN) {
+            sidebar_focus = min_size(sidebar_focus + 1, categories_row.count);
+            sidebar_reveal = true;
+        } else if (where == DIR_LEFT)
             sidebar_open = false;
         else if (where == DIR_RIGHT)
             activate_sidebar();
@@ -1715,7 +1695,6 @@ static void move(direction where)
         bool at_left = screen == SCREEN_SERVER || screen == SCREEN_AUTH || screen == SCREEN_QUICK ||
                        screen == SCREEN_DETAILS || screen == SCREEN_SETTINGS ||
                        (screen == SCREEN_HOME && col_focus[row_focus] == 0) ||
-                       (screen == SCREEN_CATEGORIES && category_selected == 0) ||
                        (screen == SCREEN_GRID && grid_columns != 0 &&
                         grid_selected % grid_columns == 0) ||
                        (screen == SCREEN_SEASON && episode_selected == 0) ||
@@ -1728,13 +1707,6 @@ static void move(direction where)
     switch (screen) {
     case SCREEN_HOME:
         move_home(where);
-        break;
-    case SCREEN_CATEGORIES:
-        if (where == DIR_UP)
-            category_selected = dec(category_selected);
-        else if (where == DIR_DOWN)
-            category_selected = min_size(category_selected + 1,
-                                         dec(categories_row.count));
         break;
     case SCREEN_AUTH:
         if (where == DIR_UP)
@@ -1875,13 +1847,14 @@ static void on_event(const jf_event *event)
         if (event->axis.axis != 0)
             break;
         const float delta = (float)event->axis.value / 256.0f * 5.0f;
+        if (sidebar_open) {
+            sidebar_scroll += delta;
+            break;
+        }
         switch (screen) {
         case SCREEN_HOME:
             home_scroll += delta;
             home_reveal = false;
-            break;
-        case SCREEN_CATEGORIES:
-            category_scroll += delta;
             break;
         case SCREEN_GRID:
             grid_scroll += delta;
@@ -2306,11 +2279,12 @@ static void draw_row(loom_context *ctx, const item_row *row, size_t id, float to
     static const loom_color fade = {9, 13, 22, 255};
     const float fade_width = 86 * scale;
     if (first > 0)
-        loom_fade(ctx, (loom_rect){strip.x, strip.y, fade_width, strip.h}, &strip, fade,
+        loom_fade(ctx, (loom_rect){0, strip.y, fade_width, strip.h}, &ctx->viewport, fade,
                   LOOM_FADE_LEFT);
     if (first + visible < row->count)
-        loom_fade(ctx, (loom_rect){strip.x + strip.w - fade_width, strip.y, fade_width, strip.h},
-                  &strip, fade, LOOM_FADE_RIGHT);
+        loom_fade(ctx, (loom_rect){ctx->viewport.x + ctx->viewport.w - fade_width, strip.y,
+                                   fade_width, strip.h},
+                  &ctx->viewport, fade, LOOM_FADE_RIGHT);
 }
 
 static void draw_home(loom_context *ctx, float width, float height, float scale)
@@ -2341,58 +2315,6 @@ static void draw_home(loom_context *ctx, float width, float height, float scale)
         loom_fade(ctx, (loom_rect){home_rect.x, home_rect.y + home_rect.h - fade_height,
                                    home_rect.w, fade_height},
                   &home_rect, fade, LOOM_FADE_BOTTOM);
-}
-
-static void draw_categories(loom_context *ctx, float width, float height, float scale)
-{
-    const item_row *categories = &categories_row;
-    loom_label(ctx, (loom_rect){64 * scale, 42 * scale, width - 128 * scale, 48 * scale}, NULL,
-               "All categories", TEXT, 32 * scale);
-    if (categories->loading) {
-        draw_spinner(ctx, width / 2, height / 2, 24 * scale, NULL, scale);
-        return;
-    }
-    if (categories->count == 0) {
-        loom_label(ctx, (loom_rect){64 * scale, 140 * scale, width - 128 * scale, 36 * scale},
-                   NULL, "No categories", DIM, 23 * scale);
-        return;
-    }
-    category_rect = (loom_rect){64 * scale, 118 * scale, width - 128 * scale, height - 182 * scale};
-    const float row_height = 102 * scale;
-    loom_virtual_list list =
-        loom_virtual_list_init(category_rect, categories->count, row_height, category_scroll);
-    list = loom_virtual_list_init(category_rect, categories->count, row_height,
-                                  loom_virtual_list_reveal(&list, category_selected));
-    category_scroll = list.scroll;
-    const loom_rect clip = category_rect;
-    for (size_t index = list.first; index < list.last; index++) {
-        const loom_rect raw = loom_virtual_list_item(&list, index);
-        const loom_rect row = {raw.x, raw.y + 6 * scale, raw.w, raw.h - 12 * scale};
-        const bool focused = index == category_selected;
-        const bool hot = hovered(row);
-        loom_fill(ctx, row, &clip, hot ? HOT : CARD, 12 * scale);
-        loom_stroke(ctx, row, &clip, focused ? ACCENT : BORDER, focused ? 4 * scale : 2 * scale,
-                    12 * scale);
-        loom_label(ctx, (loom_rect){row.x + 28 * scale, row.y + 18 * scale, row.w - 56 * scale,
-                                    34 * scale},
-                   &clip, categories->cards[index].title, TEXT, 26 * scale);
-        loom_label(ctx, (loom_rect){row.x + 28 * scale, row.y + 52 * scale, row.w - 56 * scale,
-                                    24 * scale},
-                   &clip, categories->cards[index].subtitle, DIM, 18 * scale);
-        if (hot && pointer_press) {
-            category_selected = index;
-            activate();
-            return;
-        }
-    }
-    static const loom_color fade = {9, 13, 22, 255};
-    const float fade_height = 64 * scale;
-    if (list.scroll > 0)
-        loom_fade(ctx, (loom_rect){clip.x, clip.y, clip.w, fade_height}, &clip, fade,
-                  LOOM_FADE_TOP);
-    if (list.scroll < loom_virtual_list_max_scroll(&list))
-        loom_fade(ctx, (loom_rect){clip.x, clip.y + clip.h - fade_height, clip.w, fade_height},
-                  &clip, fade, LOOM_FADE_BOTTOM);
 }
 
 static void draw_grid(loom_context *ctx, float width, float height, float scale)
@@ -2449,6 +2371,16 @@ static void draw_grid(loom_context *ctx, float width, float height, float scale)
          * with the pointer, which never calls move_grid. */
         request_page((uint32_t)min_size(row_index * grid_columns, dec(grid_total)));
     }
+
+    static const loom_color fade = {9, 13, 22, 255};
+    const float fade_height = 72 * scale;
+    if (list.scroll > 0)
+        loom_fade(ctx, (loom_rect){grid_rect.x, grid_rect.y, grid_rect.w, fade_height},
+                  &grid_rect, fade, LOOM_FADE_TOP);
+    if (list.scroll < loom_virtual_list_max_scroll(&list))
+        loom_fade(ctx, (loom_rect){grid_rect.x, grid_rect.y + grid_rect.h - fade_height,
+                                   grid_rect.w, fade_height},
+                  &grid_rect, fade, LOOM_FADE_BOTTOM);
 
     const loom_rect track = {grid_rect.x + grid_rect.w, grid_rect.y, 4 * scale, grid_rect.h};
     const float max_scroll = loom_virtual_list_max_scroll(&list);
@@ -2691,17 +2623,31 @@ static void draw_sidebar(loom_context *ctx, float height, float scale)
     const loom_rect panel = {0, 0, 354 * scale, height};
     loom_fill(ctx, panel, NULL, PANEL, 0);
     loom_stroke(ctx, panel, NULL, BORDER, 2 * scale, 0);
-    static const char *const entries[] = {"All categories", "Settings"};
-    for (size_t index = 0; index < sizeof(entries) / sizeof(entries[0]); index++) {
-        const loom_rect row = {26 * scale, (100 + index * 82) * scale,
-                               panel.w - 52 * scale, 62 * scale};
+    loom_label(ctx, (loom_rect){26 * scale, 28 * scale, panel.w - 52 * scale, 34 * scale},
+               &panel, "Categories", DIM, 20 * scale);
+    const loom_rect list_rect = {18 * scale, 78 * scale, panel.w - 36 * scale,
+                                 panel.h - 96 * scale};
+    const size_t count = categories_row.count + 1; /* the final row is Settings */
+    const float row_height = 76 * scale;
+    loom_virtual_list list = loom_virtual_list_init(list_rect, count, row_height, sidebar_scroll);
+    if (sidebar_reveal) {
+        list = loom_virtual_list_init(list_rect, count, row_height,
+                                      loom_virtual_list_reveal(&list, sidebar_focus));
+        sidebar_reveal = false;
+    }
+    sidebar_scroll = list.scroll;
+    for (size_t index = list.first; index < list.last; index++) {
+        const loom_rect raw = loom_virtual_list_item(&list, index);
+        const loom_rect row = {raw.x, raw.y + 5 * scale, raw.w, raw.h - 10 * scale};
         const bool hot = hovered(row);
-        loom_fill(ctx, row, &panel, hot ? HOT : CARD, 10 * scale);
-        loom_stroke(ctx, row, &panel, sidebar_focus == index ? ACCENT : BORDER,
+        loom_fill(ctx, row, &list_rect, hot ? HOT : CARD, 10 * scale);
+        loom_stroke(ctx, row, &list_rect, sidebar_focus == index ? ACCENT : BORDER,
                     sidebar_focus == index ? 3 * scale : 1 * scale, 10 * scale);
         loom_label(ctx, (loom_rect){row.x + 22 * scale, row.y + 16 * scale,
                                     row.w - 44 * scale, 32 * scale},
-                   &row, entries[index], TEXT, 22 * scale);
+                   &list_rect,
+                   index < categories_row.count ? categories_row.cards[index].title : "Settings",
+                   TEXT, 22 * scale);
         if (hot && pointer_press) {
             sidebar_focus = index;
             activate_sidebar();
@@ -2751,7 +2697,6 @@ static void build_ui(loom_context *ctx)
     case SCREEN_AUTH: draw_auth(ctx, width, scale); break;
     case SCREEN_QUICK: draw_quick(ctx, width, scale); break;
     case SCREEN_HOME: draw_home(ctx, width, height, scale); break;
-    case SCREEN_CATEGORIES: draw_categories(ctx, width, height, scale); break;
     case SCREEN_GRID: draw_grid(ctx, width, height, scale); break;
     case SCREEN_DETAILS: draw_details(ctx, width, scale); break;
     case SCREEN_SEASON: draw_season(ctx, width, height, scale); break;
