@@ -613,7 +613,7 @@ static size_t discovered_count;
 static bool discovering;
 static uint64_t discovery_until;
 static bool connecting;
-static char server_name[128];
+static char server_name[512];
 
 /* Quick Connect. */
 static char quick_code[16];
@@ -1790,155 +1790,161 @@ static void move_home(direction where)
       focus_cursor_move_requested = true;
 }
 
-static void move(direction where)
-{
-    if (sidebar_open) {
-        if (where == DIR_UP) {
-          const size_t next = dec(sidebar_focus);
-          if (next != sidebar_focus) {
-            sidebar_focus = next;
-            sidebar_reveal = true;
-            focus_cursor_move_requested = true;
-          }
-        } else if (where == DIR_DOWN) {
-          const size_t next = min_size(sidebar_focus + 1, categories_row.count);
-          if (next != sidebar_focus) {
-            sidebar_focus = next;
-            sidebar_reveal = true;
-            focus_cursor_move_requested = true;
-          }
-        } else if (where == DIR_RIGHT) {
-          close_sidebar();
-        }
-        return;
+static void move(direction where, bool repeat) {
+  if (sidebar_open) {
+    if (where == DIR_UP) {
+      const size_t next = dec(sidebar_focus);
+      if (next != sidebar_focus) {
+        sidebar_focus = next;
+        sidebar_reveal = true;
+        focus_cursor_move_requested = true;
+      }
+    } else if (where == DIR_DOWN) {
+      const size_t next = min_size(sidebar_focus + 1, categories_row.count);
+      if (next != sidebar_focus) {
+        sidebar_focus = next;
+        sidebar_reveal = true;
+        focus_cursor_move_requested = true;
+      }
+    } else if (where == DIR_RIGHT) {
+      close_sidebar();
     }
+    return;
+  }
+  if (where == DIR_LEFT) {
+    bool at_left = screen == SCREEN_SERVER || screen == SCREEN_AUTH ||
+                   screen == SCREEN_QUICK || screen == SCREEN_DETAILS ||
+                   screen == SCREEN_SETTINGS ||
+                   (screen == SCREEN_HOME && col_focus[row_focus] == 0) ||
+                   (screen == SCREEN_GRID && grid_columns != 0 &&
+                    grid_selected % grid_columns == 0) ||
+                   (screen == SCREEN_SEASON && episode_selected == 0) ||
+                   (screen == SCREEN_PLAYBACK && focus == 0);
+    if (at_left) {
+      if (!repeat) {
+        open_sidebar();
+      }
+    }
+  }
+  switch (screen) {
+  case SCREEN_HOME:
+    move_home(where);
+    break;
+  case SCREEN_AUTH:
+    if (where == DIR_UP)
+      focus = dec(focus);
+    else if (where == DIR_DOWN)
+      focus = min_size(focus + 1, focus_count() - 1);
+    else if (where == DIR_LEFT && focus == 3)
+      focus = 2;
+    else if (where == DIR_RIGHT && focus == 2)
+      focus = 3;
+    break;
+  case SCREEN_GRID:
+    move_grid(where);
+    break;
+  case SCREEN_SEASON:
+    if (where == DIR_UP) {
+      const size_t next = dec(episode_selected);
+      focus_cursor_move_requested |= next != episode_selected;
+      episode_selected = next;
+    } else if (where == DIR_DOWN) {
+      const size_t next =
+          min_size(episode_selected + 1, dec(episodes_row.count));
+      focus_cursor_move_requested |= next != episode_selected;
+      episode_selected = next;
+    }
+    episode_reveal = true;
+    break;
+  /* The details screen's seasons and the playback transport read as a row;
+   * every other screen is a single column of controls. */
+  case SCREEN_DETAILS:
+  case SCREEN_PLAYBACK:
     if (where == DIR_LEFT) {
-        bool at_left = screen == SCREEN_SERVER || screen == SCREEN_AUTH || screen == SCREEN_QUICK ||
-                       screen == SCREEN_DETAILS || screen == SCREEN_SETTINGS ||
-                       (screen == SCREEN_HOME && col_focus[row_focus] == 0) ||
-                       (screen == SCREEN_GRID && grid_columns != 0 &&
-                        grid_selected % grid_columns == 0) ||
-                       (screen == SCREEN_SEASON && episode_selected == 0) ||
-                       (screen == SCREEN_PLAYBACK && focus == 0);
-        if (at_left) {
-            open_sidebar();
-            return;
-        }
+      const size_t next = dec(focus);
+      focus_cursor_move_requested |= screen == SCREEN_DETAILS && next != focus;
+      focus = next;
+    } else if (where == DIR_RIGHT) {
+      const size_t next = min_size(focus + 1, focus_count() - 1);
+      focus_cursor_move_requested |= screen == SCREEN_DETAILS && next != focus;
+      focus = next;
     }
-    switch (screen) {
-    case SCREEN_HOME:
-        move_home(where);
-        break;
-    case SCREEN_AUTH:
-        if (where == DIR_UP)
-            focus = dec(focus);
-        else if (where == DIR_DOWN)
-            focus = min_size(focus + 1, focus_count() - 1);
-        else if (where == DIR_LEFT && focus == 3)
-            focus = 2;
-        else if (where == DIR_RIGHT && focus == 2)
-            focus = 3;
-        break;
-    case SCREEN_GRID:
-        move_grid(where);
-        break;
-    case SCREEN_SEASON:
-      if (where == DIR_UP) {
-        const size_t next = dec(episode_selected);
-        focus_cursor_move_requested |= next != episode_selected;
-        episode_selected = next;
-      } else if (where == DIR_DOWN) {
-        const size_t next =
-            min_size(episode_selected + 1, dec(episodes_row.count));
-        focus_cursor_move_requested |= next != episode_selected;
-        episode_selected = next;
-      }
-        episode_reveal = true;
-        break;
-    /* The details screen's seasons and the playback transport read as a row; every other
-     * screen is a single column of controls. */
-    case SCREEN_DETAILS:
-    case SCREEN_PLAYBACK:
-      if (where == DIR_LEFT) {
-        const size_t next = dec(focus);
-        focus_cursor_move_requested |=
-            screen == SCREEN_DETAILS && next != focus;
-        focus = next;
-      } else if (where == DIR_RIGHT) {
-        const size_t next = min_size(focus + 1, focus_count() - 1);
-        focus_cursor_move_requested |=
-            screen == SCREEN_DETAILS && next != focus;
-        focus = next;
-      }
-        break;
-    default:
-        if (where == DIR_UP)
-            focus = dec(focus);
-        else if (where == DIR_DOWN)
-            focus = min_size(focus + 1, focus_count() - 1);
-        break;
-    }
+    break;
+  default:
+    if (where == DIR_UP)
+      focus = dec(focus);
+    else if (where == DIR_DOWN)
+      focus = min_size(focus + 1, focus_count() - 1);
+    break;
+  }
 }
 
-static void navigate(uint32_t code)
-{
-    if (jf_window_is_back_key(code)) {
-        go_back();
-        return;
-    }
-    switch (code) {
-    case 103: move(DIR_UP); break;
-    case 108: move(DIR_DOWN); break;
-    case 105: move(DIR_LEFT); break;
-    case 106: move(DIR_RIGHT); break;
-    case 28:
-    case 96:
-    case 352:
-        if (sidebar_open)
-            activate_sidebar();
-        else
-            activate();
-        break;
-    default: break;
-    }
+static void navigate(uint32_t code, bool repeat) {
+  if (jf_window_is_back_key(code)) {
+    go_back();
+    return;
+  }
+  switch (code) {
+  case 103:
+    move(DIR_UP, repeat);
+    break;
+  case 108:
+    move(DIR_DOWN, repeat);
+    break;
+  case 105:
+    move(DIR_LEFT, repeat);
+    break;
+  case 106:
+    move(DIR_RIGHT, repeat);
+    break;
+  case 28:
+  case 96:
+  case 352:
+    if (sidebar_open)
+      activate_sidebar();
+    else
+      activate();
+    break;
+  default:
+    break;
+  }
 }
 
 /* ------------------------------------------------------------------- input */
 
-static void on_key(uint32_t code, bool pressed)
-{
-    if (!pressed)
-        return;
-    jf_window_frame_requested = true;
-    if (jf_window_is_back_key(code)) {
-        go_back();
-        return;
+static void on_key(uint32_t code, bool pressed, bool repeat) {
+  if (!pressed)
+    return;
+  jf_window_frame_requested = true;
+  if (jf_window_is_back_key(code)) {
+    go_back();
+    return;
+  }
+  if (screen == SCREEN_PLAYBACK) {
+    if (code == 103) { /* Up dismisses player chrome immediately. */
+      playback_controls_until = 0;
+      return;
     }
-    if (screen == SCREEN_PLAYBACK) {
-        if (code == 103) { /* Up dismisses player chrome immediately. */
-            playback_controls_until = 0;
-            return;
-        }
-        playback_controls_until = now_ns() + PLAYBACK_CONTROLS_NS;
-    }
-    if (code == 88) { /* F12 */
-        capture_requested = true;
-        return;
-    }
-    if (active_field != EDIT_NONE) {
-        if (code == 1 || code == 158 || code == 28 || code == 96 || code == 352)
-            end_edit();
-        else if (code == 14)
-            erase_text(1);
-        return;
-    }
-    /* Blue button / F9: sign out, the only way back to the server screen once credentials
-     * are stored. */
-    if (code == 67 && screen != SCREEN_SERVER && screen != SCREEN_AUTH) {
-        sign_out();
-        return;
-    }
-    navigate(code);
+    playback_controls_until = now_ns() + PLAYBACK_CONTROLS_NS;
+  }
+  if (code == 88) { /* F12 */
+    capture_requested = true;
+    return;
+  }
+  if (active_field != EDIT_NONE) {
+    if (code == 1 || code == 158 || code == 28 || code == 96 || code == 352)
+      end_edit();
+    else if (code == 14)
+      erase_text(1);
+    return;
+  }
+  /* Blue button / F9: sign out, the only way back to the server screen once
+   * credentials are stored. */
+  if (code == 67 && screen != SCREEN_SERVER && screen != SCREEN_AUTH) {
+    sign_out();
+    return;
+  }
+  navigate(code, repeat);
 }
 
 static void move_cursor(jf_fixed x, jf_fixed y)
@@ -1960,8 +1966,8 @@ static void on_event(const jf_event *event)
 
     switch (event->kind) {
     case JF_EVENT_KEY:
-        on_key(event->key.code, event->key.pressed);
-        break;
+      on_key(event->key.code, event->key.pressed, event->key.repeat);
+      break;
     case JF_EVENT_TEXT_COMMIT:
         append_text(event->text);
         break;
@@ -3177,7 +3183,7 @@ static bool step_script(void)
     default: break;
     }
     if (key != 0)
-        on_key(key, true);
+      on_key(key, true, false);
     if (command == '[' || command == ']') {
         jf_event wheel;
         memset(&wheel, 0, sizeof(wheel));

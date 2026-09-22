@@ -36,7 +36,10 @@ typedef enum {
 typedef struct {
     jf_event_kind kind;
     union {
-        struct { uint32_t code; bool pressed; } key;       /* raw evdev, no XKB +8 */
+      struct {
+        uint32_t code;
+        bool pressed, repeat;
+      } key; /* raw evdev, no XKB +8 */
         struct { jf_fixed x, y; } pointer;
         struct { uint32_t button; bool pressed; } button;
         struct { uint32_t axis; jf_fixed value; } axis;

@@ -306,6 +306,7 @@ static void translate(const SDL_Event *event)
         out.kind = JF_EVENT_KEY;
         out.key.code = code;
         out.key.pressed = down;
+        out.key.repeat = down && event->key.repeat != 0;
         emit(&out);
         break;
     }
