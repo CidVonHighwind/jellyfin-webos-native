@@ -23,7 +23,9 @@ static inline bool loom_contains(loom_rect r, float px, float py)
 loom_rect loom_intersect(loom_rect a, loom_rect b);
 loom_rect loom_inset(loom_rect r, float n);
 
-typedef enum { LOOM_RECTANGLE, LOOM_BORDER, LOOM_TEXT, LOOM_IMAGE } loom_command_kind;
+typedef enum { LOOM_FADE_TOP, LOOM_FADE_BOTTOM, LOOM_FADE_LEFT, LOOM_FADE_RIGHT } loom_fade_edge;
+
+typedef enum { LOOM_RECTANGLE, LOOM_BORDER, LOOM_TEXT, LOOM_IMAGE, LOOM_FADE } loom_command_kind;
 
 typedef struct {
     loom_rect rect;
@@ -46,6 +48,7 @@ typedef struct {
              * a draw call, because this GPU has no bindless textures. */
             uint32_t texture;
         } image;
+        struct { loom_color color; loom_fade_edge edge; } fade;
     };
 } loom_command;
 
@@ -67,6 +70,10 @@ void loom_label(loom_context *ctx, loom_rect rect, const loom_rect *clip, const 
 void loom_image(loom_context *ctx, loom_rect rect, const loom_rect *clip, const float uv[4], const loom_color tint, float radius);
 /* Same, from a texture the application owns rather than the default one. */
 void loom_textured(loom_context *ctx, loom_rect rect, const loom_rect *clip, uint32_t texture, const float uv[4], const loom_color tint, float radius);
+/* A smooth opaque-to-transparent overlay at one viewport edge. It makes offscreen list
+ * content recede without the visible bands produced by stacking translucent rectangles. */
+void loom_fade(loom_context *ctx, loom_rect rect, const loom_rect *clip, const loom_color color,
+               loom_fade_edge edge);
 
 /* Cursor layout: the retained loom flex machinery reduced to what a TV screen uses most,
  * ordered rows and columns with padding and a gap. */

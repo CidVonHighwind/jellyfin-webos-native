@@ -12,11 +12,12 @@
 #include "ui_border.h"
 #include "ui_glyph.h"
 #include "ui_image.h"
+#include "ui_fade.h"
 
 /* One program per kind of instance, so no fragment ever executes another kind's code.
  * The kind is also part of the batch state, so switching program costs a flush and
  * nothing else. */
-typedef enum { KIND_FILL, KIND_ROUND, KIND_BORDER, KIND_GLYPH, KIND_IMAGE, KIND_COUNT } kind;
+typedef enum { KIND_FILL, KIND_ROUND, KIND_BORDER, KIND_GLYPH, KIND_IMAGE, KIND_FADE, KIND_COUNT } kind;
 
 /* Slang hands out bindings in declaration order and the uniform block takes 0, so the
  * shader's single sampler is binding 1. Check the generated GLSL if the shader's
@@ -313,6 +314,15 @@ static void push(jf_renderer *r, loom_rect rect, loom_rect clip, const float uv[
     out->shape[3] = 0;
 }
 
+static void push_fade(jf_renderer *r, loom_rect rect, loom_rect clip, const loom_command *command)
+{
+    const size_t before = r->instance_count;
+    static const float no_uv[4] = {0, 0, 0, 0};
+    push(r, rect, clip, no_uv, command->fade.color, 0, 0);
+    if (r->instance_count != before)
+        r->instances[r->instance_count - 1].shape[2] = (float)command->fade.edge;
+}
+
 static void append_text(jf_renderer *r, loom_rect rect, loom_rect clip, const loom_command *command)
 {
     const float size = command->text.size;
@@ -408,6 +418,10 @@ void jf_renderer_draw(jf_renderer *r, const loom_command *commands, size_t count
         case LOOM_IMAGE:
             want(r, KIND_IMAGE, c->image.texture != 0 ? c->image.texture : r->media_texture, u, true);
             push(r, c->rect, c->clip, c->image.uv, c->image.tint, c->image.radius, 0);
+            break;
+        case LOOM_FADE:
+            want(r, KIND_FADE, 0, u, true);
+            push_fade(r, c->rect, c->clip, c);
             break;
         }
     }

@@ -2303,6 +2303,14 @@ static void draw_row(loom_context *ctx, const item_row *row, size_t id, float to
             return;
         }
     }
+    static const loom_color fade = {9, 13, 22, 255};
+    const float fade_width = 86 * scale;
+    if (first > 0)
+        loom_fade(ctx, (loom_rect){strip.x, strip.y, fade_width, strip.h}, &strip, fade,
+                  LOOM_FADE_LEFT);
+    if (first + visible < row->count)
+        loom_fade(ctx, (loom_rect){strip.x + strip.w - fade_width, strip.y, fade_width, strip.h},
+                  &strip, fade, LOOM_FADE_RIGHT);
 }
 
 static void draw_home(loom_context *ctx, float width, float height, float scale)
@@ -2324,20 +2332,15 @@ static void draw_home(loom_context *ctx, float width, float height, float scale)
     for (size_t id = 0; id < ROW_COUNT; id++)
         draw_row(ctx, &rows[id], id, loom_virtual_list_item(&list, id).y, width, ctx->viewport,
                  scale);
-    const float max_scroll = loom_virtual_list_max_scroll(&list);
-    const float fade = 72 * scale;
-    for (unsigned step = 0; step < 8; step++) {
-        const uint8_t alpha = (uint8_t)((8 - step) * 200 / 8);
-        loom_color shade = {BG[0], BG[1], BG[2], alpha};
-        if (list.scroll > 0)
-            loom_fill(ctx, (loom_rect){home_rect.x, home_rect.y + step * fade / 8, home_rect.w,
-                                       fade / 8 + 1},
-                      &home_rect, shade, 0);
-        if (list.scroll < max_scroll)
-            loom_fill(ctx, (loom_rect){home_rect.x, home_rect.y + home_rect.h - (step + 1) * fade / 8,
-                                       home_rect.w, fade / 8 + 1},
-                      &home_rect, shade, 0);
-    }
+    static const loom_color fade = {9, 13, 22, 255};
+    const float fade_height = 78 * scale;
+    if (list.scroll > 0)
+        loom_fade(ctx, (loom_rect){home_rect.x, home_rect.y, home_rect.w, fade_height},
+                  &home_rect, fade, LOOM_FADE_TOP);
+    if (list.scroll < loom_virtual_list_max_scroll(&list))
+        loom_fade(ctx, (loom_rect){home_rect.x, home_rect.y + home_rect.h - fade_height,
+                                   home_rect.w, fade_height},
+                  &home_rect, fade, LOOM_FADE_BOTTOM);
 }
 
 static void draw_categories(loom_context *ctx, float width, float height, float scale)
@@ -2382,19 +2385,14 @@ static void draw_categories(loom_context *ctx, float width, float height, float 
             return;
         }
     }
-    const float max_scroll = loom_virtual_list_max_scroll(&list);
-    const float fade = 60 * scale;
-    for (unsigned step = 0; step < 8; step++) {
-        const uint8_t alpha = (uint8_t)((8 - step) * 200 / 8);
-        loom_color shade = {BG[0], BG[1], BG[2], alpha};
-        if (list.scroll > 0)
-            loom_fill(ctx, (loom_rect){clip.x, clip.y + step * fade / 8, clip.w, fade / 8 + 1},
-                      &clip, shade, 0);
-        if (list.scroll < max_scroll)
-            loom_fill(ctx, (loom_rect){clip.x, clip.y + clip.h - (step + 1) * fade / 8, clip.w,
-                                       fade / 8 + 1},
-                      &clip, shade, 0);
-    }
+    static const loom_color fade = {9, 13, 22, 255};
+    const float fade_height = 64 * scale;
+    if (list.scroll > 0)
+        loom_fade(ctx, (loom_rect){clip.x, clip.y, clip.w, fade_height}, &clip, fade,
+                  LOOM_FADE_TOP);
+    if (list.scroll < loom_virtual_list_max_scroll(&list))
+        loom_fade(ctx, (loom_rect){clip.x, clip.y + clip.h - fade_height, clip.w, fade_height},
+                  &clip, fade, LOOM_FADE_BOTTOM);
 }
 
 static void draw_grid(loom_context *ctx, float width, float height, float scale)
@@ -2624,20 +2622,15 @@ static void draw_season(loom_context *ctx, float width, float height, float scal
             return;
         }
     }
-    const float max_scroll = loom_virtual_list_max_scroll(&list);
-    const float fade = 54 * scale;
-    for (unsigned step = 0; step < 8; step++) {
-        const uint8_t alpha = (uint8_t)((8 - step) * 200 / 8);
-        loom_color shade = {BG[0], BG[1], BG[2], alpha};
-        if (list.scroll > 0)
-            loom_fill(ctx, (loom_rect){content.x, content.y + step * fade / 8, content.w,
-                                       fade / 8 + 1},
-                      &content, shade, 0);
-        if (list.scroll < max_scroll)
-            loom_fill(ctx, (loom_rect){content.x, content.y + content.h - (step + 1) * fade / 8,
-                                       content.w, fade / 8 + 1},
-                      &content, shade, 0);
-    }
+    static const loom_color fade = {9, 13, 22, 255};
+    const float fade_height = 64 * scale;
+    if (list.scroll > 0)
+        loom_fade(ctx, (loom_rect){content.x, content.y, content.w, fade_height}, &content, fade,
+                  LOOM_FADE_TOP);
+    if (list.scroll < loom_virtual_list_max_scroll(&list))
+        loom_fade(ctx, (loom_rect){content.x, content.y + content.h - fade_height, content.w,
+                                   fade_height},
+                  &content, fade, LOOM_FADE_BOTTOM);
 }
 
 static void draw_playback(loom_context *ctx, float width, float height, float scale)

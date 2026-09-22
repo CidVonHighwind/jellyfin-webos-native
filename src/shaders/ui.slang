@@ -125,3 +125,14 @@ float4 fsImage(VSOut i) : SV_Target {
         alpha = 1.0 - smoothstep(0.0, 1.0, roundedDistance(i.local, i.size, r));
     return atlas.Sample(i.uv) * float4(i.color.rgb, i.color.a * alpha);
 }
+
+// The fade itself is one fragment program, not a staircase of translucent rectangles.
+// shape.z is LOOM_FADE_{TOP,BOTTOM,LEFT,RIGHT}; its alpha is opaque exactly at the viewport
+// edge and reaches zero at the content side of this small overlay rectangle.
+[shader("fragment")]
+float4 fsFade(VSOut i) : SV_Target {
+    float t = i.shape.z < 2.0 ? i.local.y / max(i.size.y, 1e-6)
+                               : i.local.x / max(i.size.x, 1e-6);
+    float alpha = (i.shape.z == 0.0 || i.shape.z == 2.0) ? 1.0 - t : t;
+    return float4(i.color.rgb, i.color.a * smoothstep(0.0, 1.0, alpha));
+}

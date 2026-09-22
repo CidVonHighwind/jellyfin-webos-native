@@ -72,7 +72,8 @@ if (HAVE_PLATFORM)
     target_link_directories(jf-ui PUBLIC ${FREETYPE_LIBRARY_DIRS})
     target_link_libraries(jf-ui PUBLIC jf-platform ${FREETYPE_LIBRARIES} m)
     foreach (_entry vsUi:ui_vs:vertex fsFill:ui_fill:fragment fsRound:ui_round:fragment
-            fsBorder:ui_border:fragment fsGlyph:ui_glyph:fragment fsImage:ui_image:fragment)
+            fsBorder:ui_border:fragment fsGlyph:ui_glyph:fragment fsImage:ui_image:fragment
+            fsFade:ui_fade:fragment)
         string(REPLACE ":" ";" _parts "${_entry}")
         list(GET _parts 0 _fn)
         list(GET _parts 1 _symbol)

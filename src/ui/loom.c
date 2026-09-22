@@ -110,6 +110,17 @@ void loom_image(loom_context *ctx, loom_rect rect, const loom_rect *clip, const 
     loom_textured(ctx, rect, clip, 0, uv, tint, radius);
 }
 
+void loom_fade(loom_context *ctx, loom_rect rect, const loom_rect *clip, const loom_color color,
+               loom_fade_edge edge)
+{
+    loom_command *c = append(ctx, rect, clip);
+    if (c == NULL)
+        return;
+    c->kind = LOOM_FADE;
+    memcpy(c->fade.color, color, sizeof(loom_color));
+    c->fade.edge = edge;
+}
+
 /* ------------------------------------------------------------------ layout */
 
 loom_stack loom_stack_init(loom_rect rect, loom_axis axis, float padding, float gap)
