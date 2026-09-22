@@ -2261,7 +2261,9 @@ static void draw_row(loom_context *ctx, const item_row *row, size_t id, float to
     /* The cursor moves across the fully visible cards first. Only when it reaches the last
      * full slot does the strip translate: one predecessor then starts beyond the left edge
      * and exits through the viewport fade. */
-    size_t visible = (size_t)(strip.w / (card_w + gap));
+    /* The final fully visible card has no following gap. Counting that otherwise treats
+     * a fitting final slot as overflow and scrolls the carousel one item too early. */
+    size_t visible = (size_t)((strip.w + gap) / (card_w + gap));
     if (visible < 1)
         visible = 1;
     const size_t first = col_focus[id] >= visible ? col_focus[id] - visible : 0;
