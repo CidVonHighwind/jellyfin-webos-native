@@ -147,6 +147,7 @@ add_executable(jellyfin
         app/main.c
         jf/api.c
         jf/arena.c
+        jf/cfg.c
         jf/image.c
         jf/store.c)
 target_include_directories(jellyfin SYSTEM PRIVATE

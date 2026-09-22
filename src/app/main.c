@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 #include "../jf/api.h"
+#include "../jf/cfg.h"
 #include "../jf/player.h"
 #include "../platform/gl.h"
 #include "../platform/luna.h"
@@ -55,6 +56,61 @@ static uint64_t now_ns(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+typedef struct {
+  float value, start, target;
+  uint64_t started_at, duration;
+} animated_float;
+
+#define NAVIGATION_ANIMATION_NS 180000000ull
+#define SIDEBAR_ANIMATION_NS 280000000ull
+
+static bool animations_enabled = true;
+static int animations_preference = 1;
+static jf_arena preferences_arena;
+static cfg preferences;
+
+static bool animated_float_running(const animated_float *value) {
+  return value->started_at != 0;
+}
+
+static void animated_float_snap(animated_float *value, float target) {
+  value->value = target;
+  value->start = target;
+  value->target = target;
+  value->started_at = 0;
+  value->duration = 0;
+}
+
+static void animated_float_update(animated_float *value, uint64_t now) {
+  if (!animated_float_running(value))
+    return;
+  const float progress =
+      value->duration == 0 ? 1.0f
+                           : (float)(now - value->started_at) / value->duration;
+  if (progress >= 1.0f) {
+    animated_float_snap(value, value->target);
+    return;
+  }
+  /* Ease-out exponential: quick feedback, with the last few pixels settling
+   * softly. */
+  const float eased = 1.0f - powf(2.0f, -10.0f * progress);
+  value->value = value->start + (value->target - value->start) * eased;
+}
+
+static void animated_float_set(animated_float *value, float target,
+                               uint64_t duration) {
+  if (!animations_enabled || fabsf(value->target - target) < 0.01f) {
+    if (!animations_enabled)
+      animated_float_snap(value, target);
+    return;
+  }
+  animated_float_update(value, now_ns());
+  value->start = value->value;
+  value->target = target;
+  value->started_at = now_ns();
+  value->duration = duration;
 }
 
 static size_t min_size(size_t a, size_t b) { return a < b ? a : b; }
@@ -518,6 +574,8 @@ static size_t focus;
 static size_t row_focus;
 static size_t col_focus[ROW_COUNT];
 static float home_scroll;
+static animated_float home_scroll_motion;
+static animated_float row_offset_motion[ROW_COUNT];
 static loom_rect home_rect;
 static float home_row_height = 470;
 static bool home_reveal;
@@ -578,6 +636,7 @@ static uint32_t grid_at[WINDOW_SIZE];
 static uint32_t grid_requested[WINDOW_PAGES];
 static size_t grid_selected;
 static float grid_scroll;
+static animated_float grid_scroll_motion;
 static loom_rect grid_rect;
 static size_t grid_columns = 6;
 static float grid_row_height = 360;
@@ -596,6 +655,7 @@ static item_row episodes_row = {"Episodes", false, NULL, EPISODES_CAPACITY, 0, f
 static size_t episode_selected;
 static card season_detail;
 static float episode_scroll;
+static animated_float episode_scroll_motion;
 static loom_rect episode_rect;
 static float episode_row_height = 170;
 static bool episode_reveal;
@@ -628,10 +688,22 @@ static bool pointer_press;
 
 /* The sidebar is an overlay containing every library category and the one settings row. */
 static bool sidebar_open;
+static bool sidebar_closing;
 static size_t sidebar_focus;
 static float sidebar_scroll;
+static animated_float sidebar_slide;
+static animated_float sidebar_scroll_motion;
 static bool sidebar_reveal;
 static screen_id sidebar_return_screen;
+
+typedef struct {
+  animated_float x, y, w, h;
+  loom_rect rendered;
+  unsigned owner;
+  bool known;
+} navigation_cursor;
+static navigation_cursor focus_cursor;
+static bool focus_cursor_move_requested;
 
 static char status_text[200];
 static bool status_error;
@@ -1338,21 +1410,29 @@ static void open_sidebar(void)
 {
     end_edit();
     sidebar_open = true;
-    sidebar_focus = 0;
-    sidebar_scroll = 0;
+    sidebar_closing = false;
+    sidebar_focus = min_size(sidebar_focus, categories_row.count);
     sidebar_reveal = true;
     sidebar_return_screen = screen;
+    animated_float_set(&sidebar_slide, 1.0f, SIDEBAR_ANIMATION_NS);
+}
+
+static void close_sidebar(void) {
+  if (!sidebar_open || sidebar_closing)
+    return;
+  sidebar_closing = true;
+  animated_float_set(&sidebar_slide, 0.0f, NAVIGATION_ANIMATION_NS);
 }
 
 static void activate_sidebar(void)
 {
-    sidebar_open = false;
-    if (sidebar_focus < categories_row.count) {
-        const card chosen = categories_row.cards[sidebar_focus];
-        push();
-        open_grid(&chosen);
-        return;
-    }
+  close_sidebar();
+  if (sidebar_focus < categories_row.count) {
+    const card chosen = categories_row.cards[sidebar_focus];
+    push();
+    open_grid(&chosen);
+    return;
+  }
     screen = SCREEN_SETTINGS;
     focus = 0;
 }
@@ -1360,8 +1440,8 @@ static void activate_sidebar(void)
 static void go_back(void)
 {
     if (sidebar_open) {
-        sidebar_open = false;
-        return;
+      close_sidebar();
+      return;
     }
     if (screen == SCREEN_PLAYBACK) {
         report_playback(JF_JOB_PLAYBACK_PROGRESS);
@@ -1612,7 +1692,25 @@ static void activate(void)
         activate_playback();
         break;
     case SCREEN_SETTINGS:
+      if (focus == 0) {
+        animations_enabled = !animations_enabled;
+        animations_preference = animations_enabled ? 1 : 0;
+        cfg_section(&preferences, "ui");
+        cfg_set_int(&preferences, "animations", animations_preference);
+        (void)cfg_save(&preferences);
+        if (!animations_enabled) {
+          animated_float_snap(&sidebar_slide, sidebar_open ? 1.0f : 0.0f);
+          animated_float_snap(&home_scroll_motion, home_scroll);
+          animated_float_snap(&grid_scroll_motion, grid_scroll);
+          animated_float_snap(&episode_scroll_motion, episode_scroll);
+          animated_float_snap(&sidebar_scroll_motion, sidebar_scroll);
+          for (size_t index = 0; index < ROW_COUNT; index++)
+            animated_float_snap(&row_offset_motion[index], 0);
+          focus_cursor.known = false;
+        }
+      } else {
         sign_out();
+      }
         break;
     }
 }
@@ -1626,7 +1724,8 @@ static size_t focus_count(void)
     case SCREEN_AUTH: return 4;
     case SCREEN_QUICK: return 1;
     case SCREEN_PLAYBACK: return PLAYBACK_BUTTON_COUNT;
-    case SCREEN_SETTINGS: return 1;
+    case SCREEN_SETTINGS:
+      return 2;
     case SCREEN_DETAILS:
         return card_is(&detail, "Series") ? (seasons_row.count > 0 ? seasons_row.count : 1) : 1;
     default: return 1;
@@ -1659,6 +1758,7 @@ static void move_grid(direction where)
     if (next == grid_selected)
         return;
     grid_selected = next;
+    focus_cursor_move_requested = true;
     const loom_virtual_list list =
         loom_virtual_list_init(grid_rect, grid_rows_count(), grid_row_height, grid_scroll);
     grid_scroll = loom_virtual_list_reveal(&list, grid_selected / grid_columns);
@@ -1667,31 +1767,49 @@ static void move_grid(direction where)
 
 static void move_home(direction where)
 {
-    home_reveal = true;
-    switch (where) {
-    case DIR_UP: row_focus = dec(row_focus); break;
-    case DIR_DOWN: row_focus = min_size(row_focus + 1, ROW_COUNT - 1); break;
-    case DIR_LEFT: col_focus[row_focus] = dec(col_focus[row_focus]); break;
-    case DIR_RIGHT:
-        col_focus[row_focus] = min_size(col_focus[row_focus] + 1, dec(rows[row_focus].count));
-        break;
-    }
+  const size_t old_row = row_focus;
+  const size_t old_column = col_focus[row_focus];
+  home_reveal = true;
+  switch (where) {
+  case DIR_UP:
+    row_focus = dec(row_focus);
+    break;
+  case DIR_DOWN:
+    row_focus = min_size(row_focus + 1, ROW_COUNT - 1);
+    break;
+  case DIR_LEFT:
+    col_focus[row_focus] = dec(col_focus[row_focus]);
+    break;
+  case DIR_RIGHT:
+    col_focus[row_focus] =
+        min_size(col_focus[row_focus] + 1, dec(rows[row_focus].count));
+    break;
+  }
     col_focus[row_focus] = min_size(col_focus[row_focus], dec(rows[row_focus].count));
+    if (row_focus != old_row || col_focus[row_focus] != old_column)
+      focus_cursor_move_requested = true;
 }
 
 static void move(direction where)
 {
     if (sidebar_open) {
         if (where == DIR_UP) {
-            sidebar_focus = dec(sidebar_focus);
+          const size_t next = dec(sidebar_focus);
+          if (next != sidebar_focus) {
+            sidebar_focus = next;
             sidebar_reveal = true;
+            focus_cursor_move_requested = true;
+          }
         } else if (where == DIR_DOWN) {
-            sidebar_focus = min_size(sidebar_focus + 1, categories_row.count);
+          const size_t next = min_size(sidebar_focus + 1, categories_row.count);
+          if (next != sidebar_focus) {
+            sidebar_focus = next;
             sidebar_reveal = true;
-        } else if (where == DIR_LEFT)
-            sidebar_open = false;
-        else if (where == DIR_RIGHT)
-            activate_sidebar();
+            focus_cursor_move_requested = true;
+          }
+        } else if (where == DIR_RIGHT) {
+          close_sidebar();
+        }
         return;
     }
     if (where == DIR_LEFT) {
@@ -1725,20 +1843,33 @@ static void move(direction where)
         move_grid(where);
         break;
     case SCREEN_SEASON:
-        if (where == DIR_UP)
-            episode_selected = dec(episode_selected);
-        else if (where == DIR_DOWN)
-            episode_selected = min_size(episode_selected + 1, dec(episodes_row.count));
+      if (where == DIR_UP) {
+        const size_t next = dec(episode_selected);
+        focus_cursor_move_requested |= next != episode_selected;
+        episode_selected = next;
+      } else if (where == DIR_DOWN) {
+        const size_t next =
+            min_size(episode_selected + 1, dec(episodes_row.count));
+        focus_cursor_move_requested |= next != episode_selected;
+        episode_selected = next;
+      }
         episode_reveal = true;
         break;
     /* The details screen's seasons and the playback transport read as a row; every other
      * screen is a single column of controls. */
     case SCREEN_DETAILS:
     case SCREEN_PLAYBACK:
-        if (where == DIR_LEFT)
-            focus = dec(focus);
-        else if (where == DIR_RIGHT)
-            focus = min_size(focus + 1, focus_count() - 1);
+      if (where == DIR_LEFT) {
+        const size_t next = dec(focus);
+        focus_cursor_move_requested |=
+            screen == SCREEN_DETAILS && next != focus;
+        focus = next;
+      } else if (where == DIR_RIGHT) {
+        const size_t next = min_size(focus + 1, focus_count() - 1);
+        focus_cursor_move_requested |=
+            screen == SCREEN_DETAILS && next != focus;
+        focus = next;
+      }
         break;
     default:
         if (where == DIR_UP)
@@ -1889,6 +2020,46 @@ static bool hovered(loom_rect rect)
 }
 
 /* ------------------------------------------------------------------- views */
+
+static void draw_navigation_cursor(loom_context *ctx, loom_rect target,
+                                   const loom_rect *clip, float radius,
+                                   float scale, unsigned owner) {
+  if (!focus_cursor.known || focus_cursor.owner != owner) {
+    animated_float_snap(&focus_cursor.x, 0);
+    animated_float_snap(&focus_cursor.y, 0);
+    animated_float_snap(&focus_cursor.w, 0);
+    animated_float_snap(&focus_cursor.h, 0);
+    focus_cursor.rendered = target;
+    focus_cursor.owner = owner;
+    focus_cursor.known = true;
+    focus_cursor_move_requested = false;
+  } else if (focus_cursor_move_requested) {
+    /* The list's target can move while this is settling. Animate a delta from
+     * the last visible cursor to that live target so list scrolling carries the
+     * cursor with it. */
+    animated_float_snap(&focus_cursor.x, focus_cursor.rendered.x - target.x);
+    animated_float_snap(&focus_cursor.y, focus_cursor.rendered.y - target.y);
+    animated_float_snap(&focus_cursor.w, focus_cursor.rendered.w - target.w);
+    animated_float_snap(&focus_cursor.h, focus_cursor.rendered.h - target.h);
+    animated_float_set(&focus_cursor.x, 0, NAVIGATION_ANIMATION_NS);
+    animated_float_set(&focus_cursor.y, 0, NAVIGATION_ANIMATION_NS);
+    animated_float_set(&focus_cursor.w, 0, NAVIGATION_ANIMATION_NS);
+    animated_float_set(&focus_cursor.h, 0, NAVIGATION_ANIMATION_NS);
+    focus_cursor_move_requested = false;
+  } else if (!animated_float_running(&focus_cursor.x) &&
+             !animated_float_running(&focus_cursor.y)) {
+    animated_float_snap(&focus_cursor.x, 0);
+    animated_float_snap(&focus_cursor.y, 0);
+    animated_float_snap(&focus_cursor.w, 0);
+    animated_float_snap(&focus_cursor.h, 0);
+  }
+  const loom_rect cursor = {
+      target.x + focus_cursor.x.value, target.y + focus_cursor.y.value,
+      target.w + focus_cursor.w.value, target.h + focus_cursor.h.value};
+  focus_cursor.rendered = cursor;
+  loom_stroke(ctx, loom_inset(cursor, -4 * scale), clip, ACCENT, 4 * scale,
+              radius);
+}
 
 static void draw_heading_and_status(loom_context *ctx, float width, float height, float scale)
 {
@@ -2045,8 +2216,6 @@ static bool draw_card(loom_context *ctx, loom_rect rect, loom_rect clip, const c
                             POSTER_H))
             draw_spinner(ctx, art.x + art.w / 2, art.y + art.h / 2, 18 * scale, &clip, scale);
     }
-    if (focused)
-        loom_stroke(ctx, loom_inset(art, -4 * scale), &clip, ACCENT, 4 * scale, 12 * scale);
     draw_watch_badge(ctx, art, clip, source, scale);
 
     if (source->progress > 1) {
@@ -2269,30 +2438,49 @@ static void draw_row(loom_context *ctx, const item_row *row, size_t id, float to
     size_t visible = (size_t)((strip.w + gap) / (card_w + gap));
     if (visible < 1)
         visible = 1;
-    const size_t first = col_focus[id] >= visible ? col_focus[id] - visible : 0;
-    const float leading_offset = col_focus[id] >= visible ? card_w + gap : 0;
+    const float step = card_w + gap;
+    /* Keep the strip's position cumulative. Advancing the virtual first index
+     * while resetting this to one step made every movement after the first one
+     * jump. */
+    const size_t scroll_steps =
+        col_focus[id] >= visible ? col_focus[id] - visible + 1 : 0;
+    const size_t first = scroll_steps > 0 ? scroll_steps - 1 : 0;
+    animated_float_set(&row_offset_motion[id], (float)scroll_steps * step,
+                       NAVIGATION_ANIMATION_NS);
+    const float strip_scroll = row_offset_motion[id].value;
+    loom_rect selected_art = {0};
+    bool selected_drawn = false;
     for (size_t index = first; index < row->count; index++) {
-        const float x = strip.x - leading_offset + (float)(index - first) * (card_w + gap);
-        if (x >= width)
-            break;
-        const loom_rect rect = {x, strip.y, card_w, card_h};
-        const bool focused = row_focus == id && col_focus[id] == index;
-        if (draw_card(ctx, rect, clip, &row->cards[index], focused, scale)) {
-            row_focus = id;
-            col_focus[id] = index;
-            activate();
-            return;
+      const float x = strip.x - strip_scroll + (float)index * step;
+      if (x >= width)
+        break;
+      const loom_rect rect = {x, strip.y, card_w, card_h};
+      const bool focused = row_focus == id && col_focus[id] == index;
+      if (draw_card(ctx, rect, clip, &row->cards[index], focused, scale)) {
+        row_focus = id;
+        col_focus[id] = index;
+        activate();
+        return;
+      }
+        if (focused) {
+          selected_art =
+              (loom_rect){rect.x, rect.y, rect.w, rect.h - 78 * scale};
+          selected_drawn = true;
         }
     }
+    if (selected_drawn)
+      draw_navigation_cursor(ctx, selected_art, &clip, 12 * scale, scale,
+                             100 + (unsigned)id);
     static const loom_color fade = {9, 13, 22, 255};
     const float fade_width = 86 * scale;
-    if (col_focus[id] >= visible)
-        loom_fade(ctx, (loom_rect){0, strip.y, fade_width, strip.h}, &ctx->viewport, fade,
-                  LOOM_FADE_LEFT);
-    if (first + visible < row->count)
-        loom_fade(ctx, (loom_rect){ctx->viewport.x + ctx->viewport.w - fade_width, strip.y,
-                                   fade_width, strip.h},
-                  &ctx->viewport, fade, LOOM_FADE_RIGHT);
+    if (scroll_steps > 0)
+      loom_fade(ctx, (loom_rect){0, strip.y, fade_width, strip.h},
+                &ctx->viewport, fade, LOOM_FADE_LEFT);
+    if (scroll_steps + visible < row->count)
+      loom_fade(ctx,
+                (loom_rect){ctx->viewport.x + ctx->viewport.w - fade_width,
+                            strip.y, fade_width, strip.h},
+                &ctx->viewport, fade, LOOM_FADE_RIGHT);
 }
 
 static void draw_home(loom_context *ctx, float width, float height, float scale)
@@ -2303,14 +2491,19 @@ static void draw_home(loom_context *ctx, float width, float height, float scale)
     }
     home_row_height = 470 * scale;
     home_rect = (loom_rect){0, 0, width, height};
-    loom_virtual_list list =
-        loom_virtual_list_init(home_rect, ROW_COUNT, home_row_height, home_scroll);
+    loom_virtual_list target = loom_virtual_list_init(
+        home_rect, ROW_COUNT, home_row_height, home_scroll);
     if (home_reveal) {
-        list = loom_virtual_list_init(home_rect, ROW_COUNT, home_row_height,
-                                      loom_virtual_list_reveal(&list, row_focus));
-        home_reveal = false;
+      home_scroll = loom_virtual_list_reveal(&target, row_focus);
+      home_reveal = false;
     }
-    home_scroll = list.scroll;
+    target = loom_virtual_list_init(home_rect, ROW_COUNT, home_row_height,
+                                    home_scroll);
+    home_scroll = target.scroll;
+    animated_float_set(&home_scroll_motion, home_scroll,
+                       NAVIGATION_ANIMATION_NS);
+    const loom_virtual_list list = loom_virtual_list_init(
+        home_rect, ROW_COUNT, home_row_height, home_scroll_motion.value);
     for (size_t id = 0; id < ROW_COUNT; id++)
         draw_row(ctx, &rows[id], id, loom_virtual_list_item(&list, id).y, width, ctx->viewport,
                  scale);
@@ -2347,9 +2540,13 @@ static void draw_grid(loom_context *ctx, float width, float height, float scale)
     }
 
     const size_t row_count = grid_rows_count();
-    loom_virtual_list list =
-        loom_virtual_list_init(grid_rect, row_count, grid_row_height, grid_scroll);
-    grid_scroll = list.scroll;
+    const loom_virtual_list target = loom_virtual_list_init(
+        grid_rect, row_count, grid_row_height, grid_scroll);
+    grid_scroll = target.scroll;
+    animated_float_set(&grid_scroll_motion, grid_scroll,
+                       NAVIGATION_ANIMATION_NS);
+    const loom_virtual_list list = loom_virtual_list_init(
+        grid_rect, row_count, grid_row_height, grid_scroll_motion.value);
     loom_label(ctx, (loom_rect){margin, 40 * scale - grid_scroll, width - margin * 2, 50 * scale},
                NULL, grid_title, TEXT, 32 * scale);
     /* Grid padding reserves room for the first and last fully visible rows. It is not a
@@ -2357,6 +2554,8 @@ static void draw_grid(loom_context *ctx, float width, float height, float scale)
     const loom_rect content = ctx->viewport;
 
     /* Selection padding is not a scissor: include the rows that extend into it. */
+    loom_rect selected_art = {0};
+    bool selected_drawn = false;
     const size_t first = dec(list.first);
     const size_t last = min_size(list.last + 1, row_count);
     for (size_t row_index = first; row_index < last; row_index++) {
@@ -2375,11 +2574,19 @@ static void draw_grid(loom_context *ctx, float width, float height, float scale)
                 activate();
                 return;
             }
+            if (index == grid_selected) {
+              selected_art =
+                  (loom_rect){rect.x, rect.y, rect.w, rect.h - 78 * scale};
+              selected_drawn = true;
+            }
         }
         /* One request per visible row is enough to walk the window forward while scrolling
          * with the pointer, which never calls move_grid. */
         request_page((uint32_t)min_size(row_index * grid_columns, dec(grid_total)));
     }
+    if (selected_drawn)
+      draw_navigation_cursor(ctx, selected_art, &content, 12 * scale, scale,
+                             200);
 
     static const loom_color fade = {9, 13, 22, 255};
     const float fade_height = 72 * scale;
@@ -2444,6 +2651,8 @@ static void draw_details(loom_context *ctx, float width, float scale)
         if (visible < 1)
             visible = 1;
         const size_t first = (focus + 1) > visible ? focus + 1 - visible : 0;
+        loom_rect selected_art = {0};
+        bool selected_drawn = false;
         for (size_t index = first; index < seasons_row.count; index++) {
             const loom_rect rect = {x + (float)(index - first) * 226 * scale, 524 * scale,
                                     200 * scale, 378 * scale};
@@ -2454,7 +2663,15 @@ static void draw_details(loom_context *ctx, float width, float scale)
                 activate();
                 break;
             }
+            if (focus == index) {
+              selected_art =
+                  (loom_rect){rect.x, rect.y, rect.w, rect.h - 78 * scale};
+              selected_drawn = true;
+            }
         }
+        if (selected_drawn)
+          draw_navigation_cursor(ctx, selected_art, &clip, 12 * scale, scale,
+                                 300);
         return;
     }
 
@@ -2501,16 +2718,24 @@ static void draw_season(loom_context *ctx, float width, float height, float scal
         episode_scroll = (float)episode_selected * episode_row_height;
         episode_jump = false;
     }
-    loom_virtual_list list = loom_virtual_list_init(episode_rect, episodes_row.count,
-                                                    episode_row_height, episode_scroll);
+    loom_virtual_list target = loom_virtual_list_init(
+        episode_rect, episodes_row.count, episode_row_height, episode_scroll);
     if (episode_reveal) {
-        list = loom_virtual_list_init(episode_rect, episodes_row.count, episode_row_height,
-                                      loom_virtual_list_reveal(&list, episode_selected));
-        episode_reveal = false;
+      episode_scroll = loom_virtual_list_reveal(&target, episode_selected);
+      episode_reveal = false;
     }
-    episode_scroll = list.scroll;
+    target = loom_virtual_list_init(episode_rect, episodes_row.count,
+                                    episode_row_height, episode_scroll);
+    episode_scroll = target.scroll;
+    animated_float_set(&episode_scroll_motion, episode_scroll,
+                       NAVIGATION_ANIMATION_NS);
+    const loom_virtual_list list =
+        loom_virtual_list_init(episode_rect, episodes_row.count,
+                               episode_row_height, episode_scroll_motion.value);
     /* Keep episodes below their heading, but let them reach the screen bottom. */
     const loom_rect content = {x, episode_rect.y, width - x, height - episode_rect.y};
+    loom_rect selected_row = {0};
+    bool selected_drawn = false;
     for (size_t index = list.first; index < list.last; index++) {
         const loom_rect raw = loom_virtual_list_item(&list, index);
         const loom_rect row = {raw.x + 10 * scale, raw.y + 6 * scale, raw.w - 20 * scale,
@@ -2523,8 +2748,10 @@ static void draw_season(loom_context *ctx, float width, float height, float scal
             static const loom_color hot_bg = {30, 40, 55, 180};
             loom_fill(ctx, row, &content, focused ? focused_bg : hot_bg, 11 * scale);
         }
-        if (focused)
-            loom_stroke(ctx, row, &content, ACCENT, 4 * scale, 11 * scale);
+        if (focused) {
+          selected_row = row;
+          selected_drawn = true;
+        }
         const loom_rect clip = loom_intersect(row, content);
         const loom_rect thumb = {row.x + 12 * scale, row.y + 12 * scale, 232 * scale,
                                  130.5f * scale};
@@ -2562,6 +2789,9 @@ static void draw_season(loom_context *ctx, float width, float height, float scal
             return;
         }
     }
+    if (selected_drawn)
+      draw_navigation_cursor(ctx, selected_row, &content, 11 * scale, scale,
+                             400);
     static const loom_color fade = {9, 13, 22, 255};
     const float fade_height = 64 * scale;
     if (list.scroll > 0)
@@ -2615,52 +2845,112 @@ static void draw_playback(loom_context *ctx, float width, float height, float sc
 
 static void draw_settings(loom_context *ctx, float width, float scale)
 {
-    const loom_rect panel = {560 * scale, 260 * scale, width - 1120 * scale, 320 * scale};
-    loom_fill(ctx, panel, NULL, PANEL, 18 * scale);
-    loom_stroke(ctx, panel, NULL, BORDER, 2 * scale, 18 * scale);
-    loom_label(ctx, (loom_rect){panel.x + 48 * scale, panel.y + 42 * scale,
-                                panel.w - 96 * scale, 44 * scale},
-               &panel, "Settings", TEXT, 32 * scale);
-    draw_button(ctx, (loom_rect){panel.x + 48 * scale, panel.y + 126 * scale,
-                                 panel.w - 96 * scale, 72 * scale},
-                "Sign out", 0, scale);
+  const loom_rect panel = {560 * scale, 230 * scale, width - 1120 * scale,
+                           390 * scale};
+  loom_fill(ctx, panel, NULL, PANEL, 18 * scale);
+  loom_stroke(ctx, panel, NULL, BORDER, 2 * scale, 18 * scale);
+  loom_label(ctx,
+             (loom_rect){panel.x + 48 * scale, panel.y + 42 * scale,
+                         panel.w - 96 * scale, 44 * scale},
+             &panel, "Settings", TEXT, 32 * scale);
+  draw_button(ctx,
+              (loom_rect){panel.x + 48 * scale, panel.y + 116 * scale,
+                          panel.w - 96 * scale, 72 * scale},
+              animations_enabled ? "Animations: On" : "Animations: Off", 0,
+              scale);
+  draw_button(ctx,
+              (loom_rect){panel.x + 48 * scale, panel.y + 210 * scale,
+                          panel.w - 96 * scale, 72 * scale},
+              "Sign out", 1, scale);
 }
 
 static void draw_sidebar(loom_context *ctx, float height, float scale)
 {
-    const loom_rect panel = {0, 0, 354 * scale, height};
-    loom_fill(ctx, panel, NULL, PANEL, 0);
-    loom_stroke(ctx, panel, NULL, BORDER, 2 * scale, 0);
-    loom_label(ctx, (loom_rect){26 * scale, 28 * scale, panel.w - 52 * scale, 34 * scale},
-               &panel, "Categories", DIM, 20 * scale);
-    const loom_rect list_rect = {18 * scale, 78 * scale, panel.w - 36 * scale,
-                                 panel.h - 96 * scale};
-    const size_t count = categories_row.count + 1; /* the final row is Settings */
-    const float row_height = 76 * scale;
-    loom_virtual_list list = loom_virtual_list_init(list_rect, count, row_height, sidebar_scroll);
-    if (sidebar_reveal) {
-        list = loom_virtual_list_init(list_rect, count, row_height,
-                                      loom_virtual_list_reveal(&list, sidebar_focus));
-        sidebar_reveal = false;
+  const float panel_width = 354 * scale;
+  const loom_rect panel = {-panel_width * (1.0f - sidebar_slide.value), 0,
+                           panel_width, height};
+  loom_fill(ctx, panel, NULL, PANEL, 0);
+  loom_stroke(ctx, panel, NULL, BORDER, 2 * scale, 0);
+  loom_label(ctx,
+             (loom_rect){panel.x + 26 * scale, 28 * scale, panel.w - 52 * scale,
+                         34 * scale},
+             &panel, "Categories", DIM, 20 * scale);
+  const loom_rect list_rect = {panel.x + 18 * scale, 78 * scale,
+                               panel.w - 36 * scale, panel.h - 96 * scale};
+  const size_t count = categories_row.count + 1; /* the final row is Settings */
+  const float row_height = 76 * scale;
+  loom_virtual_list target =
+      loom_virtual_list_init(list_rect, count, row_height, sidebar_scroll);
+  if (sidebar_reveal) {
+    sidebar_scroll = loom_virtual_list_reveal(&target, sidebar_focus);
+    sidebar_reveal = false;
+  }
+  target = loom_virtual_list_init(list_rect, count, row_height, sidebar_scroll);
+  animated_float_set(&sidebar_scroll_motion, target.scroll,
+                     NAVIGATION_ANIMATION_NS);
+  const loom_virtual_list list = loom_virtual_list_init(
+      list_rect, count, row_height, sidebar_scroll_motion.value);
+  const loom_rect selected_raw = loom_virtual_list_item(&list, sidebar_focus);
+  const loom_rect selected_row = {selected_raw.x, selected_raw.y + 5 * scale,
+                                  selected_raw.w, selected_raw.h - 10 * scale};
+  const loom_rect button_clip = {
+      list_rect.x - 4 * scale, list_rect.y - 4 * scale, list_rect.w + 8 * scale,
+      list_rect.h + 8 * scale};
+  for (size_t index = list.first; index < list.last; index++) {
+    const loom_rect raw = loom_virtual_list_item(&list, index);
+    const loom_rect row = {raw.x, raw.y + 5 * scale, raw.w, raw.h - 10 * scale};
+    const bool hot = hovered(row);
+    loom_fill(ctx, row, &button_clip, hot ? HOT : CARD, 10 * scale);
+    loom_stroke(ctx, row, &button_clip, BORDER, 1 * scale, 10 * scale);
+    loom_label(ctx,
+               (loom_rect){row.x + 22 * scale, row.y + 16 * scale,
+                           row.w - 44 * scale, 32 * scale},
+               &button_clip,
+               index < categories_row.count ? categories_row.cards[index].title
+                                            : "Settings",
+               TEXT, 22 * scale);
+    if (hot && pointer_press) {
+      sidebar_focus = index;
+      activate_sidebar();
     }
-    sidebar_scroll = list.scroll;
-    for (size_t index = list.first; index < list.last; index++) {
-        const loom_rect raw = loom_virtual_list_item(&list, index);
-        const loom_rect row = {raw.x, raw.y + 5 * scale, raw.w, raw.h - 10 * scale};
-        const bool hot = hovered(row);
-        loom_fill(ctx, row, &list_rect, hot ? HOT : CARD, 10 * scale);
-        loom_stroke(ctx, row, &list_rect, sidebar_focus == index ? ACCENT : BORDER,
-                    sidebar_focus == index ? 3 * scale : 1 * scale, 10 * scale);
-        loom_label(ctx, (loom_rect){row.x + 22 * scale, row.y + 16 * scale,
-                                    row.w - 44 * scale, 32 * scale},
-                   &list_rect,
-                   index < categories_row.count ? categories_row.cards[index].title : "Settings",
-                   TEXT, 22 * scale);
-        if (hot && pointer_press) {
-            sidebar_focus = index;
-            activate_sidebar();
-        }
-    }
+  }
+  draw_navigation_cursor(ctx, selected_row, &button_clip, 10 * scale, scale,
+                         500);
+}
+
+static bool advance_animations(uint64_t now) {
+  animated_float_update(&home_scroll_motion, now);
+  animated_float_update(&grid_scroll_motion, now);
+  animated_float_update(&episode_scroll_motion, now);
+  animated_float_update(&sidebar_slide, now);
+  animated_float_update(&sidebar_scroll_motion, now);
+  animated_float_update(&focus_cursor.x, now);
+  animated_float_update(&focus_cursor.y, now);
+  animated_float_update(&focus_cursor.w, now);
+  animated_float_update(&focus_cursor.h, now);
+  for (size_t index = 0; index < ROW_COUNT; index++)
+    animated_float_update(&row_offset_motion[index], now);
+
+  if (sidebar_closing && !animated_float_running(&sidebar_slide) &&
+      sidebar_slide.value == 0) {
+    sidebar_open = false;
+    sidebar_closing = false;
+    focus_cursor.known = false;
+  }
+  if (animated_float_running(&home_scroll_motion) ||
+      animated_float_running(&grid_scroll_motion) ||
+      animated_float_running(&episode_scroll_motion) ||
+      animated_float_running(&sidebar_slide) ||
+      animated_float_running(&sidebar_scroll_motion) ||
+      animated_float_running(&focus_cursor.x) ||
+      animated_float_running(&focus_cursor.y) ||
+      animated_float_running(&focus_cursor.w) ||
+      animated_float_running(&focus_cursor.h))
+    return true;
+  for (size_t index = 0; index < ROW_COUNT; index++)
+    if (animated_float_running(&row_offset_motion[index]))
+      return true;
+  return false;
 }
 
 static void build_ui(loom_context *ctx)
@@ -2671,6 +2961,7 @@ static void build_ui(loom_context *ctx)
     scratch_used = 0;
     poster_requests = 0;
     frame_index++;
+    advance_animations(now_ns());
 
     loom_begin(ctx, width, height);
     /* The video plane sits behind this EGL surface. During playback every untouched pixel
@@ -2717,6 +3008,8 @@ static void build_ui(loom_context *ctx)
     /* Pointer activation happens during layout; rebuild its resulting screen. */
     if (pointer_press)
         jf_window_frame_requested = true;
+    if (advance_animations(now_ns()))
+      jf_window_frame_requested = true;
     pointer_press = false;
 }
 
@@ -2908,6 +3201,15 @@ int main(void)
 
     jf_session_device_id(&session);
     jf_api_init();
+    char preferences_path[576];
+    snprintf(preferences_path, sizeof(preferences_path),
+             "%s/conf/preferences.ini", jf_store_root());
+    if (!cfg_load(&preferences, &preferences_arena, preferences_path))
+      fprintf(stderr, "could not load preferences: %s\n", preferences_path);
+    cfg_section(&preferences, "ui");
+    animations_preference =
+        cfg_int(&preferences, "animations", animations_preference);
+    animations_enabled = animations_preference != 0;
     log_to_file();
     /* After the redirect, so the confirmation lands in the log rather than on a stdout
      * nobody is reading. */
@@ -3038,6 +3340,7 @@ int main(void)
     jf_fetcher_deinit(&fetcher);
     loom_destroy(&ctx);
     jf_renderer_destroy(renderer);
+    jf_arena_destroy(&preferences_arena);
     jf_luna_deinit();
     jf_window_deinit();
     return 0;
