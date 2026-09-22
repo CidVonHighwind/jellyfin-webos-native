@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+
+if ! command -v clang-format >/dev/null 2>&1; then
+    echo "pre-commit: clang-format is required" >&2
+    exit 1
+fi
+
+# Check just the staged changed lines. Formatting a whole legacy source file from a hook
+# creates unrelated diffs; `git clang-format --staged` prepares the focused fix instead.
+if ! git clang-format --staged --diff; then
+    echo "pre-commit: format staged C/C++ changes with: git clang-format --staged" >&2
+    echo "then review and stage the result." >&2
+    exit 1
+fi

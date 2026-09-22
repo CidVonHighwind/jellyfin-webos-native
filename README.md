@@ -112,6 +112,17 @@ too:
 ctest --preset host
 ```
 
+The host preset enables UBSan and builds C and C++ with `-Wall -Wextra -Werror`.
+Enable the versioned pre-commit hook once per checkout to check staged C/C++ changes with
+`clang-format`:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+The hook prints the focused formatting diff and stops the commit. Apply it with
+`git clang-format --staged`, review the result, then stage it again.
+
 A machine with no SDL2/EGL/GLES still configures; it just builds the tests and
 skips the two probes.
 
