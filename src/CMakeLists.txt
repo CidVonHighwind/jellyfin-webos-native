@@ -24,6 +24,25 @@ add_library(jf-portable STATIC
 target_include_directories(jf-portable PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(jf-portable PUBLIC m pthread)
 
+# demux.c needs nothing but FFmpeg, so the host tests link it wherever
+# `tools/build-ffmpeg.sh --host` has put one. On the TV it is part of `jellyfin` itself,
+# further down. No FFmpeg here just means those tests are skipped.
+if (NOT TARGET_WEBOS)
+    if (EXISTS "${FFMPEG_ROOT}/lib")
+        add_library(jf-demux STATIC jf/demux.c)
+        target_include_directories(jf-demux PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+        target_include_directories(jf-demux SYSTEM PUBLIC "${FFMPEG_ROOT}/include")
+        foreach (_lib avformat avcodec swresample avutil)
+            # Absolute, so CMake records the rpath itself: a distro FFmpeg of the same
+            # soname in /usr/lib must not win the lookup.
+            target_link_libraries(jf-demux PUBLIC "${FFMPEG_ROOT}/lib/lib${_lib}.so")
+        endforeach ()
+    else ()
+        message(STATUS "No FFmpeg at ${FFMPEG_ROOT} - skipping the demux tests "
+                "(tools/build-ffmpeg.sh --host)")
+    endif ()
+endif ()
+
 # ------------------------------------------------------------ platform layer
 
 if (TARGET_WEBOS)
@@ -186,6 +205,7 @@ target_sources(jellyfin PRIVATE
 target_include_directories(jellyfin SYSTEM PRIVATE ${ALSA_INCLUDE_DIRS}
         "${FFMPEG_ROOT}/include")
 target_link_directories(jellyfin PRIVATE "${FFMPEG_ROOT}/lib")
+target_link_options(jellyfin PRIVATE "-Wl,-rpath-link,${FFMPEG_ROOT}/lib")
 target_link_libraries(jellyfin PRIVATE jf-smp-shim ${ALSA_LIBRARIES}
         avformat avcodec swresample avutil)
 # The bundled FFmpeg lives beside the binary, which is what $ORIGIN/lib resolves to.

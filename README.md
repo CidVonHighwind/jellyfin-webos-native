@@ -24,8 +24,14 @@ One translation unit is C++: `src/jf/smp_shim.cpp`, a try/catch façade over
   installing
 - `slangc` to compile the embedded OpenGL ES shaders; `glslangValidator` is
   optional extra validation
-- A target FFmpeg prefix. It defaults to the buildroot path used by this
-  checkout; override it with `-DFFMPEG_ROOT=/path`.
+- FFmpeg, from `tools/build-ffmpeg.sh` — a build with no video decoders, no
+  encoders, no muxers, no filters and only file/http/https, which is all the
+  client needs when the server transcodes. It builds mbedTLS alongside it, since
+  no firmware exports a TLS library and https has to come from somewhere; both
+  ship inside the ipk. Required for the TV; on a desktop
+  `tools/build-ffmpeg.sh --host` is optional and only the demux tests want it.
+  Both install where `FFMPEG_ROOT` defaults to; override it with
+  `-DFFMPEG_ROOT=/path`.
 
 ## Build
 

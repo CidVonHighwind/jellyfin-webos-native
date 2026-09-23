@@ -12,6 +12,9 @@
 #include "platform/luna.h"
 #include "ui/loom.h"
 #include "ui/skyline.h"
+#ifdef JF_HAVE_DEMUX
+#include "jf/demux.h"
+#endif
 
 #define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); failures++; } } while (0)
 
@@ -198,6 +201,16 @@ static void test_skyline(void)
     skyline_destroy(&packer);
 }
 
+#ifdef JF_HAVE_DEMUX
+/* Only what runs without media: the bundled FFmpeg links, and a URL that opens
+ * nothing reports failure instead of handing back a half-built context. */
+static void test_demux_open_failure(void) {
+  CHECK(jf_demux_open("/nonexistent/stream.mkv") == NULL);
+  CHECK(jf_demux_open("https://127.0.0.1:1/stream.mkv") == NULL);
+  jf_demux_close(NULL);
+}
+#endif
+
 int main(void)
 {
     test_load_payload();
@@ -207,6 +220,9 @@ int main(void)
     test_luna_event();
     test_virtual_list();
     test_skyline();
+#ifdef JF_HAVE_DEMUX
+    test_demux_open_failure();
+#endif
     if (failures != 0) {
         fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;
