@@ -156,8 +156,22 @@ bool jf_window_init(const char *app_id, const char *title, uint32_t want_width,
     const bool display_ok = SDL_GetCurrentDisplayMode(0, &mode) == 0 && mode.w > 0 && mode.h > 0;
     if (display_ok && mode.refresh_rate > 0)
         jf_window_refresh_mhz = (uint32_t)mode.refresh_rate * 1000;
-    const int width = want_width != 0 ? (int)want_width : display_ok ? mode.w : 1280;
-    const int height = want_height != 0 ? (int)want_height : display_ok ? mode.h : 720;
+    /* The display's size is the right default only for the TV, which is fullscreen. A
+     * desktop window asked for at panel size opens as large as the screen it is on, with
+     * its title bar off the top edge, so windowed builds start at a size that fits. */
+    int width = want_width != 0 ? (int)want_width : display_ok ? mode.w : 1280;
+    int height = want_height != 0 ? (int)want_height : display_ok ? mode.h : 720;
+    if (want_width == 0 && !jf_window_on_webos) {
+        width = 1280;
+        height = 720;
+        if (display_ok) {
+            /* Never larger than the display, and leave room for the window furniture. */
+            if (width > mode.w - 80)
+                width = mode.w - 80;
+            if (height > mode.h - 120)
+                height = mode.h - 120;
+        }
+    }
 
     const Uint32 flags = SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN |
                          (jf_window_on_webos ? SDL_WINDOW_FULLSCREEN_DESKTOP
