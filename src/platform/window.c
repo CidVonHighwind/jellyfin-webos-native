@@ -29,6 +29,8 @@ static atomic_bool wake_pending;
 /* Window units to framebuffer pixels; 1.0 unless SDL and GL disagree. */
 static float pointer_scale_x = 1.0f;
 static float pointer_scale_y = 1.0f;
+/* Frames still owed to a size change; see jf_window_swap. */
+static int resize_redraws;
 static char video_window_id[64];
 
 /* Our own event, so a foreign thread can ask the main thread to do something only the
@@ -222,8 +224,19 @@ void jf_window_deinit(void)
 
 void jf_window_swap(void)
 {
-    if (window != NULL)
-        SDL_GL_SwapWindow(window);
+    if (window == NULL)
+        return;
+    SDL_GL_SwapWindow(window);
+    /* A GLES implementation may resize its window surface when that surface is swapped
+     * rather than when the window itself changes - ANGLE, which is where a Windows build
+     * gets GLES, is one. The first frame after a resize is then presented into a buffer of
+     * the old size and stays on screen, because nothing else asks for a frame. Drawing
+     * again for a couple of frames is what replaces it. The TV never resizes, so this
+     * counter is only ever non-zero on a desktop. */
+    if (resize_redraws > 0) {
+        resize_redraws--;
+        jf_window_frame_requested = true;
+    }
 }
 
 /* ------------------------------------------------------------- event pump */
@@ -261,6 +274,8 @@ static void refresh_drawable_size(void)
 {
     if (window == NULL)
         return;
+    /* See jf_window_swap: these are the frames that get the resized surface on screen. */
+    resize_redraws = 2;
     int pixel_w = 0, pixel_h = 0;
     int logical_w = 0, logical_h = 0;
     SDL_GL_GetDrawableSize(window, &pixel_w, &pixel_h);
