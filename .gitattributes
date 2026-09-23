@@ -1,5 +1,4 @@
-# Shell scripts are run by the build - cmake/slangc.sh compiles every shader - and a
-# checkout on Windows would otherwise give them CRLF endings, which /bin/sh rejects with
-# "set: Illegal option -" on the first line it reads.
+# The build runs these, and a CRLF checkout makes /bin/sh fail on the first line with
+# "set: Illegal option -".
 *.sh text eol=lf
 .githooks/* text eol=lf

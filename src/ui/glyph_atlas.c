@@ -14,8 +14,7 @@
 #define MAX_FACES 8
 #define TABLE_CAPACITY 4096 /* power of two; ~2k glyphs before it is half full */
 
-/* The UI face first, then whatever covers the rest of Unicode. Where a system keeps its
- * fonts is the system's business, so the paths come from the platform header. */
+/* The UI face first, then whatever covers the rest of Unicode; paths are per-system. */
 static const char *const face_candidates[] = {JF_OS_FONT_CANDIDATES};
 static const char *const fallback_paths[] = {JF_OS_FONT_FALLBACKS};
 

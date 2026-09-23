@@ -6,9 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* The socket type, the way a socket is closed and the shape of a receive timeout all
- * differ by platform; os.h carries the sockets headers with them. */
-#include "../platform/os.h"
+#include "../platform/os.h" /* the socket type, close and timeout differ by platform */
 
 /* ------------------------------------------------------------------ model */
 
@@ -119,9 +117,7 @@ bool jf_session_load(jf_session *session)
 
 void jf_api_init(void)
 {
-    /* Where the socket layer needs starting, it has to happen before any socket call - and
-     * the gethostname above is one. Nothing to do on POSIX. */
-    jf_os_net_init();
+    jf_os_net_init(); /* before any socket call, and gethostname above is one */
     curl_global_init(CURL_GLOBAL_DEFAULT);
     jf_image_report_version();
     jf_store_init();

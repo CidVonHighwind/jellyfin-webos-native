@@ -1,7 +1,7 @@
 /* The Windows side of os.h. Include os.h, not this. */
 #pragma once
 
-/* winsock2.h before anything that might reach windows.h, or the older winsock wins. */
+/* winsock2.h first, or an indirect windows.h pulls in the older winsock instead. */
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
@@ -13,18 +13,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-/* Where the UI's faces are looked for, in order. Segoe UI is the system face every
- * supported Windows carries; the other two are there in case it has been removed. */
 #define JF_OS_FONT_CANDIDATES                                                                \
     "C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/arial.ttf", "C:/Windows/Fonts/tahoma.ttf"
 
-/* Faces consulted for codepoints the primary one has no glyph for. */
 #define JF_OS_FONT_FALLBACKS "C:/Windows/Fonts/seguisym.ttf", "C:/Windows/Fonts/arial.ttf"
 
-/* No mode here; Windows has no permission bits to carry. */
 static inline int jf_os_mkdir(const char *path) { return _mkdir(path); }
 
-/* _commit is fsync under another name. */
 static inline int jf_os_fsync(int file) { return _commit(file); }
 
 static inline int jf_os_setenv(const char *name, const char *value, int overwrite)
@@ -35,8 +30,8 @@ static inline int jf_os_setenv(const char *name, const char *value, int overwrit
     return _putenv_s(name, value);
 }
 
-/* There is no dprintf. Formatting into a buffer and writing it keeps the property the
- * callers rely on: negative when the write does not complete. */
+/* No dprintf. Formatting into a buffer keeps what the callers rely on: negative when the
+ * write does not complete. */
 static inline int jf_os_write_fmt(int file, const char *format, ...)
 {
     va_list args;
@@ -63,18 +58,10 @@ static inline int jf_os_write_fmt(int file, const char *format, ...)
     return written;
 }
 
-static inline bool jf_os_cwd(char *out, size_t out_len)
-{
-    return _getcwd(out, (int)out_len) != NULL;
-}
-
-/* ------------------------------------------------------------------ sockets */
-
 /* Unsigned, so the usual `fd < 0` test would never fire. */
 typedef SOCKET jf_os_socket;
 
-/* Winsock has to be started before any socket call - and gethostname is one. Repeated
- * calls are counted by Winsock itself, so this is safe to call more than once. */
+/* Winsock counts its own callers, so starting it more than once is safe. */
 static inline bool jf_os_net_init(void)
 {
     WSADATA wsa;
@@ -88,7 +75,7 @@ static inline bool jf_os_socket_valid(jf_os_socket socket_fd)
 
 static inline void jf_os_socket_close(jf_os_socket socket_fd) { closesocket(socket_fd); }
 
-/* A count of milliseconds here, where POSIX takes a struct timeval. */
+/* Milliseconds here, where POSIX takes a struct timeval. */
 static inline int jf_os_socket_recv_timeout(jf_os_socket socket_fd, int milliseconds)
 {
     const DWORD timeout = (DWORD)milliseconds;
@@ -100,4 +87,9 @@ static inline int jf_os_socket_broadcast(jf_os_socket socket_fd)
 {
     const int yes = 1;
     return setsockopt(socket_fd, SOL_SOCKET, SO_BROADCAST, (const char *)&yes, sizeof(yes));
+}
+
+static inline bool jf_os_cwd(char *out, size_t out_len)
+{
+    return _getcwd(out, (int)out_len) != NULL;
 }

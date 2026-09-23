@@ -57,9 +57,8 @@ else ()
     # windowed programs.
     pkg_check_modules(SDL2 sdl2)
     if (WIN32)
-        # ANGLE is where GLES comes from on Windows. The mingw-w64 angleproject package
-        # installs EGL/ and GLES3/ headers and the two import libraries into the toolchain
-        # prefix, but ships no pkg-config files - so they are named directly.
+        # GLES comes from ANGLE, whose mingw-w64 package installs the headers and import
+        # libraries into the toolchain prefix but ships no pkg-config files.
         set(EGL_FOUND TRUE)
         set(GLESV2_FOUND TRUE)
         set(GL_LIBRARIES GLESv2 EGL)
@@ -184,8 +183,7 @@ add_executable(jellyfin
 # static library - embedded rather than staged: an installed app runs as a jail uid, and a
 # licence that fails to open is not an acceptable outcome. The TV's own libraries are not
 # here; see src/app/licenses.h. Symbol names match it.
-# `|` rather than `:` as the separator: a Windows source path starts "C:/", and splitting
-# these on a colon tears the drive letter off into a target of its own.
+# `|` as the separator, not `:`: a source path starting "C:/" would split at the drive.
 foreach (_license agpl_3_0|${CMAKE_SOURCE_DIR}/LICENSE.txt
         lgpl_3_0|${CMAKE_SOURCE_DIR}/assets/licenses/lgpl-3.0.txt
         lgpl_2_1|${CMAKE_SOURCE_DIR}/assets/licenses/lgpl-2.1.txt
@@ -200,7 +198,7 @@ foreach (_license agpl_3_0|${CMAKE_SOURCE_DIR}/LICENSE.txt
 endforeach ()
 
 if (WIN32)
-    # MSYS2 packages libass, so there is nothing to build out of tree and no .so to name.
+    # MSYS2 packages libass, so there is nothing to build out of tree.
     pkg_check_modules(LIBASS REQUIRED libass)
     target_include_directories(jellyfin SYSTEM PRIVATE ${LIBASS_INCLUDE_DIRS})
     target_link_directories(jellyfin PRIVATE ${LIBASS_LIBRARY_DIRS})
@@ -217,7 +215,7 @@ target_include_directories(jellyfin SYSTEM PRIVATE
 target_link_directories(jellyfin PRIVATE ${LIBCURL_LIBRARY_DIRS} ${LIBPNG_LIBRARY_DIRS}
         ${JSONC_LIBRARY_DIRS})
 if (WIN32)
-    # No libdl here; the sockets the discovery probe uses live in ws2_32 instead.
+    # No libdl here; the discovery probe's sockets live in ws2_32 instead.
     set(PLATFORM_SYSTEM_LIBS ws2_32)
 else ()
     set(PLATFORM_SYSTEM_LIBS dl)

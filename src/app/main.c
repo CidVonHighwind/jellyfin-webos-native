@@ -2165,9 +2165,7 @@ static void on_event(const jf_event *event)
         jf_window_running = false;
         break;
     case JF_EVENT_RESIZED:
-        /* The new size is already in gl_width/gl_height, but this loop only draws when a
-         * frame is asked for - so without this the window keeps showing the old frame,
-         * stretched, until something unrelated happens to request one. */
+        /* The size is already in gl_width/gl_height; this loop only draws when asked. */
         jf_window_frame_requested = true;
         break;
     }

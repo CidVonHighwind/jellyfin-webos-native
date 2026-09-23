@@ -12,15 +12,13 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-/* Where the UI's faces are looked for, in order. The first entry is the TV's own; the rest
- * are what a desktop distribution is likely to carry. */
+/* The TV's own face first, then what a desktop distribution is likely to carry. */
 #define JF_OS_FONT_CANDIDATES                                                                \
     "/usr/share/fonts/LG_Smart_UI-Regular.ttf", "/usr/share/fonts/DroidSans.ttf",            \
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",                                   \
         "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",                  \
         "/usr/share/fonts/TTF/DejaVuSans.ttf"
 
-/* Faces consulted for codepoints the primary one has no glyph for. */
 #define JF_OS_FONT_FALLBACKS                                                                 \
     "/usr/share/fonts/DroidSansFallback.ttf", "/usr/share/fonts/DroidSans.ttf",              \
         "/usr/share/fonts/TTF/DejaVuSans.ttf",                                               \
@@ -44,8 +42,6 @@ static inline int jf_os_write_fmt(int file, const char *format, ...)
     return written;
 }
 
-/* ------------------------------------------------------------------ sockets */
-
 typedef int jf_os_socket;
 
 static inline bool jf_os_net_init(void) { return true; }
@@ -66,9 +62,8 @@ static inline int jf_os_socket_broadcast(jf_os_socket socket_fd)
     return setsockopt(socket_fd, SOL_SOCKET, SO_BROADCAST, &yes, sizeof(yes));
 }
 
-/* The resolved working directory. /proc/self/cwd rather than getcwd because an installed
- * app is started from a path that passes through symlinks, and it is the resolved one that
- * carries the app id this is read for. */
+/* /proc/self/cwd rather than getcwd: an installed app is started through symlinks, and it
+ * is the resolved path that carries the app id its caller reads. */
 static inline bool jf_os_cwd(char *out, size_t out_len)
 {
     const ssize_t n = readlink("/proc/self/cwd", out, out_len - 1);

@@ -124,8 +124,7 @@ bool jf_window_init(const char *app_id, const char *title, uint32_t want_width,
      * hint. Without it the registration fails with "Invalid appId specified", SDL reports
      * the backend as unavailable and falls back to plain wayland - where the remote has no
      * keymap and every button arrives as scancode 1. Whatever SAM set wins. */
-    /* SDL_setenv rather than setenv: Windows has no setenv, and this is SDL's own. */
-    SDL_setenv("APPID", app_id, 0);
+    SDL_setenv("APPID", app_id, 0); /* SDL's own; Windows has no setenv. */
     SDL_SetHint("SDL_WEBOS_REGISTER_APP", "true");
     SDL_SetHint("SDL_WEBOS_ACCESS_POLICY_KEYS_BACK", "true"); /* no exit dialog */
     /* How long the magic-remote pointer stays on screen once it stops moving. SAM starts
@@ -144,10 +143,9 @@ bool jf_window_init(const char *app_id, const char *title, uint32_t want_width,
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
 #ifdef _WIN32
-    /* GLES on Windows is ANGLE, which hands out exactly the version asked for - and the UI
-     * shaders need 3.1 for their storage buffer blocks. The hint is what makes SDL reach
-     * for ANGLE at all rather than returning a desktop WGL context, whose entry points are
-     * not the ones this program links against. */
+    /* GLES here is ANGLE, which gives exactly the version asked for, and the UI shaders
+     * need 3.1. Without the hint SDL returns a desktop WGL context instead, whose entry
+     * points are not the ones this program links. */
     SDL_SetHint(SDL_HINT_OPENGL_ES_DRIVER, "1");
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
 #else
@@ -166,16 +164,14 @@ bool jf_window_init(const char *app_id, const char *title, uint32_t want_width,
     const bool display_ok = SDL_GetCurrentDisplayMode(0, &mode) == 0 && mode.w > 0 && mode.h > 0;
     if (display_ok && mode.refresh_rate > 0)
         jf_window_refresh_mhz = (uint32_t)mode.refresh_rate * 1000;
-    /* The display's size is the right default only for the TV, which is fullscreen. A
-     * desktop window asked for at panel size opens as large as the screen it is on, with
-     * its title bar off the top edge, so windowed builds start at a size that fits. */
+    /* Panel size is the right default only for the TV, which is fullscreen; on a desktop
+     * it opens a window as large as the screen with its title bar off the top edge. */
     int width = want_width != 0 ? (int)want_width : display_ok ? mode.w : 1280;
     int height = want_height != 0 ? (int)want_height : display_ok ? mode.h : 720;
     if (want_width == 0 && !jf_window_on_webos) {
         width = 1280;
         height = 720;
         if (display_ok) {
-            /* Never larger than the display, and leave room for the window furniture. */
             if (width > mode.w - 80)
                 width = mode.w - 80;
             if (height > mode.h - 120)
@@ -251,12 +247,9 @@ void jf_window_swap(void)
     if (window == NULL)
         return;
     SDL_GL_SwapWindow(window);
-    /* A GLES implementation may resize its window surface when that surface is swapped
-     * rather than when the window itself changes - ANGLE, which is where a Windows build
-     * gets GLES, is one. The first frame after a resize is then presented into a buffer of
-     * the old size and stays on screen, because nothing else asks for a frame. Drawing
-     * again for a couple of frames is what replaces it. The TV never resizes, so this
-     * counter is only ever non-zero on a desktop. */
+    /* ANGLE resizes its window surface on the swap, not when the window changes, so the
+     * first frame after a resize lands in a buffer of the old size and stays there until
+     * something asks for another. Only ever non-zero on a desktop. */
     if (resize_redraws > 0) {
         resize_redraws--;
         jf_window_frame_requested = true;
@@ -292,14 +285,12 @@ void jf_window_wake(void)
         atomic_store(&wake_pending, false);
 }
 
-/* Take the drawable's size from SDL and re-derive the pointer scale from it. Anything that
- * can change the window's size calls this before asking for a frame. */
+/* Called by anything that can change the window's size, before it asks for a frame. */
 static void refresh_drawable_size(void)
 {
     if (window == NULL)
         return;
-    /* See jf_window_swap: these are the frames that get the resized surface on screen. */
-    resize_redraws = 2;
+    resize_redraws = 2; /* see jf_window_swap */
     int pixel_w = 0, pixel_h = 0;
     int logical_w = 0, logical_h = 0;
     SDL_GL_GetDrawableSize(window, &pixel_w, &pixel_h);
@@ -308,9 +299,8 @@ static void refresh_drawable_size(void)
         return;
     gl_width = (uint32_t)pixel_w;
     gl_height = (uint32_t)pixel_h;
-    /* The drawable-to-window ratio is what pointer coordinates are scaled by, and a resize
-     * can change it - dragging the window to a display of a different scale is exactly
-     * that. Recompute it here or the cursor drifts. */
+    /* Pointer coordinates are scaled by this ratio, and a resize - or a move to a display
+     * of a different scale - changes it. Stale, and the cursor drifts. */
     if (logical_w > 0)
         pointer_scale_x = (float)gl_width / (float)logical_w;
     if (logical_h > 0)
@@ -411,10 +401,9 @@ static void translate(const SDL_Event *event)
         break;
 
     case SDL_WINDOWEVENT:
-        /* What SDL reports at each window event, next to what the platform layer currently
-         * believes. Which of these carries a size, and whether that size has landed by the
-         * time it arrives, differs between backends - so this is the first thing to reach
-         * for when a window is drawn at the wrong dimensions. */
+        /* Which events carry a size, and whether it has landed by the time one arrives,
+         * differs between backends - the first thing to reach for when a window is drawn
+         * at the wrong dimensions. */
         if (getenv("JF_WINLOG") != NULL) {
             int drawable_w = 0, drawable_h = 0, logical_w = 0, logical_h = 0;
             if (window != NULL) {
@@ -435,10 +424,8 @@ static void translate(const SDL_Event *event)
         case SDL_WINDOWEVENT_EXPOSED:
         case SDL_WINDOWEVENT_MAXIMIZED:
         case SDL_WINDOWEVENT_RESTORED:
-            /* Maximising - snapping the window to the top edge is one - changes the
-             * drawable, and does not always send a RESIZED first, so the size is taken
-             * here too. Requesting a frame without it draws the new window from the old
-             * dimensions. */
+            /* Maximising changes the drawable without always sending RESIZED first, so
+             * the size is taken here too or the frame is drawn from the old one. */
             refresh_drawable_size();
             jf_window_drawable = true;
             jf_window_frame_requested = true;
