@@ -152,6 +152,7 @@ echo JF_KEYLOG=1 > $APPDIR/dev.hookedbehemoth.jellyfin/conf/debug.env
 |---|---|
 | `JF_KEYLOG` | log every key SDL reports |
 | `JF_LUNALOG` | log every Luna lifecycle payload |
+| `JF_WINLOG` | log every SDL window event with the sizes reported at it |
 | `JF_ALSA_DEV` | ALSA device for audio output (default `default`) |
 | `JF_NOAUDIO` | play video only |
 | `UI_FONT` | rasterise the UI from this .ttf |

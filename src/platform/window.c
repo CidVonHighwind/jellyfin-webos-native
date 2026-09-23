@@ -401,6 +401,21 @@ static void translate(const SDL_Event *event)
         break;
 
     case SDL_WINDOWEVENT:
+        /* What SDL reports at each window event, next to what the platform layer currently
+         * believes. Which of these carries a size, and whether that size has landed by the
+         * time it arrives, differs between backends - so this is the first thing to reach
+         * for when a window is drawn at the wrong dimensions. */
+        if (getenv("JF_WINLOG") != NULL) {
+            int drawable_w = 0, drawable_h = 0, logical_w = 0, logical_h = 0;
+            if (window != NULL) {
+                SDL_GL_GetDrawableSize(window, &drawable_w, &drawable_h);
+                SDL_GetWindowSize(window, &logical_w, &logical_h);
+            }
+            fprintf(stderr,
+                    "winevent=%u data=%dx%d drawable=%dx%d windowsize=%dx%d gl=%ux%u\n",
+                    event->window.event, event->window.data1, event->window.data2,
+                    drawable_w, drawable_h, logical_w, logical_h, gl_width, gl_height);
+        }
         switch (event->window.event) {
         case SDL_WINDOWEVENT_HIDDEN:
         case SDL_WINDOWEVENT_MINIMIZED:
