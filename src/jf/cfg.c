@@ -7,7 +7,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "../platform/win_compat.h"
+#include "../platform/os.h"
 
 struct cfg_entry {
   cfg_entry *next;
@@ -195,19 +195,19 @@ bool cfg_save(const cfg *document) {
   for (const cfg_entry *entry = document->entries; entry != NULL;
        entry = entry->next) {
     if (section == NULL || strcmp(section, entry->section) != 0) {
-      if (dprintf(file, "%s[%s]\n", section != NULL ? "\n" : "",
-                  entry->section) < 0) {
+      if (jf_os_write_fmt(file, "%s[%s]\n", section != NULL ? "\n" : "",
+                          entry->section) < 0) {
         ok = false;
         break;
       }
       section = entry->section;
     }
-    if (dprintf(file, "%s=%s\n", entry->key, entry->value) < 0) {
+    if (jf_os_write_fmt(file, "%s=%s\n", entry->key, entry->value) < 0) {
       ok = false;
       break;
     }
   }
-  if (ok && fsync(file) != 0)
+  if (ok && jf_os_fsync(file) != 0)
     ok = false;
   close(file);
   if (!ok || rename(temporary, document->path) != 0) {

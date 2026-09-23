@@ -21,7 +21,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "../platform/win_compat.h"
+#include "../platform/os.h"
 
 #include "../jf/api.h"
 #include "../jf/cfg.h"
@@ -3438,7 +3438,7 @@ static void load_debug_env(void)
         for (char *end = value + strlen(value) - 1;
              end >= value && (*end == '\n' || *end == '\r' || *end == ' ' || *end == '\t'); end--)
             *end = '\0';
-        setenv(cursor, value, 0);
+        jf_os_setenv(cursor, value, 0);
         fprintf(stderr, "debug.env: %s=%s\n", cursor, value);
     }
     fclose(file);

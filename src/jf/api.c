@@ -6,24 +6,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Windows has the same BSD socket calls under different names, in different headers, and
- * with a socket type that is unsigned - so the discovery probe below goes through these
- * three rather than #ifdef-ing its body. */
-#ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-typedef SOCKET jf_socket;
-#define JF_SOCKET_BAD(s) ((s) == INVALID_SOCKET)
-#define jf_socket_close closesocket
-#else
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
-typedef int jf_socket;
-#define JF_SOCKET_BAD(s) ((s) < 0)
-#define jf_socket_close close
-#endif
+/* The socket type, the way a socket is closed and the shape of a receive timeout all
+ * differ by platform; os.h carries the sockets headers with them. */
+#include "../platform/os.h"
 
 /* ------------------------------------------------------------------ model */
 
@@ -134,12 +119,9 @@ bool jf_session_load(jf_session *session)
 
 void jf_api_init(void)
 {
-#ifdef _WIN32
-    /* Winsock has to be started before any socket call, and gethostname below is one.
-     * curl_global_init does it too, but only for as long as curl stays initialised. */
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
-#endif
+    /* Where the socket layer needs starting, it has to happen before any socket call - and
+     * the gethostname above is one. Nothing to do on POSIX. */
+    jf_os_net_init();
     curl_global_init(CURL_GLOBAL_DEFAULT);
     jf_image_report_version();
     jf_store_init();
@@ -479,18 +461,11 @@ void jf_stream_url(const jf_session *session, const char *id, char *out, size_t 
 /* Jellyfin answers a UDP broadcast on 7359 with one JSON datagram per server. */
 static bool discover(jf_arena *arena, jf_discovered **out, size_t *out_count)
 {
-    const jf_socket socket_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (JF_SOCKET_BAD(socket_fd))
+    const jf_os_socket socket_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (!jf_os_socket_valid(socket_fd))
         return false;
-    const int yes = 1;
-    setsockopt(socket_fd, SOL_SOCKET, SO_BROADCAST, (const char *)&yes, sizeof(yes));
-    /* The receive timeout is a count of milliseconds here and a struct timeval there. */
-#ifdef _WIN32
-    const DWORD timeout = 1000;
-#else
-    const struct timeval timeout = {1, 0};
-#endif
-    setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
+    jf_os_socket_broadcast(socket_fd);
+    jf_os_socket_recv_timeout(socket_fd, 1000);
 
     struct sockaddr_in address;
     memset(&address, 0, sizeof(address));
@@ -500,7 +475,7 @@ static bool discover(jf_arena *arena, jf_discovered **out, size_t *out_count)
     static const char probe[] = "who is JellyfinServer?";
     if (sendto(socket_fd, probe, sizeof(probe) - 1, 0, (struct sockaddr *)&address,
                sizeof(address)) < 0) {
-        jf_socket_close(socket_fd);
+        jf_os_socket_close(socket_fd);
         return false;
     }
 
@@ -529,7 +504,7 @@ static bool discover(jf_arena *arena, jf_discovered **out, size_t *out_count)
         if (!seen && found != NULL)
             found[count++] = server;
     }
-    jf_socket_close(socket_fd);
+    jf_os_socket_close(socket_fd);
     *out = found;
     *out_count = count;
     return true;
