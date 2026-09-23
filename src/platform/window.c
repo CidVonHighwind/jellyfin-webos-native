@@ -255,6 +255,29 @@ void jf_window_wake(void)
         atomic_store(&wake_pending, false);
 }
 
+/* Take the drawable's size from SDL and re-derive the pointer scale from it. Anything that
+ * can change the window's size calls this before asking for a frame. */
+static void refresh_drawable_size(void)
+{
+    if (window == NULL)
+        return;
+    int pixel_w = 0, pixel_h = 0;
+    int logical_w = 0, logical_h = 0;
+    SDL_GL_GetDrawableSize(window, &pixel_w, &pixel_h);
+    SDL_GetWindowSize(window, &logical_w, &logical_h);
+    if (pixel_w <= 0 || pixel_h <= 0)
+        return;
+    gl_width = (uint32_t)pixel_w;
+    gl_height = (uint32_t)pixel_h;
+    /* The drawable-to-window ratio is what pointer coordinates are scaled by, and a resize
+     * can change it - dragging the window to a display of a different scale is exactly
+     * that. Recompute it here or the cursor drifts. */
+    if (logical_w > 0)
+        pointer_scale_x = (float)gl_width / (float)logical_w;
+    if (logical_h > 0)
+        pointer_scale_y = (float)gl_height / (float)logical_h;
+}
+
 static void translate(const SDL_Event *event)
 {
     jf_event out;
@@ -358,16 +381,17 @@ static void translate(const SDL_Event *event)
         case SDL_WINDOWEVENT_EXPOSED:
         case SDL_WINDOWEVENT_MAXIMIZED:
         case SDL_WINDOWEVENT_RESTORED:
+            /* Maximising - snapping the window to the top edge is one - changes the
+             * drawable, and does not always send a RESIZED first, so the size is taken
+             * here too. Requesting a frame without it draws the new window from the old
+             * dimensions. */
+            refresh_drawable_size();
             jf_window_drawable = true;
             jf_window_frame_requested = true;
             break;
         case SDL_WINDOWEVENT_RESIZED:
         case SDL_WINDOWEVENT_SIZE_CHANGED: {
-            int pixel_w = 0, pixel_h = 0;
-            if (window != NULL)
-                SDL_GL_GetDrawableSize(window, &pixel_w, &pixel_h);
-            gl_width = (uint32_t)(pixel_w > 0 ? pixel_w : 0);
-            gl_height = (uint32_t)(pixel_h > 0 ? pixel_h : 0);
+            refresh_drawable_size();
             out.kind = JF_EVENT_RESIZED;
             out.resized.width = gl_width;
             out.resized.height = gl_height;
