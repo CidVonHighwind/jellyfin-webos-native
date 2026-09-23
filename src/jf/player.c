@@ -29,6 +29,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "../platform/env.h"
 #include "../platform/window.h"
 #include "audio_alsa.h"
 #include "clock.h"
@@ -816,7 +817,7 @@ static void *session(void *unused)
     /* Escape hatch, like JF_NOAUDIO above: JF_NOSUBS=1 keeps the reader off the
      * subtitle path entirely, which is the A/B test when playback itself
      * misbehaves. */
-    if (getenv("JF_NOSUBS") != NULL) {
+    if (jf_env_flag("JF_NOSUBS")) {
       atomic_store(&sub_track_count, 0);
       subtitle_count = 0;
     }
@@ -827,7 +828,7 @@ static void *session(void *unused)
       atomic_store(&wanted_subs, sub_tracks[0].stream);
     fprintf(stderr, "Jellyfin subtitles: %d text track(s)\n", subtitle_count);
     /* Escape hatch: JF_NOAUDIO=1 plays video only. */
-    if (getenv("JF_NOAUDIO") != NULL)
+    if (jf_env_flag("JF_NOAUDIO"))
         audio_stream = -1;
     if (video_stream < 0 || width <= 0 || height <= 0) {
         set_error("No DirectMedia-compatible video stream");

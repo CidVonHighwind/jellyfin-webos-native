@@ -21,6 +21,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../platform/env.h"
 #include "../platform/os.h"
 
 #include "../jf/api.h"
@@ -2165,7 +2166,6 @@ static void on_event(const jf_event *event)
         jf_window_running = false;
         break;
     case JF_EVENT_RESIZED:
-        /* The size is already in gl_width/gl_height; this loop only draws when asked. */
         jf_window_frame_requested = true;
         break;
     }
@@ -3401,47 +3401,6 @@ done:
     free(row);
 }
 
-/* SAM launches an app with an environment of its own making and no way to add
- * to it, so the debug switches (JF_KEYLOG, JF_LUNALOG, JF_ALSA_DEV, JF_NOAUDIO,
- * JF_NOSUBS) would be reachable only from a hand-started run - which is exactly
- * the run that behaves differently. Read them from conf/debug.env instead, one
- * KEY=VALUE per line, so they work however the app was started:
- *
- *     echo JF_KEYLOG=1 > $APPDIR/<id>/conf/debug.env
- *
- * Anything already in the environment wins, so a manual run can still override
- * the file. */
-static void load_debug_env(void)
-{
-    char path[576];
-    snprintf(path, sizeof(path), "%s/conf/debug.env", jf_store_root());
-    FILE *file = fopen(path, "r");
-    if (file == NULL)
-        return;
-    char line[256];
-    while (fgets(line, sizeof(line), file) != NULL) {
-        char *cursor = line;
-        while (*cursor == ' ' || *cursor == '\t')
-            cursor++;
-        if (*cursor == '#' || *cursor == '\n' || *cursor == '\0')
-            continue;
-        char *equals = strchr(cursor, '=');
-        if (equals == NULL)
-            continue;
-        *equals = '\0';
-        char *value = equals + 1;
-        /* Trim the key's trailing blanks and the value's newline. */
-        for (char *end = equals - 1; end >= cursor && (*end == ' ' || *end == '\t'); end--)
-            *end = '\0';
-        for (char *end = value + strlen(value) - 1;
-             end >= value && (*end == '\n' || *end == '\r' || *end == ' ' || *end == '\t'); end--)
-            *end = '\0';
-        jf_os_setenv(cursor, value, 0);
-        fprintf(stderr, "debug.env: %s=%s\n", cursor, value);
-    }
-    fclose(file);
-}
-
 /* Launched from the TV's app list there is no terminal, so an installed app's output goes
  * nowhere and a failure is invisible. The fallback is to send stdout and stderr to a file
  * next to everything else this app writes - SDL and the Luna bridge report on stdout, and
@@ -3540,7 +3499,7 @@ int main(void)
     log_to_file();
     /* After the redirect, so the confirmation lands in the log rather than on a stdout
      * nobody is reading. */
-    load_debug_env();
+    jf_env_init();
     const bool restored = jf_session_load(&session);
     if (session.url[0] != '\0') {
         set_text(server_url, sizeof(server_url), session.url);
@@ -3548,7 +3507,7 @@ int main(void)
     }
 
     jf_window_set_handler(on_event);
-    const char *appid = getenv("APPID");
+    const char *appid = jf_env("APPID");
     if (!jf_window_init(appid != NULL ? appid : APP_ID, "Jellyfin", 0, 0))
         return 1;
     /* How the TV asks the app to close. Absent off-device, where nothing asks. */
@@ -3583,17 +3542,17 @@ int main(void)
         /* Development convenience, and the only way a script can sign in: the fields start
          * filled from the environment. Nothing is read from there once a token is
          * stored. */
-        const char *address = getenv("JELLYFIN_ADDRESS");
+        const char *address = jf_env("JELLYFIN_ADDRESS");
         if (address != NULL) {
             set_text(server_url, sizeof(server_url), address);
             set_text(session.url, sizeof(session.url), address);
             set_text(server_name, sizeof(server_name), address);
             jf_fetcher_set_session(&fetcher, &session);
         }
-        const char *user = getenv("JELLYFIN_USER");
+        const char *user = jf_env("JELLYFIN_USER");
         if (user != NULL)
             set_text(username, sizeof(username), user);
-        const char *secret = getenv("JELLYFIN_PASSWORD");
+        const char *secret = jf_env("JELLYFIN_PASSWORD");
         if (secret != NULL)
             set_text(password, sizeof(password), secret);
         if (session.url[0] != '\0') {
@@ -3603,8 +3562,8 @@ int main(void)
         }
     }
 
-    const char *capture_path = getenv("UI_CAPTURE");
-    const char *requested_script = getenv("UI_SCRIPT");
+    const char *capture_path = jf_env("UI_CAPTURE");
+    const char *requested_script = jf_env("UI_SCRIPT");
     script = requested_script != NULL ? requested_script : "";
     /* Without a script, hold long enough for discovery's three timeouts. */
     unsigned capture_after = (capture_path != NULL && script[0] == '\0') ? 240 : 0;

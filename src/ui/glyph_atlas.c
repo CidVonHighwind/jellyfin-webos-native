@@ -8,15 +8,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../platform/env.h"
 #include "../platform/os.h"
 
 #define GUTTER 1
 #define MAX_FACES 8
 #define TABLE_CAPACITY 4096 /* power of two; ~2k glyphs before it is half full */
-
-/* The UI face first, then whatever covers the rest of Unicode; paths are per-system. */
-static const char *const face_candidates[] = {JF_OS_FONT_CANDIDATES};
-static const char *const fallback_paths[] = {JF_OS_FONT_FALLBACKS};
 
 /* Open addressing keyed by codepoint. A miss is cached too - an unsupported character
  * must not be re-rasterised every frame - so entries carry `found`. */
@@ -94,10 +91,12 @@ static void load_fallbacks(jf_atlas *atlas)
     if (atlas->fallbacks_loaded)
         return;
     atlas->fallbacks_loaded = true;
-    for (size_t i = 0; i < sizeof(fallback_paths) / sizeof(*fallback_paths); i++) {
-        if (atlas->primary_path != NULL && strcmp(fallback_paths[i], atlas->primary_path) == 0)
+    size_t count = 0;
+    const char *const *paths = jf_os_font_fallbacks(&count);
+    for (size_t i = 0; i < count; i++) {
+        if (atlas->primary_path != NULL && strcmp(paths[i], atlas->primary_path) == 0)
             continue;
-        add_face(atlas, fallback_paths[i]);
+        add_face(atlas, paths[i]);
     }
 }
 
@@ -201,13 +200,15 @@ jf_atlas *jf_atlas_create(void)
         return NULL;
     }
 
-    const char *override = getenv("UI_FONT");
+    const char *override = jf_env("UI_FONT");
     if (override != NULL && override[0] != '\0' && add_face(atlas, override)) {
         atlas->primary_path = override;
     } else {
-        for (size_t i = 0; i < sizeof(face_candidates) / sizeof(*face_candidates); i++) {
-            if (add_face(atlas, face_candidates[i])) {
-                atlas->primary_path = face_candidates[i];
+        size_t count = 0;
+        const char *const *paths = jf_os_font_candidates(&count);
+        for (size_t i = 0; i < count; i++) {
+            if (add_face(atlas, paths[i])) {
+                atlas->primary_path = paths[i];
                 break;
             }
         }

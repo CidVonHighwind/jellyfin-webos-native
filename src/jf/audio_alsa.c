@@ -1,4 +1,5 @@
 #include "audio_alsa.h"
+#include "../platform/env.h"
 
 #include <alsa/asoundlib.h>
 #include <stdatomic.h>
@@ -36,7 +37,7 @@ bool jf_audio_open(int rate, int channels)
     /* webOS routes app audio through its own daemon, so which device that ends up being
      * is a property of the TV rather than of this code. `default` is the right first
      * guess; JF_ALSA_DEV exists so trying another is not a rebuild. */
-    const char *device = getenv("JF_ALSA_DEV");
+    const char *device = jf_env("JF_ALSA_DEV");
     if (device == NULL || device[0] == '\0')
         device = "default";
 

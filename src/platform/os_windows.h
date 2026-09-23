@@ -13,22 +13,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#define JF_OS_FONT_CANDIDATES                                                                \
-    "C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/arial.ttf", "C:/Windows/Fonts/tahoma.ttf"
-
-#define JF_OS_FONT_FALLBACKS "C:/Windows/Fonts/seguisym.ttf", "C:/Windows/Fonts/arial.ttf"
-
 static inline int jf_os_mkdir(const char *path) { return _mkdir(path); }
 
 static inline int jf_os_fsync(int file) { return _commit(file); }
-
-static inline int jf_os_setenv(const char *name, const char *value, int overwrite)
-{
-    /* _putenv_s always overwrites, so the flag is honoured here. */
-    if (!overwrite && getenv(name) != NULL)
-        return 0;
-    return _putenv_s(name, value);
-}
 
 /* No dprintf. Formatting into a buffer keeps what the callers rely on: negative when the
  * write does not complete. */
@@ -87,9 +74,4 @@ static inline int jf_os_socket_broadcast(jf_os_socket socket_fd)
 {
     const int yes = 1;
     return setsockopt(socket_fd, SOL_SOCKET, SO_BROADCAST, (const char *)&yes, sizeof(yes));
-}
-
-static inline bool jf_os_cwd(char *out, size_t out_len)
-{
-    return _getcwd(out, (int)out_len) != NULL;
 }

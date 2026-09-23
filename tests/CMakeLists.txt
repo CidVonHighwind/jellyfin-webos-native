@@ -8,7 +8,9 @@ if (TARGET jf-demux)
 endif ()
 # libass needs a real font to rasterise with, so this only runs where one is installed.
 if (EXISTS "${LIBASS_ROOT}/lib")
-    target_sources(jf-tests PRIVATE "${CMAKE_SOURCE_DIR}/src/jf/subs.c")
+    # env.c comes with subs.c: it reads UI_FONT through jf_env.
+    target_sources(jf-tests PRIVATE "${CMAKE_SOURCE_DIR}/src/jf/subs.c"
+            "${CMAKE_SOURCE_DIR}/src/platform/env.c")
     target_include_directories(jf-tests SYSTEM PRIVATE "${LIBASS_ROOT}/include")
     target_link_libraries(jf-tests PRIVATE "${LIBASS_ROOT}/lib/libass.so")
     target_compile_definitions(jf-tests PRIVATE JF_HAVE_SUBS=1)

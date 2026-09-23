@@ -11,6 +11,7 @@
 
 #include "../platform/gl.h"
 #include "../platform/luna.h"
+#include "../platform/env.h"
 #include "../platform/window.h"
 #include "probe.h"
 
@@ -30,7 +31,7 @@ static void on_event(const jf_event *event)
 
 int main(void)
 {
-    const char *appid = getenv("APPID");
+    const char *appid = jf_env("APPID");
     jf_window_set_handler(on_event);
     if (!jf_window_init(appid != NULL ? appid : "dev.hookedbehemoth.xmb", "XMB", 0, 0))
         return 1;
@@ -83,7 +84,7 @@ int main(void)
             gl_swap_interval, probe_gpu_mode_name(&timer));
 
     /* A couple of frames first, so the timer query has a result to show. */
-    unsigned dump_after = getenv("XMB_DUMP") != NULL ? 3 : 0;
+    unsigned dump_after = jf_env_flag("XMB_DUMP") ? 3 : 0;
     const uint64_t start = probe_now_ns();
     char line[PROBE_OVERLAY_COLS + 1];
 

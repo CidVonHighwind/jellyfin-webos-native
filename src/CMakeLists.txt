@@ -79,7 +79,19 @@ endif ()
 if (HAVE_PLATFORM)
     # Window, GL context, input and the webOS lifecycle. Off the TV the webOS-only halves
     # compile out and SDL picks an ordinary desktop backend, so the probes run either way.
-    add_library(jf-platform STATIC platform/window.c platform/luna.c platform/luna_json.c)
+    if (WIN32)
+        set(OS_IMPL platform/os_windows.c)
+    else ()
+        set(OS_IMPL platform/os_posix.c)
+    endif ()
+    # Only the TV has switches to read from a file; see platform/env.h.
+    if (TARGET_WEBOS)
+        set(ENV_IMPL platform/env_webos.c)
+    else ()
+        set(ENV_IMPL platform/env_null.c)
+    endif ()
+    add_library(jf-platform STATIC platform/window.c platform/luna.c platform/luna_json.c
+            platform/env.c ${OS_IMPL} ${ENV_IMPL})
     target_include_directories(jf-platform PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
     target_include_directories(jf-platform SYSTEM PUBLIC ${SDL2_INCLUDE_DIRS}
             ${GLIB_INCLUDE_DIRS} ${GLESV2_INCLUDE_DIRS} ${EGL_INCLUDE_DIRS})
@@ -183,7 +195,6 @@ add_executable(jellyfin
 # static library - embedded rather than staged: an installed app runs as a jail uid, and a
 # licence that fails to open is not an acceptable outcome. The TV's own libraries are not
 # here; see src/app/licenses.h. Symbol names match it.
-# `|` as the separator, not `:`: a source path starting "C:/" would split at the drive.
 foreach (_license agpl_3_0|${CMAKE_SOURCE_DIR}/LICENSE.txt
         lgpl_3_0|${CMAKE_SOURCE_DIR}/assets/licenses/lgpl-3.0.txt
         lgpl_2_1|${CMAKE_SOURCE_DIR}/assets/licenses/lgpl-2.1.txt

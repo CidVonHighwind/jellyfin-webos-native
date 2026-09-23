@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "../platform/env.h"
 #include "../platform/os.h"
 
 /* Artwork budget. The cache is pruned to this at startup, oldest first. Two hundred-odd
@@ -39,16 +40,27 @@ static void make_subdirectories(void)
  * `/usr/palm/applications/` is the marker rather than the leading component, because a
  * developer-mode install lives under /media/developer/apps and a retail one under
  * /media/cryptofs/apps, both ending in that path. */
+#ifdef JF_WEBOS
 static bool app_directory(char *out, size_t out_len)
 {
-    if (!jf_os_cwd(out, out_len))
+    const ssize_t n = readlink("/proc/self/cwd", out, out_len - 1);
+    if (n <= 0)
         return false;
+    out[n] = '\0';
     if (strstr(out, "/usr/palm/applications/") == NULL)
         return false;
     /* The last component is the app id, which always has a dot in it. */
     const char *slash = strrchr(out, '/');
     return slash != NULL && strchr(slash + 1, '.') != NULL;
 }
+#else
+static bool app_directory(char *out, size_t out_len)
+{
+    (void)out;
+    (void)out_len;
+    return false;
+}
+#endif
 
 static bool writable(void)
 {
@@ -65,7 +77,7 @@ static bool writable(void)
 void jf_store_init(void)
 {
     char cwd[512];
-    const char *override = getenv("JELLYFIN_STORE");
+    const char *override = jf_env("JELLYFIN_STORE");
     if (override != NULL && override[0] != '\0') {
         snprintf(root, sizeof(root), "%s", override);
     } else if (app_directory(cwd, sizeof(cwd))) {

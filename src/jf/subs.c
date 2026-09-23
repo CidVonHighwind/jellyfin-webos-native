@@ -1,4 +1,5 @@
 #include "subs.h"
+#include "../platform/env.h"
 
 #include <ass/ass.h>
 #include <pthread.h>
@@ -50,7 +51,7 @@ static void ass_log(int level, const char *format, va_list args, void *unused) {
 }
 
 static const char *pick_font(void) {
-  const char *override = getenv("UI_FONT");
+  const char *override = jf_env("UI_FONT");
   if (override != NULL)
     return override;
   for (size_t i = 0; i < sizeof(font_candidates) / sizeof(*font_candidates);

@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../platform/os.h" /* the socket type, close and timeout differ by platform */
+#include "../platform/os.h"
 
 /* ------------------------------------------------------------------ model */
 

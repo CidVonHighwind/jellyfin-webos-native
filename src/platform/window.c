@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "env.h"
 #include "gl.h"
 
 #ifdef JF_WEBOS
@@ -37,6 +38,26 @@ static char video_window_id[64];
  * main thread may do. */
 #define EV_RAISE (SDL_USEREVENT)
 #define EV_WAKE (SDL_USEREVENT + 1)
+
+/* Resolved once: these are consulted per key and per window event. */
+static bool flag_once(const char *name, int *cached)
+{
+    if (*cached < 0)
+        *cached = jf_env_flag(name);
+    return *cached != 0;
+}
+
+static bool keylog(void)
+{
+    static int cached = -1;
+    return flag_once("JF_KEYLOG", &cached);
+}
+
+static bool winlog(void)
+{
+    static int cached = -1;
+    return flag_once("JF_WINLOG", &cached);
+}
 
 static void emit(const jf_event *event)
 {
@@ -124,7 +145,7 @@ bool jf_window_init(const char *app_id, const char *title, uint32_t want_width,
      * hint. Without it the registration fails with "Invalid appId specified", SDL reports
      * the backend as unavailable and falls back to plain wayland - where the remote has no
      * keymap and every button arrives as scancode 1. Whatever SAM set wins. */
-    SDL_setenv("APPID", app_id, 0); /* SDL's own; Windows has no setenv. */
+    SDL_setenv("APPID", app_id, 0);
     SDL_SetHint("SDL_WEBOS_REGISTER_APP", "true");
     SDL_SetHint("SDL_WEBOS_ACCESS_POLICY_KEYS_BACK", "true"); /* no exit dialog */
     /* How long the magic-remote pointer stays on screen once it stops moving. SAM starts
@@ -164,20 +185,9 @@ bool jf_window_init(const char *app_id, const char *title, uint32_t want_width,
     const bool display_ok = SDL_GetCurrentDisplayMode(0, &mode) == 0 && mode.w > 0 && mode.h > 0;
     if (display_ok && mode.refresh_rate > 0)
         jf_window_refresh_mhz = (uint32_t)mode.refresh_rate * 1000;
-    /* Panel size is the right default only for the TV, which is fullscreen; on a desktop
-     * it opens a window as large as the screen with its title bar off the top edge. */
-    int width = want_width != 0 ? (int)want_width : display_ok ? mode.w : 1280;
-    int height = want_height != 0 ? (int)want_height : display_ok ? mode.h : 720;
-    if (want_width == 0 && !jf_window_on_webos) {
-        width = 1280;
-        height = 720;
-        if (display_ok) {
-            if (width > mode.w - 80)
-                width = mode.w - 80;
-            if (height > mode.h - 120)
-                height = mode.h - 120;
-        }
-    }
+    const bool panel_size = jf_window_on_webos && display_ok;
+    const int width = panel_size ? mode.w : 1280;
+    const int height = panel_size ? mode.h : 720;
 
     const Uint32 flags = SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN |
                          (jf_window_on_webos ? SDL_WINDOW_FULLSCREEN_DESKTOP
@@ -196,7 +206,7 @@ bool jf_window_init(const char *app_id, const char *title, uint32_t want_width,
 
     /* 1 = throttle to the display. SWAP_INTERVAL=0 lets frames go out as fast as they are
      * drawn, which is what shows the GPU's real ceiling. */
-    const char *interval = getenv("SWAP_INTERVAL");
+    const char *interval = jf_env("SWAP_INTERVAL");
     gl_swap_interval = interval != NULL ? atoi(interval) : 1;
     SDL_GL_SetSwapInterval(gl_swap_interval);
 
@@ -347,7 +357,7 @@ static void translate(const SDL_Event *event)
         const bool known = evdev_for(scancode, &code);
         /* JF_KEYLOG=1 shows every key SDL reports, which is the only way to learn what a
          * TV remote actually sends. */
-        if (!known || getenv("JF_KEYLOG") != NULL)
+        if (!known || keylog())
             fprintf(stderr, "sdl: key scancode=%d sym=0x%x down=%d repeat=%d\n", scancode,
                     (unsigned)event->key.keysym.sym, down, event->key.repeat);
         if (!known)
@@ -404,7 +414,7 @@ static void translate(const SDL_Event *event)
         /* Which events carry a size, and whether it has landed by the time one arrives,
          * differs between backends - the first thing to reach for when a window is drawn
          * at the wrong dimensions. */
-        if (getenv("JF_WINLOG") != NULL) {
+        if (winlog()) {
             int drawable_w = 0, drawable_h = 0, logical_w = 0, logical_h = 0;
             if (window != NULL) {
                 SDL_GL_GetDrawableSize(window, &drawable_w, &drawable_h);

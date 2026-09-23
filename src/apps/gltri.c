@@ -16,6 +16,7 @@
 
 #include "../platform/gl.h"
 #include "../platform/luna.h"
+#include "../platform/env.h"
 #include "../platform/window.h"
 #include "probe.h"
 
@@ -46,7 +47,7 @@ static float next_unit(unsigned *state)
 
 int main(void)
 {
-    const char *appid = getenv("APPID");
+    const char *appid = jf_env("APPID");
     jf_window_set_handler(on_event);
     if (!jf_window_init(appid != NULL ? appid : "dev.hookedbehemoth.gltri", "3000 triangles", 0,
                         0))
@@ -143,7 +144,7 @@ int main(void)
             INSTANCES, gl_width, gl_height, jf_window_refresh_mhz / 1000,
             jf_window_refresh_mhz % 1000, gl_swap_interval, probe_gpu_mode_name(&timer));
 
-    unsigned dump_after = getenv("GLTRI_DUMP") != NULL ? 3 : 0;
+    unsigned dump_after = jf_env_flag("GLTRI_DUMP") ? 3 : 0;
     const uint64_t start = probe_now_ns();
     char line[PROBE_OVERLAY_COLS + 1];
 
