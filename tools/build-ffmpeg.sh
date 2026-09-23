@@ -7,7 +7,11 @@
 #
 # The TV's own decoder takes the video, and the server transcodes anything it will not,
 # so this build has no video decoders, no encoders, no muxers, no filters and no
-# scaler. Seeking reopens the stream, so there is no HLS and no segment handling: file,
+# scaler. The subtitle decoders are the exception to "no decoders": every text format
+# FFmpeg knows decodes to ASS dialogue lines, which is the one thing libass takes, so
+# those few are what SRT, WebVTT and mov_text support costs. Bitmap subtitles are not
+# built - there is nothing to draw them with.
+# Seeking reopens the stream, so there is no HLS and no segment handling: file,
 # http and https are the whole protocol list. The video parsers stay because
 # jf_demux_video_unsupported reads bit depth and profile, which containers do not carry
 # and only the parser fills in.
@@ -121,6 +125,7 @@ cd "$BUILD_DIR"
     --enable-demuxer=matroska,mov,mpegts,mp3,flac,ogg,wav,aac,ac3 \
     --enable-decoder=aac,aac_latm,ac3,eac3,mp3,flac,opus,vorbis,alac,dca,truehd,mlp \
     --enable-decoder=pcm_s16le,pcm_s16be,pcm_s24le,pcm_s32le,pcm_f32le \
+    --enable-decoder=ass,ssa,subrip,srt,webvtt,movtext,text \
     --enable-protocol=file,http,https,tcp,tls \
     --disable-bsfs --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,extract_extradata \
     --disable-parsers \
@@ -133,7 +138,7 @@ make install ${DESTDIR:+DESTDIR="$DESTDIR"}
 INSTALLED="${DESTDIR}${PREFIX}/lib"
 for want in HTTPS_PROTOCOL MATROSKA_DEMUXER MOV_DEMUXER MPEGTS_DEMUXER AAC_DECODER \
             AC3_DECODER H264_MP4TOANNEXB_BSF HEVC_MP4TOANNEXB_BSF EXTRACT_EXTRADATA_BSF \
-            H264_PARSER HEVC_PARSER; do
+            H264_PARSER HEVC_PARSER ASS_DECODER SUBRIP_DECODER MOVTEXT_DECODER WEBVTT_DECODER; do
     grep -q "^#define CONFIG_$want 1$" config_components.h || {
         echo "error: CONFIG_$want is off" >&2; exit 1; }
 done

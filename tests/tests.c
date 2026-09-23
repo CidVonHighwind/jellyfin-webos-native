@@ -15,6 +15,9 @@
 #ifdef JF_HAVE_DEMUX
 #include "jf/demux.h"
 #endif
+#ifdef JF_HAVE_SUBS
+#include "jf/subs.h"
+#endif
 
 #define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); failures++; } } while (0)
 
@@ -211,6 +214,66 @@ static void test_demux_open_failure(void) {
 }
 #endif
 
+#ifdef JF_HAVE_SUBS
+/* The subtitle path end to end, minus the TV: a script header, one event fed on
+ * the segment timeline, and the composited overlay appearing and disappearing
+ * with it. This is where an off-by-one in the timing or a wrong premultiply
+ * shows up as nothing on screen, which the app itself cannot tell apart from
+ * "no subtitles here". */
+static void test_subtitles(void) {
+  static const char header[] =
+      "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\n\n"
+      "[V4+ Styles]\n"
+      "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+      "OutlineColour, "
+      "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, "
+      "Spacing, Angle, "
+      "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, "
+      "Encoding\n"
+      "Style: "
+      "Default,Sans,48,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,"
+      "100,100,0,0,1,2,0,2,10,10,40,1\n\n"
+      "[Events]\n"
+      "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, "
+      "Effect, Text\n";
+  /* The ASS event format FFmpeg's decoders emit: read order first, then the
+   * fields. */
+  static const char line[] = "0,0,Default,,0,0,0,,Hello";
+
+  CHECK(jf_subs_open(header, (int)sizeof(header) - 1, 1920, 1080));
+  CHECK(jf_subs_ready());
+  jf_subs_feed(line, (int)sizeof(line) - 1, 1000, 2000);
+
+  jf_subs_image image;
+  jf_subs_frame(500, &image);
+  CHECK(image.w == 0); /* before the event */
+
+  jf_subs_frame(1500, &image);
+  CHECK(image.w > 0 && image.h > 0 && image.rgba != NULL);
+  CHECK(image.x >= 0 && image.y >= 0);
+  CHECK(image.x + image.w <= 1920 && image.y + image.h <= 1080);
+  /* Something was actually drawn, and it is not an opaque block: a glyph covers
+   * some of its own bounding box and none of the rest. */
+  int opaque = 0, clear = 0;
+  for (int i = 0; i < image.w * image.h; i++) {
+    if (image.rgba[i * 4 + 3] > 200)
+      opaque++;
+    if (image.rgba[i * 4 + 3] == 0)
+      clear++;
+  }
+  CHECK(opaque > 0 && clear > 0);
+
+  jf_subs_frame(4000, &image);
+  CHECK(image.w == 0); /* after it */
+
+  jf_subs_flush();
+  jf_subs_frame(1500, &image);
+  CHECK(image.w == 0); /* a seek drops what was queued */
+  jf_subs_close();
+  CHECK(!jf_subs_ready());
+}
+#endif
+
 int main(void)
 {
     test_load_payload();
@@ -222,6 +285,9 @@ int main(void)
     test_skyline();
 #ifdef JF_HAVE_DEMUX
     test_demux_open_failure();
+#endif
+#ifdef JF_HAVE_SUBS
+    test_subtitles();
 #endif
     if (failures != 0) {
         fprintf(stderr, "%d check(s) failed\n", failures);

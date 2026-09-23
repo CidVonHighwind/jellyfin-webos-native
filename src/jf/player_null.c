@@ -47,3 +47,13 @@ int jf_player_position(void) { return 0; }
 bool jf_player_embedded(void) { return false; }
 bool jf_player_needs_frame(void) { return false; }
 void jf_player_render(uint32_t width, uint32_t height) { (void)width; (void)height; }
+
+/* No pipeline here, so no container and no tracks to offer. */
+int jf_player_subtitle_count(void) { return 0; }
+const char *jf_player_subtitle_name(int track) {
+  (void)track;
+  return "";
+}
+int jf_player_subtitle_current(void) { return -1; }
+void jf_player_subtitle_select(int track) { (void)track; }
+int jf_player_media_ms(void) { return -1; }

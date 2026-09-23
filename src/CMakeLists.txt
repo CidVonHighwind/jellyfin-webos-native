@@ -168,7 +168,31 @@ add_executable(jellyfin
         jf/arena.c
         jf/cfg.c
         jf/image.c
-        jf/store.c)
+        jf/store.c
+        jf/subs.c)
+
+# The licences of what the package distributes - its own shared objects and the one
+# static library - embedded rather than staged: an installed app runs as a jail uid, and a
+# licence that fails to open is not an acceptable outcome. The TV's own libraries are not
+# here; see src/app/licenses.h. Symbol names match it.
+foreach (_license agpl_3_0:${CMAKE_SOURCE_DIR}/LICENSE.txt
+        lgpl_3_0:${CMAKE_SOURCE_DIR}/assets/licenses/lgpl-3.0.txt
+        lgpl_2_1:${CMAKE_SOURCE_DIR}/assets/licenses/lgpl-2.1.txt
+        apache_2_0:${CMAKE_SOURCE_DIR}/assets/licenses/apache-2.0.txt
+        libass:${CMAKE_SOURCE_DIR}/assets/licenses/libass.txt
+        harfbuzz:${CMAKE_SOURCE_DIR}/assets/licenses/harfbuzz.txt
+        mit:${CMAKE_SOURCE_DIR}/assets/licenses/mit.txt)
+    string(REPLACE ":" ";" _parts "${_license}")
+    list(GET _parts 0 _name)
+    list(GET _parts 1 _path)
+    webos_embed(jellyfin SYMBOL license_${_name} FILE "${_path}")
+endforeach ()
+
+if (NOT EXISTS "${LIBASS_ROOT}/lib")
+    message(FATAL_ERROR "No libass at ${LIBASS_ROOT} - run tools/build-libass.sh")
+endif ()
+target_include_directories(jellyfin SYSTEM PRIVATE "${LIBASS_ROOT}/include")
+target_link_libraries(jellyfin PRIVATE "${LIBASS_ROOT}/lib/libass.so")
 target_include_directories(jellyfin SYSTEM PRIVATE
         ${LIBCURL_INCLUDE_DIRS} ${LIBPNG_INCLUDE_DIRS} ${JSONC_INCLUDE_DIRS})
 target_link_directories(jellyfin PRIVATE ${LIBCURL_LIBRARY_DIRS} ${LIBPNG_LIBRARY_DIRS}
@@ -205,7 +229,8 @@ target_sources(jellyfin PRIVATE
 target_include_directories(jellyfin SYSTEM PRIVATE ${ALSA_INCLUDE_DIRS}
         "${FFMPEG_ROOT}/include")
 target_link_directories(jellyfin PRIVATE "${FFMPEG_ROOT}/lib")
-target_link_options(jellyfin PRIVATE "-Wl,-rpath-link,${FFMPEG_ROOT}/lib")
+target_link_options(jellyfin PRIVATE "-Wl,-rpath-link,${FFMPEG_ROOT}/lib"
+        "-Wl,-rpath-link,${LIBASS_ROOT}/lib")
 target_link_libraries(jellyfin PRIVATE jf-smp-shim ${ALSA_LIBRARIES}
         avformat avcodec swresample avutil)
 # The bundled FFmpeg lives beside the binary, which is what $ORIGIN/lib resolves to.
@@ -216,6 +241,9 @@ set_target_properties(jellyfin PROPERTIES
 set(FFMPEG_BUNDLE "")
 foreach (_soname IN LISTS FFMPEG_SONAMES)
     list(APPEND FFMPEG_BUNDLE "${FFMPEG_ROOT}/lib/${_soname}")
+endforeach ()
+foreach (_soname IN LISTS LIBASS_SONAMES)
+    list(APPEND FFMPEG_BUNDLE "${LIBASS_ROOT}/lib/${_soname}")
 endforeach ()
 
 webos_add_ipk(

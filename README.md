@@ -32,6 +32,12 @@ One translation unit is C++: `src/jf/smp_shim.cpp`, a try/catch façade over
   `tools/build-ffmpeg.sh --host` is optional and only the demux tests want it.
   Both install where `FFMPEG_ROOT` defaults to; override it with
   `-DFFMPEG_ROOT=/path`.
+- libass, from `tools/build-libass.sh` — the subtitle renderer, with the FriBidi
+  and HarfBuzz it will not build without. FreeType is the TV's own; fontconfig is
+  deliberately left out, so ASS styles resolve to the same face the UI uses.
+  All three ship inside the ipk. Required for both targets;
+  `tools/build-libass.sh --host` also enables the subtitle test. They install
+  where `LIBASS_ROOT` defaults to; override it with `-DLIBASS_ROOT=/path`.
 
 ## Build
 

@@ -26,11 +26,13 @@
 #include "../jf/api.h"
 #include "../jf/cfg.h"
 #include "../jf/player.h"
+#include "../jf/subs.h"
 #include "../platform/gl.h"
 #include "../platform/luna.h"
 #include "../platform/window.h"
 #include "../ui/loom.h"
 #include "../ui/renderer.h"
+#include "licenses.h"
 
 #define APP_ID "dev.hookedbehemoth.jellyfin"
 
@@ -516,15 +518,17 @@ static size_t first_unfinished(const card *cards, size_t count)
 /* ---------------------------------------------------------------- app state */
 
 typedef enum {
-    SCREEN_SERVER,
-    SCREEN_AUTH,
-    SCREEN_QUICK,
-    SCREEN_HOME,
-    SCREEN_GRID,
-    SCREEN_DETAILS,
-    SCREEN_SEASON,
-    SCREEN_PLAYBACK,
-    SCREEN_SETTINGS,
+  SCREEN_SERVER,
+  SCREEN_AUTH,
+  SCREEN_QUICK,
+  SCREEN_HOME,
+  SCREEN_GRID,
+  SCREEN_DETAILS,
+  SCREEN_SEASON,
+  SCREEN_PLAYBACK,
+  SCREEN_SETTINGS,
+  SCREEN_LICENSES,
+  SCREEN_LICENSE,
 } screen_id;
 
 typedef enum { EDIT_NONE, EDIT_URL, EDIT_USERNAME, EDIT_PASSWORD } edit_field;
@@ -602,6 +606,30 @@ typedef struct {
 
 static stack_entry stack[12];
 static size_t depth;
+
+/* Third-party licences. The list is static; the text of one is split into lines
+ * when it is opened, so only the licence being read costs anything, and the
+ * virtual list draws the handful of lines that are on screen. */
+static size_t license_open = JF_LICENSE_COUNT;
+static char *license_body;
+static const char **license_lines;
+static size_t license_line_count;
+static float license_scroll;
+/* Width of the longest line at a font size of one, measured once when the
+ * licence is opened. The panel is then sized to the text rather than to the
+ * screen. */
+static float license_text_width;
+/* Set by the draw, used by the key handler: one press moves one line of
+ * whatever size that screen turned out to be. */
+static float license_line_height = 26;
+static float licenses_scroll;
+static bool licenses_reveal;
+
+/* The composited subtitle overlay, uploaded only when libass says it changed.
+ */
+static uint32_t subtitle_texture;
+static loom_rect subtitle_rect;
+static uint64_t subtitle_tick;
 
 /* Discovery / manual server entry. */
 #define DISCOVERED_CAPACITY 8
@@ -1406,6 +1434,62 @@ static void use_server(const char *address, const char *name)
 
 static void activate(void);
 
+/* Split one licence into lines once, at open, rather than measuring the whole
+ * text every frame. The copy is mutable so the newlines become terminators in
+ * place and each line is a pointer into it; the virtual list then draws only
+ * what is on screen. */
+static void open_license(size_t index) {
+  free(license_body);
+  free(license_lines);
+  license_body = NULL;
+  license_lines = NULL;
+  license_line_count = 0;
+  license_scroll = 0;
+  license_open = index;
+  if (index >= JF_LICENSE_COUNT)
+    return;
+
+  const char *text = (const char *)jf_licenses[index].text;
+  const size_t length = strlen(text);
+  license_body = malloc(length + 1);
+  if (license_body == NULL) {
+    set_error("Not enough memory to open that licence");
+    return;
+  }
+  memcpy(license_body, text, length + 1);
+
+  size_t lines = 1;
+  for (size_t i = 0; i < length; i++)
+    if (license_body[i] == '\n')
+      lines++;
+  license_lines = malloc(lines * sizeof(*license_lines));
+  if (license_lines == NULL) {
+    free(license_body);
+    license_body = NULL;
+    set_error("Not enough memory to open that licence");
+    return;
+  }
+  char *cursor = license_body;
+  license_lines[license_line_count++] = cursor;
+  for (size_t i = 0; i < length; i++) {
+    if (license_body[i] != '\n')
+      continue;
+    license_body[i] = '\0';
+    /* A trailing newline would otherwise add an empty last line. */
+    if (i + 1 < length)
+      license_lines[license_line_count++] = &license_body[i + 1];
+  }
+  /* Also the only walk over every glyph in the text, which warms the atlas here
+   * rather than on the first frame that scrolls into a character it has not
+   * seen. */
+  license_text_width = 0;
+  for (size_t i = 0; i < license_line_count; i++)
+    license_text_width =
+        maxf(license_text_width,
+             jf_renderer_measure(renderer, license_lines[i], 1.0f));
+  screen = SCREEN_LICENSE;
+}
+
 static void open_sidebar(void)
 {
     end_edit();
@@ -1480,6 +1564,16 @@ static void go_back(void)
         screen = sidebar_return_screen;
         focus = 0;
         break;
+    case SCREEN_LICENSES:
+      screen = SCREEN_SETTINGS;
+      focus = 2;
+      break;
+    case SCREEN_LICENSE:
+      focus = min_size(license_open, JF_LICENSE_COUNT - 1);
+      open_license(JF_LICENSE_COUNT); /* frees the text */
+      screen = SCREEN_LICENSES;
+      licenses_reveal = true;
+      break;
     default:
         pop();
         break;
@@ -1542,6 +1636,11 @@ static void start_playback(const char *id, const char *title, uint64_t resume_ti
         set_error("Playback failed: %s", jf_player_error());
         return;
     }
+    if (subtitle_texture != 0) {
+      /* Whatever the last item left on screen is not this one's. */
+      jf_renderer_destroy_texture(renderer, subtitle_texture);
+      subtitle_texture = 0;
+    }
     set_text(playback_title, sizeof(playback_title), title);
     set_text(playback_item_id, sizeof(playback_item_id), id);
     playback_paused = false;
@@ -1579,7 +1678,24 @@ static void activate_playback(void)
     case ACTION_NEXT:
         set_status("Episode navigation is not available for this item");
         break;
-    case ACTION_SUBTITLES: set_status("No subtitle tracks are available"); break;
+    case ACTION_SUBTITLES: {
+      const int count = jf_player_subtitle_count();
+      if (count == 0) {
+        set_status("No subtitle tracks are available");
+        break;
+      }
+      /* Off, then each track in turn, then off again. A picker is a screen;
+       * this is a button that already exists. */
+      const int next = jf_player_subtitle_current() + 1;
+      if (next >= count) {
+        jf_player_subtitle_select(-1);
+        set_status("Subtitles off");
+      } else {
+        jf_player_subtitle_select(next);
+        set_status("Subtitles: %s", jf_player_subtitle_name(next));
+      }
+      break;
+    }
     case ACTION_AUDIO: set_status("This stream has one audio track"); break;
     }
 }
@@ -1708,10 +1824,19 @@ static void activate(void)
             animated_float_snap(&row_offset_motion[index], 0);
           focus_cursor.known = false;
         }
-      } else {
+      } else if (focus == 1) {
         sign_out();
+      } else {
+        screen = SCREEN_LICENSES;
+        focus = 0;
+        licenses_reveal = true;
       }
         break;
+    case SCREEN_LICENSES:
+      open_license(min_size(focus, JF_LICENSE_COUNT - 1));
+      break;
+    case SCREEN_LICENSE:
+      break;
     }
 }
 
@@ -1725,7 +1850,11 @@ static size_t focus_count(void)
     case SCREEN_QUICK: return 1;
     case SCREEN_PLAYBACK: return PLAYBACK_BUTTON_COUNT;
     case SCREEN_SETTINGS:
-      return 2;
+      return 3;
+    case SCREEN_LICENSES:
+      return JF_LICENSE_COUNT;
+    case SCREEN_LICENSE:
+      return 1;
     case SCREEN_DETAILS:
         return card_is(&detail, "Series") ? (seasons_row.count > 0 ? seasons_row.count : 1) : 1;
     default: return 1;
@@ -1842,6 +1971,19 @@ static void move(direction where, bool repeat) {
     break;
   case SCREEN_GRID:
     move_grid(where);
+    break;
+  case SCREEN_LICENSES:
+    if (where == DIR_UP)
+      focus = dec(focus);
+    else if (where == DIR_DOWN)
+      focus = min_size(focus + 1, focus_count() - 1);
+    licenses_reveal = true;
+    break;
+  case SCREEN_LICENSE:
+    if (where == DIR_UP)
+      license_scroll = maxf(0, license_scroll - license_line_height);
+    else if (where == DIR_DOWN)
+      license_scroll += license_line_height;
     break;
   case SCREEN_SEASON:
     if (where == DIR_UP) {
@@ -2007,6 +2149,13 @@ static void on_event(const jf_event *event)
             if (card_is(&detail, "Series") && delta != 0)
                 focus = delta > 0 ? min_size(focus + 1, dec(seasons_row.count)) : dec(focus);
             break;
+        case SCREEN_LICENSES:
+          licenses_scroll += delta;
+          licenses_reveal = false;
+          break;
+        case SCREEN_LICENSE:
+          license_scroll = maxf(0, license_scroll + delta);
+          break;
         default:
             break;
         }
@@ -2849,10 +2998,151 @@ static void draw_playback(loom_context *ctx, float width, float height, float sc
     }
 }
 
+/* The subtitle overlay sits under the transport chrome and over the video hole.
+ * libass composes it; this only notices when it changed and re-uploads. */
+static void draw_subtitles(loom_context *ctx) {
+  if (!jf_subs_ready()) {
+    if (subtitle_texture != 0) {
+      jf_renderer_destroy_texture(renderer, subtitle_texture);
+      subtitle_texture = 0;
+    }
+    return;
+  }
+  const int media_ms = jf_player_media_ms();
+  if (media_ms < 0)
+    return;
+  jf_subs_image image;
+  if (jf_subs_frame(media_ms, &image)) {
+    if (subtitle_texture != 0)
+      jf_renderer_destroy_texture(renderer, subtitle_texture);
+    subtitle_texture =
+        image.w > 0
+            ? jf_renderer_create_rgba_texture(renderer, (uint32_t)image.w,
+                                              (uint32_t)image.h, image.rgba)
+            : 0;
+    subtitle_rect = (loom_rect){(float)image.x, (float)image.y, (float)image.w,
+                                (float)image.h};
+  }
+  if (subtitle_texture == 0)
+    return;
+  static const float whole[4] = {0, 0, 1, 1};
+  loom_textured(ctx, subtitle_rect, NULL, subtitle_texture, whole, WHITE, 0);
+}
+
+static void draw_licenses(loom_context *ctx, float width, float height,
+                          float scale) {
+  /* Tall enough for the list, or for the screen, whichever runs out first. */
+  const float row_height = 78 * scale;
+  const float chrome = 164 * scale; /* heading above, hint below */
+  const float panel_height =
+      minf(height - 240 * scale, chrome + JF_LICENSE_COUNT * row_height);
+  const loom_rect panel = {360 * scale, (height - panel_height) / 2,
+                           width - 720 * scale, panel_height};
+  loom_fill(ctx, panel, NULL, PANEL, 18 * scale);
+  loom_stroke(ctx, panel, NULL, BORDER, 2 * scale, 18 * scale);
+  loom_label(ctx,
+             (loom_rect){panel.x + 48 * scale, panel.y + 36 * scale,
+                         panel.w - 96 * scale, 44 * scale},
+             &panel, "Open source licenses", TEXT, 32 * scale);
+
+  const loom_rect list_rect = {panel.x + 40 * scale, panel.y + 104 * scale,
+                               panel.w - 80 * scale, panel.h - 144 * scale};
+  loom_virtual_list target = loom_virtual_list_init(
+      list_rect, JF_LICENSE_COUNT, row_height, licenses_scroll);
+  if (licenses_reveal) {
+    licenses_scroll = loom_virtual_list_reveal(&target, focus);
+    licenses_reveal = false;
+    target = loom_virtual_list_init(list_rect, JF_LICENSE_COUNT, row_height,
+                                    licenses_scroll);
+  }
+  const loom_virtual_list list = target;
+  /* Rows of its own rather than draw_button, for the same reason the sidebar
+   * has them: a scrolled list needs every part of a row clipped to the view,
+   * not just its text. */
+  const loom_rect clip = {list_rect.x - 4 * scale, list_rect.y,
+                          list_rect.w + 8 * scale, list_rect.h};
+  for (size_t index = list.first; index < list.last; index++) {
+    const loom_rect raw = loom_virtual_list_item(&list, index);
+    const loom_rect row = {raw.x, raw.y + 6 * scale, raw.w, raw.h - 12 * scale};
+    const bool hot = hovered(row);
+    loom_fill(ctx, row, &clip, hot ? HOT : CARD, 12 * scale);
+    loom_stroke(ctx, row, &clip, focus == index ? ACCENT : BORDER,
+                focus == index ? 4 * scale : 2 * scale, 12 * scale);
+    loom_label(
+        ctx,
+        (loom_rect){row.x + 24 * scale, row.y + (row.h - 30 * scale) / 2,
+                    row.w - 48 * scale, 38 * scale},
+        &clip,
+        fmt("%s - %s", jf_licenses[index].library, jf_licenses[index].license),
+        TEXT, 25 * scale);
+    if (hot && pointer_press) {
+      focus = index;
+      activate();
+    }
+  }
+}
+
+static void draw_license(loom_context *ctx, float width, float height,
+                         float scale) {
+  if (license_open >= JF_LICENSE_COUNT)
+    return;
+  /* The licence files are hard-wrapped to 96 columns in the tree, so opening
+   * one is a split on newlines and nothing else - no measuring, no re-flow, and
+   * the same line breaks the licensor published. Which also means the box can
+   * be cut to the text: the ISC licence is fifteen lines and has no business
+   * filling a screen. */
+  const float size = 17 * scale;
+  license_line_height = 24 * scale;
+  const float padding = 40 * scale;
+  const float heading = 86 * scale;
+  const float panel_width =
+      minf(width - 240 * scale,
+           maxf(620 * scale, license_text_width * size + 2 * padding));
+  const float panel_height =
+      minf(height - 180 * scale,
+           heading + license_line_count * license_line_height + padding);
+  const loom_rect panel = {(width - panel_width) / 2,
+                           (height - panel_height) / 2, panel_width,
+                           panel_height};
+  loom_fill(ctx, panel, NULL, PANEL, 18 * scale);
+  loom_stroke(ctx, panel, NULL, BORDER, 2 * scale, 18 * scale);
+  loom_label(ctx,
+             (loom_rect){panel.x + padding, panel.y + 30 * scale,
+                         panel.w - 2 * padding, 40 * scale},
+             &panel,
+             fmt("%s - %s", jf_licenses[license_open].library,
+                 jf_licenses[license_open].license),
+             TEXT, 28 * scale);
+
+  const loom_rect view = {panel.x + padding, panel.y + heading,
+                          panel.w - 2 * padding, panel.h - heading - padding};
+  loom_virtual_list list = loom_virtual_list_init(
+      view, license_line_count, license_line_height, license_scroll);
+  const float end = loom_virtual_list_max_scroll(&list);
+  license_scroll = minf(license_scroll, end);
+  list = loom_virtual_list_init(view, license_line_count, license_line_height,
+                                license_scroll);
+  for (size_t index = list.first; index < list.last; index++) {
+    const loom_rect row = loom_virtual_list_item(&list, index);
+    loom_label(ctx, (loom_rect){row.x, row.y, row.w, row.h}, &view,
+               license_lines[index], DIM, size);
+  }
+  /* Deep enough to cover the line being cut in half, and only at the end there
+   * is more text past - a fade over the first line of a licence that starts at
+   * the top just makes its title hard to read. */
+  const float fade = license_line_height * 2;
+  if (license_scroll > 0.5f)
+    loom_fade(ctx, (loom_rect){view.x, view.y, view.w, fade}, &panel, PANEL,
+              LOOM_FADE_TOP);
+  if (license_scroll < end - 0.5f)
+    loom_fade(ctx, (loom_rect){view.x, view.y + view.h - fade, view.w, fade},
+              &panel, PANEL, LOOM_FADE_BOTTOM);
+}
+
 static void draw_settings(loom_context *ctx, float width, float scale)
 {
   const loom_rect panel = {560 * scale, 230 * scale, width - 1120 * scale,
-                           390 * scale};
+                           484 * scale};
   loom_fill(ctx, panel, NULL, PANEL, 18 * scale);
   loom_stroke(ctx, panel, NULL, BORDER, 2 * scale, 18 * scale);
   loom_label(ctx,
@@ -2868,6 +3158,10 @@ static void draw_settings(loom_context *ctx, float width, float scale)
               (loom_rect){panel.x + 48 * scale, panel.y + 210 * scale,
                           panel.w - 96 * scale, 72 * scale},
               "Sign out", 1, scale);
+  draw_button(ctx,
+              (loom_rect){panel.x + 48 * scale, panel.y + 304 * scale,
+                          panel.w - 96 * scale, 72 * scale},
+              "Open source licenses", 2, scale);
 }
 
 static void draw_sidebar(loom_context *ctx, float height, float scale)
@@ -3006,8 +3300,17 @@ static void build_ui(loom_context *ctx)
     case SCREEN_GRID: draw_grid(ctx, width, height, scale); break;
     case SCREEN_DETAILS: draw_details(ctx, width, scale); break;
     case SCREEN_SEASON: draw_season(ctx, width, height, scale); break;
-    case SCREEN_PLAYBACK: draw_playback(ctx, width, height, scale); break;
+    case SCREEN_PLAYBACK:
+      draw_subtitles(ctx);
+      draw_playback(ctx, width, height, scale);
+      break;
     case SCREEN_SETTINGS: draw_settings(ctx, width, scale); break;
+    case SCREEN_LICENSES:
+      draw_licenses(ctx, width, height, scale);
+      break;
+    case SCREEN_LICENSE:
+      draw_license(ctx, width, height, scale);
+      break;
     }
     if (sidebar_open)
         draw_sidebar(ctx, height, scale);
@@ -3021,7 +3324,17 @@ static void build_ui(loom_context *ctx)
 
 /* -------------------------------------------------------------------- main */
 
-/* Only these two UI features have time-dependent work in normal operation. */
+/* How often the subtitle overlay is asked whether it has changed.
+ *
+ * ponytail: a poll, not a schedule. libass knows when the next event starts but
+ * not when the current one ends, so there is no single wake-up to ask it for;
+ * at this period a line appears within one frame of its time at 30 Hz and the
+ * check costs one ass_render_frame against an unchanged time. A karaoke or
+ * sign-heavy script animates at this rate rather than the display's - drive it
+ * from jf_player_needs_frame if that ever matters. */
+#define SUBTITLE_TICK_NS (33 * 1000000ull)
+
+/* Only these UI features have time-dependent work in normal operation. */
 static bool next_deadline(uint64_t now, bool controls_visible, uint64_t *out)
 {
     bool have = false;
@@ -3034,6 +3347,11 @@ static bool next_deadline(uint64_t now, bool controls_visible, uint64_t *out)
         if (!have || playback_controls_until < deadline)
             deadline = playback_controls_until;
         have = true;
+    }
+    if (screen == SCREEN_PLAYBACK && jf_subs_ready()) {
+      if (!have || subtitle_tick < deadline)
+        deadline = subtitle_tick;
+      have = true;
     }
     *out = deadline;
     return have;
@@ -3081,15 +3399,16 @@ done:
     free(row);
 }
 
-/* SAM launches an app with an environment of its own making and no way to add to it, so
- * the debug switches (JF_KEYLOG, JF_LUNALOG, JF_ALSA_DEV) would be reachable only from a
- * hand-started run - which is exactly the run that behaves differently. Read them from
- * conf/debug.env instead, one KEY=VALUE per line, so they work however the app was
- * started:
+/* SAM launches an app with an environment of its own making and no way to add
+ * to it, so the debug switches (JF_KEYLOG, JF_LUNALOG, JF_ALSA_DEV, JF_NOAUDIO,
+ * JF_NOSUBS) would be reachable only from a hand-started run - which is exactly
+ * the run that behaves differently. Read them from conf/debug.env instead, one
+ * KEY=VALUE per line, so they work however the app was started:
  *
  *     echo JF_KEYLOG=1 > $APPDIR/<id>/conf/debug.env
  *
- * Anything already in the environment wins, so a manual run can still override the file. */
+ * Anything already in the environment wins, so a manual run can still override
+ * the file. */
 static void load_debug_env(void)
 {
     char path[576];
@@ -3304,6 +3623,11 @@ int main(void)
         if (visible != controls_visible) {
             controls_visible = visible;
             jf_window_frame_requested = true;
+        }
+        if (screen == SCREEN_PLAYBACK && jf_subs_ready() &&
+            now >= subtitle_tick) {
+          subtitle_tick = now + SUBTITLE_TICK_NS;
+          jf_window_frame_requested = true;
         }
         const bool scripted_frame = script[script_at] != '\0' || capture_after > 0;
         if (!jf_window_drawable ||

@@ -37,6 +37,16 @@ set(FFMPEG_ROOT "${_ffmpeg_default}" CACHE PATH "FFmpeg prefix")
 set(FFMPEG_SONAMES libavformat.so.63 libavcodec.so.63 libavutil.so.61 libswresample.so.7
         libmbedtls.so.21 libmbedx509.so.7 libmbedcrypto.so.16)
 
+# libass, and the two libraries it will not build without. The TV ships FreeType but
+# neither of these; tools/build-libass.sh puts them here.
+if (TARGET_WEBOS)
+    set(_libass_default "${WEBOS_SDK}/arm-webos-linux-gnueabi/sysroot/usr/local/libass")
+else ()
+    set(_libass_default "${CMAKE_SOURCE_DIR}/build/libass-host")
+endif ()
+set(LIBASS_ROOT "${_libass_default}" CACHE PATH "libass prefix")
+set(LIBASS_SONAMES libass.so.9 libfribidi.so.0 libharfbuzz.so.0)
+
 add_subdirectory(src)
 if (NOT TARGET_WEBOS)
     enable_testing()

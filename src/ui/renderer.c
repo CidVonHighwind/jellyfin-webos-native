@@ -101,23 +101,24 @@ static GLuint make_program(const unsigned char *fragment)
     return program;
 }
 
-/* RGB8 into a fresh immutable-storage texture, clamped and linear - the settings every
- * texture here wants. */
-static GLuint make_texture(uint32_t width, uint32_t height, const uint8_t *rgb)
-{
-    GLuint id = 0;
-    glGenTextures(1, &id);
-    glActiveTexture(ATLAS_UNIT);
-    glBindTexture(GL_TEXTURE_2D, id);
-    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGB8, (GLsizei)width, (GLsizei)height);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)width, (GLsizei)height, GL_RGB,
-                    GL_UNSIGNED_BYTE, rgb);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    return id;
+/* Into a fresh immutable-storage texture, clamped and linear - the settings
+ * every texture here wants. */
+static GLuint make_texture(uint32_t width, uint32_t height,
+                           const uint8_t *pixels, bool alpha) {
+  GLuint id = 0;
+  glGenTextures(1, &id);
+  glActiveTexture(ATLAS_UNIT);
+  glBindTexture(GL_TEXTURE_2D, id);
+  glTexStorage2D(GL_TEXTURE_2D, 1, alpha ? GL_RGBA8 : GL_RGB8, (GLsizei)width,
+                 (GLsizei)height);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)width, (GLsizei)height,
+                  alpha ? GL_RGBA : GL_RGB, GL_UNSIGNED_BYTE, pixels);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  return id;
 }
 
 static void atlas_texture_params(void)
@@ -184,7 +185,9 @@ jf_renderer *jf_renderer_create(const uint8_t *media, uint32_t media_width, uint
     r->atlas_texture_size = jf_atlas_size(r->atlas);
 
     /* Same unit as the glyph atlas: only one texture is bound at a time. */
-    r->media_texture = media != NULL ? make_texture(media_width, media_height, media) : r->texture;
+    r->media_texture =
+        media != NULL ? make_texture(media_width, media_height, media, false)
+                      : r->texture;
 
     const unsigned char *const fragments[KIND_COUNT] = {ui_fill, ui_round, ui_border, ui_glyph,
                                                         ui_image, ui_fade};
@@ -218,9 +221,17 @@ float jf_renderer_measure(jf_renderer *r, const char *text, float size)
 uint32_t jf_renderer_create_texture(jf_renderer *r, uint32_t width, uint32_t height,
                                     const uint8_t *rgb)
 {
-    const GLuint id = make_texture(width, height, rgb);
-    r->have_state = false; /* the batcher tracks what it bound last; this bypassed it */
-    return id;
+  const GLuint id = make_texture(width, height, rgb, false);
+  r->have_state =
+      false; /* the batcher tracks what it bound last; this bypassed it */
+  return id;
+}
+
+uint32_t jf_renderer_create_rgba_texture(jf_renderer *r, uint32_t width,
+                                         uint32_t height, const uint8_t *rgba) {
+  const GLuint id = make_texture(width, height, rgba, true);
+  r->have_state = false;
+  return id;
 }
 
 void jf_renderer_destroy_texture(jf_renderer *r, uint32_t id)

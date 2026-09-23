@@ -41,6 +41,46 @@ threads. Bounded `std.Io.Queue` packet queues keep both the packet-count and
 the pacing event before threads are joined. Thread priorities remain at their
 defaults.
 
+## Subtitles
+
+Text subtitle tracks are rendered with libass (`src/jf/subs.c`) onto the
+graphics plane. Video belongs to the TV's own plane, so nothing can be
+composited into the picture; the overlay is drawn over the transparent hole
+instead, at the window's size rather than the video's.
+
+Every text format FFmpeg knows — ASS/SSA, SRT, WebVTT, mov_text — decodes to ASS
+dialogue lines, which is exactly what `ass_process_chunk` takes, so
+`jf_demux_subtitle_decode` has one path and the build needs only those few
+decoders. Bitmap tracks (PGS, VobSub) have no ASS form and are not offered.
+
+**The timing is the pipeline's.** Events are fed on the same rebased segment
+timeline the video feed and the ALSA writer are paced against, and the frame
+asked for is `jf_clock_pts()` — the projected presentation timestamp, not the
+wall clock. Subtitles therefore track the picture and the sound through pauses,
+buffering and seeks, and a seek flushes the track rather than re-deriving an
+offset.
+
+The demux thread feeds; the render thread composes. One lock covers the library,
+the renderer and the track, which is a few short calls a minute against a few a
+second. libass returns one 8-bit coverage bitmap per colour run; those are
+blended into a single RGBA image bounded by their union — a strip near the
+bottom, not a frame — so an overlay costs one upload and one draw call. It is
+re-uploaded only when `ass_render_frame` reports a change.
+
+The playback screen otherwise schedules no frames once the controls hide, so
+with a track selected the main loop ticks at 33 ms to ask whether the overlay
+moved. libass can say when the next event *starts* but not when the current one
+*ends*, so there is no single deadline to wait on.
+
+The first text track is selected when playback starts, and the Subtitles button
+cycles through the rest and back to off. The reader thread owns the demuxer, so
+a selection made on the render thread is a request it picks up between packets.
+`JF_NOSUBS=1` keeps the reader off that path entirely.
+
+Subtitle packets are not decoded before the segment origin is known. It is set
+by the first video or audio packet, and a line rebased against a zero origin
+lands at its absolute container time - half an hour out, on a resume.
+
 Two bugs that cost time and are easy to reintroduce:
 
 - A draw command holds a **slice**, not a string. Passing a card *by value* to a
@@ -50,6 +90,9 @@ Two bugs that cost time and are easy to reintroduce:
 - `fetcher.pending()` counts tasks that are **finished but not yet consumed**,
   not just in-flight ones. "Nothing in flight" is not "the screen is up to
   date": there is a frame between a worker finishing and the UI draining it.
+- The subtitle canvas deliberately outlives the track. The UI uploads
+  `jf_subs_image.rgba` after the lock is gone, so freeing it from the demux
+  thread on a track change pulls the buffer out from under a texture upload.
 
 ## Navigation is a stack, not a rule
 

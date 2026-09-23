@@ -41,6 +41,13 @@ jf_atlas *jf_renderer_atlas(jf_renderer *renderer);
  * batcher already does for a binding change. */
 uint32_t jf_renderer_create_texture(jf_renderer *renderer, uint32_t width, uint32_t height,
                                     const uint8_t *rgb);
+/* The same, with an alpha channel, for an overlay that has to let the picture
+ * behind it through - the subtitle image, which arrives already composited.
+ * Storage is immutable, so a changed overlay is a new texture rather than a
+ * subimage upload; one a second, at the rate dialogue changes, is not worth a
+ * mutable-format special case. */
+uint32_t jf_renderer_create_rgba_texture(jf_renderer *renderer, uint32_t width,
+                                         uint32_t height, const uint8_t *rgba);
 void jf_renderer_destroy_texture(jf_renderer *renderer, uint32_t id);
 
 /* Draw calls issued by the last draw, which is the number worth watching. */
