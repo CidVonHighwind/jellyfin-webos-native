@@ -9,3 +9,5 @@ fptest
 # CMake build trees
 /build/
 /build-host/
+/build-windows/
+/.vscode

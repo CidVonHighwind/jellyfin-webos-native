@@ -56,9 +56,18 @@ else ()
     # A desktop without these still builds jf-portable and its tests; it just gets no
     # windowed programs.
     pkg_check_modules(SDL2 sdl2)
-    pkg_check_modules(EGL egl)
-    pkg_check_modules(GLESV2 glesv2)
-    set(GL_LIBRARIES ${GLESV2_LIBRARIES} ${EGL_LIBRARIES})
+    if (WIN32)
+        # ANGLE is where GLES comes from on Windows. The mingw-w64 angleproject package
+        # installs EGL/ and GLES3/ headers and the two import libraries into the toolchain
+        # prefix, but ships no pkg-config files - so they are named directly.
+        set(EGL_FOUND TRUE)
+        set(GLESV2_FOUND TRUE)
+        set(GL_LIBRARIES GLESv2 EGL)
+    else ()
+        pkg_check_modules(EGL egl)
+        pkg_check_modules(GLESV2 glesv2)
+        set(GL_LIBRARIES ${GLESV2_LIBRARIES} ${EGL_LIBRARIES})
+    endif ()
     set(PLATFORM_EXTRA "")
     if (SDL2_FOUND AND EGL_FOUND AND GLESV2_FOUND)
         set(HAVE_PLATFORM ON)
@@ -175,9 +184,8 @@ add_executable(jellyfin
 # static library - embedded rather than staged: an installed app runs as a jail uid, and a
 # licence that fails to open is not an acceptable outcome. The TV's own libraries are not
 # here; see src/app/licenses.h. Symbol names match it.
-# `|` rather than `:` as the separator: these entries carry absolute paths, and on a host
-# where one begins "C:/" splitting on a colon tears the drive letter off into an entry of
-# its own - which then becomes a build target named `C` that nothing knows how to make.
+# `|` rather than `:` as the separator: a Windows source path starts "C:/", and splitting
+# these on a colon tears the drive letter off into a target of its own.
 foreach (_license agpl_3_0|${CMAKE_SOURCE_DIR}/LICENSE.txt
         lgpl_3_0|${CMAKE_SOURCE_DIR}/assets/licenses/lgpl-3.0.txt
         lgpl_2_1|${CMAKE_SOURCE_DIR}/assets/licenses/lgpl-2.1.txt
@@ -191,17 +199,32 @@ foreach (_license agpl_3_0|${CMAKE_SOURCE_DIR}/LICENSE.txt
     webos_embed(jellyfin SYMBOL license_${_name} FILE "${_path}")
 endforeach ()
 
-if (NOT EXISTS "${LIBASS_ROOT}/lib")
-    message(FATAL_ERROR "No libass at ${LIBASS_ROOT} - run tools/build-libass.sh")
+if (WIN32)
+    # MSYS2 packages libass, so there is nothing to build out of tree and no .so to name.
+    pkg_check_modules(LIBASS REQUIRED libass)
+    target_include_directories(jellyfin SYSTEM PRIVATE ${LIBASS_INCLUDE_DIRS})
+    target_link_directories(jellyfin PRIVATE ${LIBASS_LIBRARY_DIRS})
+    target_link_libraries(jellyfin PRIVATE ${LIBASS_LIBRARIES})
+else ()
+    if (NOT EXISTS "${LIBASS_ROOT}/lib")
+        message(FATAL_ERROR "No libass at ${LIBASS_ROOT} - run tools/build-libass.sh")
+    endif ()
+    target_include_directories(jellyfin SYSTEM PRIVATE "${LIBASS_ROOT}/include")
+    target_link_libraries(jellyfin PRIVATE "${LIBASS_ROOT}/lib/libass.so")
 endif ()
-target_include_directories(jellyfin SYSTEM PRIVATE "${LIBASS_ROOT}/include")
-target_link_libraries(jellyfin PRIVATE "${LIBASS_ROOT}/lib/libass.so")
 target_include_directories(jellyfin SYSTEM PRIVATE
         ${LIBCURL_INCLUDE_DIRS} ${LIBPNG_INCLUDE_DIRS} ${JSONC_INCLUDE_DIRS})
 target_link_directories(jellyfin PRIVATE ${LIBCURL_LIBRARY_DIRS} ${LIBPNG_LIBRARY_DIRS}
         ${JSONC_LIBRARY_DIRS})
+if (WIN32)
+    # No libdl here; the sockets the discovery probe uses live in ws2_32 instead.
+    set(PLATFORM_SYSTEM_LIBS ws2_32)
+else ()
+    set(PLATFORM_SYSTEM_LIBS dl)
+endif ()
 target_link_libraries(jellyfin PRIVATE jf-ui
-        ${LIBCURL_LIBRARIES} ${LIBPNG_LIBRARIES} ${JSONC_LIBRARIES} dl m pthread)
+        ${LIBCURL_LIBRARIES} ${LIBPNG_LIBRARIES} ${JSONC_LIBRARIES}
+        ${PLATFORM_SYSTEM_LIBS} m pthread)
 
 if (NOT TARGET_WEBOS)
     target_sources(jellyfin PRIVATE jf/player_null.c)

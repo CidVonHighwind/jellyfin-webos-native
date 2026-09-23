@@ -22,6 +22,15 @@ add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 
 add_link_options($<$<CONFIG:Release>:-s>)
 
+# The GLSL ES version the embedded shaders declare. These shaders need 3.10 at least - they
+# use storage buffer blocks and explicit binding/location qualifiers - and the TV's Mali
+# reports 3.2. ANGLE, which supplies GLES on Windows, tops out at an ES 3.1 context.
+if (WIN32)
+    set(JF_GLSL_VERSION 310)
+else ()
+    set(JF_GLSL_VERSION 320)
+endif ()
+
 # Allow FPU usage within the app, while ABI stays soft-float.
 if (TARGET_WEBOS AND TARGET_WEBOS_ARCH STREQUAL "arm")
     add_compile_options(-mcpu=cortex-a55 -mfpu=neon-vfpv4 -mfloat-abi=softfp)

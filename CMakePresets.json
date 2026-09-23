@@ -29,6 +29,18 @@
         "CMAKE_CXX_FLAGS": "-Wall -Wextra -Werror -fsanitize=undefined -fno-omit-frame-pointer",
         "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=undefined"
       }
+    },
+    {
+      "name": "windows",
+      "displayName": "Windows (MSYS2 UCRT64)",
+      "description": "Local UI-debugging build. GLES comes from ANGLE; no UBSan, which mingw-w64 does not ship.",
+      "binaryDir": "${sourceDir}/build-windows",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_FLAGS": "-Wall -Wextra",
+        "CMAKE_CXX_FLAGS": "-Wall -Wextra"
+      }
     }
   ],
   "buildPresets": [

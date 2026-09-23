@@ -21,6 +21,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../platform/win_compat.h"
+
 #include "../jf/api.h"
 #include "../jf/cfg.h"
 #include "../jf/player.h"

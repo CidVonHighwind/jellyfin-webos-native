@@ -40,7 +40,8 @@ function(webos_add_shader TARGET)
     set(_glsl "${CMAKE_CURRENT_BINARY_DIR}/generated/${S_SYMBOL}.glsl")
     add_custom_command(OUTPUT "${_glsl}"
             COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
-            COMMAND sh "${WEBOS_ASSETS_MODULE_DIR}/slangc.sh"
+            COMMAND "${CMAKE_COMMAND}" -E env "JF_GLSL_VERSION=${JF_GLSL_VERSION}"
+            sh "${WEBOS_ASSETS_MODULE_DIR}/slangc.sh"
             "${S_SRC}" "${S_STAGE}" "${S_ENTRY}" "${_short}" "${_glsl}"
             DEPENDS "${S_SRC}" "${WEBOS_ASSETS_MODULE_DIR}/slangc.sh"
             COMMENT "slangc ${S_ENTRY}"

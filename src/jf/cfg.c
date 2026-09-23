@@ -7,6 +7,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "../platform/win_compat.h"
+
 struct cfg_entry {
   cfg_entry *next;
   char *section;

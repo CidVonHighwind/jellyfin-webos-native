@@ -12,19 +12,29 @@
 #define MAX_FACES 8
 #define TABLE_CAPACITY 4096 /* power of two; ~2k glyphs before it is half full */
 
-/* The UI face first, then whatever covers the rest of Unicode. */
+/* The UI face first, then whatever covers the rest of Unicode. The Windows entries are
+ * for the local debugging build; that machine has none of the paths above. */
 static const char *const face_candidates[] = {
     "/usr/share/fonts/LG_Smart_UI-Regular.ttf",
     "/usr/share/fonts/DroidSans.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
     "/usr/share/fonts/TTF/DejaVuSans.ttf",
+#ifdef _WIN32
+    "C:/Windows/Fonts/segoeui.ttf",
+    "C:/Windows/Fonts/arial.ttf",
+    "C:/Windows/Fonts/tahoma.ttf",
+#endif
 };
 static const char *const fallback_paths[] = {
     "/usr/share/fonts/DroidSansFallback.ttf",
     "/usr/share/fonts/DroidSans.ttf",
     "/usr/share/fonts/TTF/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+#ifdef _WIN32
+    "C:/Windows/Fonts/seguisym.ttf",
+    "C:/Windows/Fonts/arial.ttf",
+#endif
 };
 
 /* Open addressing keyed by codepoint. A miss is cached too - an unsupported character

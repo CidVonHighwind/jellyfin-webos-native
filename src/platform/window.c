@@ -124,7 +124,8 @@ bool jf_window_init(const char *app_id, const char *title, uint32_t want_width,
      * hint. Without it the registration fails with "Invalid appId specified", SDL reports
      * the backend as unavailable and falls back to plain wayland - where the remote has no
      * keymap and every button arrives as scancode 1. Whatever SAM set wins. */
-    setenv("APPID", app_id, 0);
+    /* SDL_setenv rather than setenv: Windows has no setenv, and this is SDL's own. */
+    SDL_setenv("APPID", app_id, 0);
     SDL_SetHint("SDL_WEBOS_REGISTER_APP", "true");
     SDL_SetHint("SDL_WEBOS_ACCESS_POLICY_KEYS_BACK", "true"); /* no exit dialog */
     /* How long the magic-remote pointer stays on screen once it stops moving. SAM starts
@@ -142,7 +143,16 @@ bool jf_window_init(const char *app_id, const char *title, uint32_t want_width,
 
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+#ifdef _WIN32
+    /* GLES on Windows is ANGLE, which hands out exactly the version asked for - and the UI
+     * shaders need 3.1 for their storage buffer blocks. The hint is what makes SDL reach
+     * for ANGLE at all rather than returning a desktop WGL context, whose entry points are
+     * not the ones this program links against. */
+    SDL_SetHint(SDL_HINT_OPENGL_ES_DRIVER, "1");
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+#else
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+#endif
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 16);
     /* The TV's video plane shows through wherever the UI writes alpha 0. */
     SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 8);

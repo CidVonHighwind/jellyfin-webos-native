@@ -9,6 +9,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "../platform/win_compat.h"
+
 /* Artwork budget. The cache is pruned to this at startup, oldest first. Two hundred-odd
  * posters at 240x360 PNG; a library of any size settles here. */
 #define CACHE_BUDGET (48u * 1024 * 1024)
@@ -39,6 +41,12 @@ static void make_subdirectories(void)
  * /media/cryptofs/apps, both ending in that path. */
 static bool app_directory(char *out, size_t out_len)
 {
+#ifdef _WIN32
+    /* Nothing here is ever an installed webOS app, and there is no /proc to ask. */
+    (void)out;
+    (void)out_len;
+    return false;
+#else
     const ssize_t n = readlink("/proc/self/cwd", out, out_len - 1);
     if (n <= 0)
         return false;
@@ -48,6 +56,7 @@ static bool app_directory(char *out, size_t out_len)
     /* The last component is the app id, which always has a dot in it. */
     const char *slash = strrchr(out, '/');
     return slash != NULL && strchr(slash + 1, '.') != NULL;
+#endif
 }
 
 static bool writable(void)

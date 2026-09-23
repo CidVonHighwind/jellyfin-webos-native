@@ -138,6 +138,24 @@ The hook prints the focused formatting diff and stops the commit. Apply it with
 A machine with no SDL2/EGL/GLES still configures; it just builds the tests and
 skips the two probes.
 
+## Windows
+
+There is a third preset for debugging the UI on Windows. It builds the same
+desktop target — the player is still `jf/player_null.c`, so it does not play
+anything — with MSYS2's mingw-w64 toolchain:
+
+```sh
+pacman -S --needed mingw-w64-ucrt-x86_64-{gcc,cmake,ninja,pkgconf,SDL2,freetype,curl,libpng,json-c,libass,angleproject}
+cmake --preset windows
+cmake --build build-windows
+```
+
+`slangc` has to be on `PATH` for the shader step, and so does `sh`, which MSYS2
+provides. GLES comes from ANGLE rather than a system library, which is why the
+context asked for there is ES 3.1: ANGLE returns exactly the version requested,
+and the UI shaders need 3.10 for their storage buffer blocks. Running the
+resulting `.exe` needs `C:\msys64\ucrt64\bin` on `PATH` for the DLLs.
+
 ## Debug switches
 
 SAM launches an app with an environment of its own making, so the switches are
