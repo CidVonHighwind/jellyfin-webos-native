@@ -175,14 +175,17 @@ add_executable(jellyfin
 # static library - embedded rather than staged: an installed app runs as a jail uid, and a
 # licence that fails to open is not an acceptable outcome. The TV's own libraries are not
 # here; see src/app/licenses.h. Symbol names match it.
-foreach (_license agpl_3_0:${CMAKE_SOURCE_DIR}/LICENSE.txt
-        lgpl_3_0:${CMAKE_SOURCE_DIR}/assets/licenses/lgpl-3.0.txt
-        lgpl_2_1:${CMAKE_SOURCE_DIR}/assets/licenses/lgpl-2.1.txt
-        apache_2_0:${CMAKE_SOURCE_DIR}/assets/licenses/apache-2.0.txt
-        libass:${CMAKE_SOURCE_DIR}/assets/licenses/libass.txt
-        harfbuzz:${CMAKE_SOURCE_DIR}/assets/licenses/harfbuzz.txt
-        mit:${CMAKE_SOURCE_DIR}/assets/licenses/mit.txt)
-    string(REPLACE ":" ";" _parts "${_license}")
+# `|` rather than `:` as the separator: these entries carry absolute paths, and on a host
+# where one begins "C:/" splitting on a colon tears the drive letter off into an entry of
+# its own - which then becomes a build target named `C` that nothing knows how to make.
+foreach (_license agpl_3_0|${CMAKE_SOURCE_DIR}/LICENSE.txt
+        lgpl_3_0|${CMAKE_SOURCE_DIR}/assets/licenses/lgpl-3.0.txt
+        lgpl_2_1|${CMAKE_SOURCE_DIR}/assets/licenses/lgpl-2.1.txt
+        apache_2_0|${CMAKE_SOURCE_DIR}/assets/licenses/apache-2.0.txt
+        libass|${CMAKE_SOURCE_DIR}/assets/licenses/libass.txt
+        harfbuzz|${CMAKE_SOURCE_DIR}/assets/licenses/harfbuzz.txt
+        mit|${CMAKE_SOURCE_DIR}/assets/licenses/mit.txt)
+    string(REPLACE "|" ";" _parts "${_license}")
     list(GET _parts 0 _name)
     list(GET _parts 1 _path)
     webos_embed(jellyfin SYMBOL license_${_name} FILE "${_path}")
